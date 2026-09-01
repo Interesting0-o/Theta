@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+
+# Virtual environments
+.venv
+
+#agent
+.claude
+CLAUDE.md
+
+#ide
+.vscode
+.ide
+.nvim
+
+#environment configuration files
+.env
+
+#资源
+resource

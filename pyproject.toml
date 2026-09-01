@@ -1,0 +1,41 @@
+[project]
+name = "CodingAgent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    # LangChain — 核心框架 / Core LLM framework
+    "langchain>=1.2.18",
+    "langchain-community>=0.4.1",
+    "langgraph-checkpoint-sqlite>=3.1.0",
+    # Model Providers — 模型供应商 SDK
+    "dashscope>=1.25.18",
+    "langchain-deepseek>=1.0.1",
+    "langchain-ollama>=1.1.0",
+    "openai>=2.36.0",
+    # Web Framework — API 服务
+    "fastapi>=0.136.1",
+    "uvicorn>=0.46.0",
+    # Vector Database — 向量数据库
+    "chromadb>=1.5.9",
+    # Search & Tools — 搜索与工具集成
+    "langchain-tavily>=0.2.18",
+    "jq>=1.11.0",
+    # Document Processing — 文档处理
+    "pypdf>=6.11.0",
+    # Monitoring — 可观测性
+    "prometheus-client>=0.25.0",
+    # Utilities — 工具库
+    "dotenv>=0.9.9",
+    "notebook>=7.5.6",
+    "pydantic>=2.13.4",
+    "python-dotenv>=1.2.2",
+    "rich>=15.0.0",
+    "langchain-chroma>=1.1.0",
+    "langsmith>=0.8.3",
+    "langgraph-cli[inmem]>=0.4.26",
+    "langchain-mcp-adapters>=0.3.2",
+    "mcp[cli]>=1.29.1",
+    "pydantic-settings>=2.14.1",
+]

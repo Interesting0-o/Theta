@@ -1,0 +1,6 @@
+{
+  "graphs": {
+    "my_agent": "./agent.py:compiled_graph"
+  },
+  "dependencies": ["."]
+}
