@@ -1,5 +1,7 @@
-from .agent_schema  import ToolResult
+from .agent_schema import PlanStatus, PlanStep, ToolResult
 
 __all__ = [
-    "ToolResult"
+    "ToolResult",
+    "PlanStep",
+    "PlanStatus",
 ]
