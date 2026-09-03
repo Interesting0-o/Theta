@@ -12,21 +12,24 @@ import sys
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
-async def load_mcp_tool():
+async def load_mcp_tool(workspace_path: str):
+
     file_io_connection = StdioConnection(
         transport="stdio",
         command=sys.executable,
         args=["-m", "mcp_service.file_io"],
         cwd=PROJECT_ROOT,
+        env={"WORKSPACE_PATH": workspace_path},
     )
     terminal_connection = StdioConnection(
         transport="stdio",
         command=sys.executable,
         args=["-m", "mcp_service.terminal"],
         cwd=PROJECT_ROOT,
+        env={"WORKSPACE_PATH": workspace_path},
     )
 
-    servers:dict[str,Connection] = {
+    servers: dict[str, Connection] = {
         "file_io": file_io_connection,
         "terminal": terminal_connection,
     }
