@@ -1,6 +1,4 @@
-import json
 from typing import Any, Callable
-from pathlib import Path
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import Runnable
@@ -8,6 +6,11 @@ from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 
 from app.agent.state import AgentState
+from app.agent.utils import (
+    format_tool_result,
+    get_tool_config,
+    ORCHESTRATE_SOURCES,
+)
 
 #-------------------大模型节点----------------------
 class LLMNode:
@@ -55,7 +58,7 @@ class ToolNode:
                 # MCP 工具是 async-only(只实现了 coroutine)，必须用 ainvoke
                 # (同步 invoke 会抛 "StructuredTool does not support sync invocation")
                 result_value = await tool_obj.ainvoke(tool_args)
-                result_content = str(result_value)
+                result_content = format_tool_result(result_value)
             except Exception as exc:
                 result_content = f"工具执行失败: {exc}"
 
@@ -73,9 +76,8 @@ class ToolNode:
 #----------------------工具审核节点--------------------
 class ReviewNode:
     def __init__(self) -> None:
-        tool_config_path = Path(__file__).with_name("tool.json")
-        with tool_config_path.open("r", encoding="utf-8") as file:
-            self.tool_review = json.load(file)
+        # 与 ToolNode/PlanNode 共用同一份 tool.json（缓存加载见 app/agent/utils.py）
+        self.tool_review = get_tool_config()
 
     async def __call__(self, state: AgentState) -> dict | AgentState:
         pending = list(state.get("pending_tool_calls", []))
@@ -84,9 +86,10 @@ class ReviewNode:
 
         current_tool = pending[0]
         tool_name = current_tool.get("name")
+        tool_cfg = self.tool_review.get(tool_name, {}) if tool_name else {}
         approved = True
 
-        if tool_name and self.tool_review.get(tool_name, {}).get("need_review"):
+        if tool_name and tool_cfg.get("need_review"):
             payload = {
                 "type": "tool_approval",
                 "current_step": "1/1",
@@ -97,16 +100,75 @@ class ReviewNode:
             decision = interrupt(payload)
             approved = isinstance(decision, dict) and decision.get("approved", False)
 
+        # 按 tool.json 的 source 分流：编排类进 orchestrate 队列，其余进普通工具队列
+        is_orchestrate = tool_cfg.get("source") in ORCHESTRATE_SOURCES
+
+        approved_orchestrate = list(state.get("approved_orchestrate_calls", []))
         approved_calls = list(state.get("approved_tool_calls", []))
         if approved:
-            approved_calls.append(current_tool)
+            (approved_orchestrate if is_orchestrate else approved_calls).append(current_tool)
 
         remaining = pending[1:]
 
         return {
             "pending_tool_calls": remaining,
+            "approved_orchestrate_calls": approved_orchestrate,
             "approved_tool_calls": approved_calls,
         }
+
+#----------------------计划处理节点--------------------
+class OrchestrateNode:
+    """
+    职责边界
+    """
+
+    def __init__(self,plan_tools:list[Callable]) -> None:
+        self.tools_map = {}
+
+        for tool_obj in plan_tools:
+            name = getattr(tool_obj, "name", None)
+            if name:
+                self.tools_map[name] = tool_obj
+        
+
+    async def __call__(self, state:AgentState) -> dict|AgentState:
+        tool_calls = list(state.get("approved_orchestrate_calls", []))
+
+        current_plan = state.get("current_plan", [])
+        results: AgentState|dict[str,Any] = {
+            "messages": [],
+            "current_plan":[]
+        }
+
+        for tool_call in tool_calls:
+            tool_name = tool_call.get("name")
+            tool_args = tool_call.get("args", {})
+            tool_call_id = tool_call.get("id", "unknown")
+
+            if not tool_name or tool_name not in self.tools_map:
+                results["messages"].append(
+                    ToolMessage(
+                        content=f"工具不存在或未注册: {tool_name}",
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                    ))
+                continue
+
+            tool_obj = self.tools_map[tool_name]
+            try:
+                res = tool_obj.ainvoke(tool_args)
+
+                for key,value in res.items():
+                    if key =="messages":
+                        continue
+                    results[key] = value
+
+            except Exception as exc:
+                result_content = f"工具执行失败: {exc}"
+
+        return results
+        
+
 
 
 #----------------------审核队列处理节点-------------------
@@ -116,4 +178,6 @@ async def queue_node(state: AgentState) -> dict | AgentState:
     return {
         "pending_tool_calls": tool_calls,
         "approved_tool_calls": [],
+        "approved_orchestrate_calls": []
     }
+

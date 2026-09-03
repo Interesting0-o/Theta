@@ -3,6 +3,18 @@
         "need_review":false,
         "source":"agent"
     },
+    "create_plan":{
+        "need_review":false,
+        "source":"plan"
+    },
+    "update_plan_step":{
+        "need_review":false,
+        "source":"plan"
+    },
+    "clear_plan":{
+        "need_review":false,
+        "source":"plan"
+    },
     "safe_tool":{
         "need_review":false,
         "source":"tests"
@@ -44,6 +56,10 @@
         "source":"mcp_service/file_io"
     },
     "get_directory_tree":{
+        "need_review":false,
+        "source":"mcp_service/file_io"
+    },
+    "search_content":{
         "need_review":false,
         "source":"mcp_service/file_io"
     },
