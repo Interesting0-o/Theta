@@ -6,6 +6,7 @@ from mcp_service.file_io import (
     delete_file,
     get_directory_tree,
     list_dir,
+    search_content,
     write_file,
 )
 
@@ -79,3 +80,62 @@ def test_get_directory_tree(tmp_path):
 def test_get_directory_tree_invalid_path(tmp_path):
     result = get_directory_tree(str(tmp_path / "not_exists"), max_depth=3)
     assert result.success is False
+
+
+def test_create_file_success_has_no_error_type(tmp_path):
+    result = create_file(str(tmp_path / "guarded.txt"), "hi")
+    assert result.success is True
+    assert result.error_type is None
+
+
+def test_create_file_violation_carries_error_type():
+    # 绝对路径不在 WORKSPACE_PATH(=/tmp) 内，越界校验应在任何 IO 之前触发
+    result = create_file("/etc/coding_agent_outside_test.txt", "x")
+    assert result.success is False
+    assert result.error_type == "workspace_violation"
+    assert "coding_agent_outside_test.txt" in result.content
+
+
+def _populate_search_fixture(tmp_path):
+    (tmp_path / "mod.py").write_text("def alpha():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "doc.md").write_text("# ALPHA doc\n", encoding="utf-8")
+    (tmp_path / "bin.dat").write_bytes(b"\x00\x01hello\n")
+
+
+def test_search_content_case_insensitive_substring(tmp_path):
+    _populate_search_fixture(tmp_path)
+    result = search_content("ALPHA", path=str(tmp_path))
+    assert result.success is True
+    assert "mod.py:1:" in result.content
+    assert "doc.md:1:" in result.content
+
+
+def test_search_content_extension_filter(tmp_path):
+    _populate_search_fixture(tmp_path)
+    result = search_content("alpha", path=str(tmp_path), extensions=[".py"])
+    assert result.success is True
+    assert "mod.py" in result.content
+    assert "doc.md" not in result.content
+
+
+def test_search_content_no_match(tmp_path):
+    _populate_search_fixture(tmp_path)
+    result = search_content("根本不存在的内容", path=str(tmp_path))
+    assert result.success is True
+    assert "未" in result.content
+
+
+def test_search_content_truncates_and_marks(tmp_path):
+    lines = "\n".join(f"row {i} needle" for i in range(5))
+    (tmp_path / "a.txt").write_text(lines, encoding="utf-8")
+    result = search_content("needle", path=str(tmp_path), max_results=2)
+    assert result.success is True
+    assert "仅显示前 2 条" in result.content
+
+
+def test_search_content_skips_binary(tmp_path):
+    _populate_search_fixture(tmp_path)
+    # "hello" 只出现在二进制 bin.dat 里，应被跳过而搜不到
+    result = search_content("hello", path=str(tmp_path))
+    assert result.success is True
+    assert "未" in result.content
