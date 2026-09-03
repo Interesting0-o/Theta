@@ -10,6 +10,11 @@ wheels/
 # Virtual environments
 .venv
 
+# Environment secrets (真实密钥，勿提交)
+.env
+.env.*
+!.env.example
+
 #agent
 .claude
 CLAUDE.md
@@ -19,8 +24,8 @@ CLAUDE.md
 .ide
 .nvim
 
-#environment configuration files
-.env
-
 #资源
 resource
+
+# LangGraph dev 服务器运行产物
+.langgraph_api/

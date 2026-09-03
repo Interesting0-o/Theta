@@ -1,41 +1,68 @@
 [project]
 name = "CodingAgent"
 version = "0.1.0"
-description = "Add your description here"
+description = "基于 LangGraph 的编码助手智能体，核心是带人工审批的工具调用流程"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    # LangChain — 核心框架 / Core LLM framework
+    # ── 核心框架（代码直接 import）──
     "langchain>=1.2.18",
-    "langchain-community>=0.4.1",
+    "langchain-core>=1.4.0",
+    "langgraph>=1.1.10",
     "langgraph-checkpoint-sqlite>=3.1.0",
-    # Model Providers — 模型供应商 SDK
-    "dashscope>=1.25.18",
-    "langchain-deepseek>=1.0.1",
-    "langchain-ollama>=1.1.0",
-    "openai>=2.36.0",
-    # Web Framework — API 服务
-    "fastapi>=0.136.1",
-    "uvicorn>=0.46.0",
-    # Vector Database — 向量数据库
-    "chromadb>=1.5.9",
-    # Search & Tools — 搜索与工具集成
-    "langchain-tavily>=0.2.18",
-    "jq>=1.11.0",
-    # Document Processing — 文档处理
-    "pypdf>=6.11.0",
-    # Monitoring — 可观测性
-    "prometheus-client>=0.25.0",
-    # Utilities — 工具库
-    "dotenv>=0.9.9",
-    "notebook>=7.5.6",
-    "pydantic>=2.13.4",
-    "python-dotenv>=1.2.2",
-    "rich>=15.0.0",
-    "langchain-chroma>=1.1.0",
-    "langsmith>=0.8.3",
-    "langgraph-cli[inmem]>=0.4.26",
+    # ── MCP 工具协议 ──
     "langchain-mcp-adapters>=0.3.2",
     "mcp[cli]>=1.29.1",
+    # ── 模型接入（OpenAI 兼容接口）──
+    "langchain-openai>=1.2.1",
+    # ── 联网搜索 ──
+    "langchain-tavily>=0.2.18",
+    # ── 配置与数据校验 ──
+    "pydantic>=2.13.4",
     "pydantic-settings>=2.14.1",
+    "python-dotenv>=1.2.2",  # pydantic-settings 读取 .env 依赖它
+    "dotenv>=0.9.9",
+    # ── 可观测性 ──
+    "langsmith>=0.8.3",
+]
+
+# 可选扩展：按需安装，如  uv sync --extra web
+[project.optional-dependencies]
+# 其他模型供应商 SDK
+providers = [
+    "dashscope>=1.25.18",
+    "langchain-community>=0.4.1",
+    "langchain-deepseek>=1.0.1",
+    "langchain-ollama>=1.1.0",
+]
+# 向量检索 / RAG（路线图）
+vector = [
+    "chromadb>=1.5.9",
+    "langchain-chroma>=1.1.0",
+]
+# Web API 服务层（路线图）
+web = [
+    "fastapi>=0.136.1",
+    "uvicorn>=0.46.0",
+]
+# 文档处理
+docs = [
+    "jq>=1.11.0",
+    "pypdf>=6.11.0",
+]
+# 监控指标
+monitoring = [
+    "prometheus-client>=0.25.0",
+]
+# 终端 UI 增强
+ui = [
+    "rich>=15.0.0",
+]
+
+# 开发 / 测试依赖
+[dependency-groups]
+dev = [
+    "langgraph-cli[inmem]>=0.4.26",
+    "notebook>=7.5.6",
+    "pytest>=8.0.0",
 ]
