@@ -1,69 +1,75 @@
-"""计划纯状态转换函数（app/agent/utils.py）的单测（不经过 FastMCP / 模型）。
+"""编排工具核心逻辑的单测（不经过 FastMCP / 模型）。
 
-注意：import app.agent.utils 会触发 app/agent/__init__ → graph → model，
-要求 .env 存在（CLAUDE.md 前提）。
+编排工具 create_plan / update_plan_step / clear_plan 的核心逻辑由工具自身实现
+（见 app/agent/tools.py）。本文件通过 `.func`（langchain @tool 暴露的底层原函数）
+直接调用工具：跳过 schema/注入机制，把 state 与 tool_call_id 当普通参数传入，
+仅验证逻辑与返回切片，与节点/图解耦。
+
+注意：import app.agent.tools 会触发 app/agent/__init__ → graph → model 及
+模块顶层 get_settings()/TavilySearch()，要求 .env 存在（CLAUDE.md 前提）。
 """
-from app.agent.utils import (
-    apply_step_status,
-    empty_plan,
-    plan_snapshot,
-    steps_to_plan,
-)
+from app.agent.tools import clear_plan, create_plan, update_plan_step
 
 
-def test_steps_to_plan_assigns_ids_and_pending():
-    plan = steps_to_plan(["读 A", "改 B", "测 C"])
-    assert plan == [
-        {"id": "1", "task": "读 A", "status": "pending"},
-        {"id": "2", "task": "改 B", "status": "pending"},
-        {"id": "3", "task": "测 C", "status": "pending"},
-    ]
+def _call(tool, *args):
+    return tool.func(*args)
 
 
-def test_steps_to_plan_skips_blank():
-    plan = steps_to_plan(["   ", "x"])
-    assert plan == [{"id": "1", "task": "x", "status": "pending"}]
+def _plan(items):
+    return [{"id": str(i + 1), "task": t, "status": "pending"} for i, t in enumerate(items)]
 
 
-def test_apply_step_status_marks_done_without_mutating_original():
-    plan = steps_to_plan(["a", "b"])
-    new, ok, message = apply_step_status(plan, "1", "done")
-    assert ok
-    assert message == "步骤 1 已标记为 done"
-    assert new[0]["status"] == "done"
-    assert new[1]["status"] == "pending"
-    assert plan[0]["status"] == "pending"  # 原列表不被修改
+def _message(out):
+    return out["messages"][0].content
 
 
-def test_apply_step_status_in_progress():
-    plan = steps_to_plan(["a"])
-    new, ok, _ = apply_step_status(plan, "1", "in_progress")
-    assert ok
-    assert new[0]["status"] == "in_progress"
+def test_create_plan_assigns_ids_and_pending():
+    out = _call(create_plan, ["读 A", "改 B", "测 C"], {"current_plan": []}, "c1")
+    assert out["current_plan"] == _plan(["读 A", "改 B", "测 C"])
+    assert out["current_plan"][0]["status"] == "pending"
+    assert "已生成计划（3 步）" in _message(out)
+    assert "读 A" in _message(out)
 
 
-def test_apply_step_status_unknown_id_keeps_plan():
-    plan = steps_to_plan(["a"])
-    new, ok, message = apply_step_status(plan, "99", "done")
-    assert not ok
-    assert new is plan
-    assert "不存在" in message
+def test_create_plan_skips_blank():
+    out = _call(create_plan, ["   ", "x"], {"current_plan": []}, "c1")
+    assert out["current_plan"] == [{"id": "1", "task": "x", "status": "pending"}]
 
 
-def test_apply_step_status_invalid_status():
-    plan = steps_to_plan(["a"])
-    new, ok, _ = apply_step_status(plan, "1", "nope")
-    assert not ok
-    assert new is plan
+def test_update_marks_done_without_mutating_input_state():
+    src_plan = _plan(["a", "b"])
+    state = {"current_plan": list(src_plan)}  # state 副本，供工具读
+    out = _call(update_plan_step, "1", "done", state, "c2")
+    assert out["current_plan"][0]["status"] == "done"
+    assert out["current_plan"][1]["status"] == "pending"
+    # 原 state 里的列表不被修改
+    assert state["current_plan"][0]["status"] == "pending"
+    assert "步骤 1 已标记为 done" in _message(out)
+    # 快照体现打勾
+    assert "- [x] 1. a" in _message(out)
 
 
-def test_empty_plan_returns_empty():
-    assert empty_plan() == []
+def test_update_in_progress():
+    state = {"current_plan": _plan(["a"])}
+    out = _call(update_plan_step, "1", "in_progress", state, "c2")
+    assert out["current_plan"][0]["status"] == "in_progress"
 
 
-def test_plan_snapshot_shows_marks():
-    plan = steps_to_plan(["a", "b"])
-    plan, ok, _ = apply_step_status(plan, "2", "done")
-    text = plan_snapshot(plan)
-    assert "- [ ] 1. a" in text
-    assert "- [x] 2. b" in text
+def test_update_unknown_step_keeps_plan():
+    state = {"current_plan": _plan(["a"])}
+    out = _call(update_plan_step, "99", "done", state, "c2")
+    assert "current_plan" not in out  # 未返回计划切片 = 计划保持不变
+    assert "步骤 99 不存在" in _message(out)
+
+
+def test_update_invalid_status():
+    state = {"current_plan": _plan(["a"])}
+    out = _call(update_plan_step, "1", "nope", state, "c2")
+    assert "current_plan" not in out
+    assert "非法状态" in _message(out)
+
+
+def test_clear_plan_returns_empty():
+    out = _call(clear_plan, {"current_plan": _plan(["a"])}, "c3")
+    assert out["current_plan"] == []
+    assert "已清空全部计划" in _message(out)

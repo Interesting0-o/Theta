@@ -1,13 +1,15 @@
-"""agent 侧共享工具函数（工具函数都放这里，不放节点/工具模块）。
+"""agent 侧共享工具函数（与"agent 专属/编排工具"无关的通用辅助都放这里）。
 
 - `format_tool_result`：把工具返回的对象转成大模型实际读到的文本
   （EXCEPTION_DESIGN.md §5 / §7）。分类已发生在边界（guard / MCP server），
   这里只负责"提取正文"。
 - `format_tool_approval` / `truncate` / `get_agent_db_path`：从 app/main.py 的
   TUI 迁来的辅助函数（审批信息排版、长文本截断、checkpoint 数据库路径）。
-- `get_tool_config`：tool.json 的共享缓存加载（ReviewNode/PlanNode 复用，避免各自读文件）。
-- 计划模式纯函数：`steps_to_plan` / `apply_step_status` / `empty_plan` / `plan_snapshot`，
-  供 tools.py 的工具与 nodes.py 的 PlanNode 共用（单一事实来源）。
+- `get_tool_config`：tool.json 的共享缓存加载（ReviewNode 等复用，避免各自读文件）。
+- `ORCHESTRATE_SOURCES`：编排类工具的 source 集合，供 ReviewNode 分流判断。
+
+计划（plan）的核心逻辑不在本文件：编排工具 `create_plan` / `update_plan_step` /
+`clear_plan` 自身实现，见 app/agent/tools.py。
 """
 from __future__ import annotations
 
@@ -15,63 +17,13 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
-from app.schema.agent_schema import PlanStep, ToolResult
+from app.schema.agent_schema import ToolResult
 
 _TOOL_CONFIG_PATH = Path(__file__).with_name("tool.json")
-
-PLAN_STATUSES: tuple[str, ...] = ("pending", "in_progress", "done")
 
 # 编排类工具在 tool.json 中的 source 取值集合：命中即视为编排调用，
 # 由 review_node 分流进 approved_orchestrate_calls，交 orchestrate_node 处理。
 ORCHESTRATE_SOURCES: frozenset[str] = frozenset({"plan"})
-
-
-# ---------------- 计划纯状态转换函数 ----------------
-
-def steps_to_plan(steps: list[str]) -> list[PlanStep]:
-    """把顺序任务列表转成计划步骤；空白项跳过；id 从 "1" 起分配。"""
-    plan: list[PlanStep] = []
-    for task in steps:
-        if not isinstance(task, str) or not task.strip():
-            continue
-        plan.append({"id": str(len(plan) + 1), "task": task, "status": "pending"})
-    return plan
-
-
-def apply_step_status(
-    plan: list[PlanStep], step_id: str, status: str
-) -> tuple[list[PlanStep], bool, str]:
-    """把指定步骤置为新状态。成功时返回(新列表, True, 消息)；原列表不变。
-
-    失败（status 非法 / step_id 不存在）返回(原对象, False, 消息)，
-    调用方可用 `new is plan` 判断是否无改动。
-    """
-    if status not in PLAN_STATUSES:
-        return (
-            plan,
-            False,
-            f"非法状态 {status!r}（可用：{' / '.join(PLAN_STATUSES)}）",
-        )
-    idx = next((i for i, s in enumerate(plan) if s.get("id") == step_id), None)
-    if idx is None:
-        return plan, False, f"步骤 {step_id} 不存在"
-    new_plan = list(plan)
-    new_plan[idx] = {**plan[idx], "status": status}
-    return new_plan, True, f"步骤 {step_id} 已标记为 {status}"
-
-
-def empty_plan() -> list[PlanStep]:
-    """清空后的计划。"""
-    return []
-
-
-def plan_snapshot(plan: list[PlanStep]) -> str:
-    """把计划渲染成模型可读的清单文本（done 打勾，便于模型跨轮跟踪进度）。"""
-    lines = []
-    for step in plan:
-        mark = "x" if step.get("status") == "done" else " "
-        lines.append(f"- [{mark}] {step.get('id')}. {step.get('task')}")
-    return "\n".join(lines)
 
 
 # ---------------- tool.json 共享加载 ----------------
@@ -82,8 +34,6 @@ def get_tool_config() -> dict[str, dict]:
     with _TOOL_CONFIG_PATH.open("r", encoding="utf-8") as file:
         return json.load(file)
 
-
-# ---------------- 计划模式：纯状态转换 ----------------
 
 # ---------------- 模型工具结果 / TUI 辅助 ----------------
 

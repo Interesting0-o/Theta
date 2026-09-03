@@ -29,3 +29,6 @@ resource
 
 # LangGraph dev 服务器运行产物
 .langgraph_api/
+
+# 默认沙箱工作区（未指定 WORKSPACE_PATH 时模型操作目录）
+tmp/

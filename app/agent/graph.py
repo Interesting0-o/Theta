@@ -1,11 +1,36 @@
-from langgraph.checkpoint.memory import InMemorySaver
+import asyncio
+import os
+from pathlib import Path
+
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.runnables import RunnableConfig
 from app.agent.state import AgentState
 from app.agent.nodes import *
 from app.agent.model import get_chat_model
 from app.agent.mcp import load_mcp_tool
 from app.agent.tools import core_tools, orchestrate_tool
+
+# 项目根：模块导入期由 __file__ 算好，避免在运行时调用阻塞式 os.getcwd()
+# （langgraph dev 的 blockbuster 会拦截事件循环内的同步阻塞调用）
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+# 默认工作区：项目根的 tmp 子目录，作为模型的默认沙箱（不直接指向仓库本身）
+DEFAULT_WORKSPACE = PROJECT_ROOT / "tmp"
+
+
+def _resolve_workspace(config: RunnableConfig | None = None) -> str:
+    """解析工作区路径：config.configurable.workspace_path → 环境变量 WORKSPACE_PATH → 默认 tmp。
+
+    LangGraph 平台/CLI 会把工厂函数的唯一参数当 Config 传入（见 langgraph_api
+    _classify_factory），因此工作区不从函数参数取，而按上面优先级解析；都不提供时
+    退回 <项目根>/tmp（__file__ 推导、非阻塞），便于 `uv run langgraph dev` 直接可用
+    （可用 env/config 覆盖）。
+    """
+    cfg = (config or {}).get("configurable") or {}
+    workspace = cfg.get("workspace_path") or os.environ.get("WORKSPACE_PATH")
+    if workspace:
+        return str(Path(workspace).expanduser())
+    return str(DEFAULT_WORKSPACE)
 
 
 def should_continue(state: AgentState):
@@ -31,10 +56,18 @@ def should_continue_after_orchestrate(state: AgentState):
     return "tool_node" if state.get("approved_tool_calls") else "llm_node"
 
 
-async def get_graph(workspace_path:str):
+async def get_graph(config: RunnableConfig | None = None):
     """
-    返回编译后的图(含 checkpointer, 以支持 interrupt 权限请求)。
+    返回未编译的 StateGraph（compile 由调用方完成，以支持挂 checkpointer 的 interrupt 审批）。
+
+    LangGraph dev/Platform 会以 Config 为参调用本工厂（0 参时给默认 config）；
+    TUI(app.main)则直接无参调用。工作区见 _resolve_workspace。
     """
+    workspace_path = _resolve_workspace(config)
+    # 默认 tmp 工作区需存在：os.makedirs 属阻塞调用，放到线程执行（blockbuster 不拦）
+    if workspace_path == str(DEFAULT_WORKSPACE):
+        await asyncio.to_thread(DEFAULT_WORKSPACE.mkdir, parents=True, exist_ok=True)
+
     graph = StateGraph(AgentState)
     mcp_tools = await load_mcp_tool(workspace_path)
 

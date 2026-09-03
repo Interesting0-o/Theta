@@ -1,3 +1,5 @@
+import inspect
+from inspect import signature
 from typing import Any, Callable
 
 from langchain_core.messages import AIMessage, ToolMessage
@@ -76,7 +78,7 @@ class ToolNode:
 #----------------------工具审核节点--------------------
 class ReviewNode:
     def __init__(self) -> None:
-        # 与 ToolNode/PlanNode 共用同一份 tool.json（缓存加载见 app/agent/utils.py）
+        # 与 ToolNode/OrchestrateNode 共用同一份 tool.json（缓存加载见 app/agent/utils.py）
         self.tool_review = get_tool_config()
 
     async def __call__(self, state: AgentState) -> dict | AgentState:
@@ -116,59 +118,119 @@ class ReviewNode:
             "approved_tool_calls": approved_calls,
         }
 
-#----------------------计划处理节点--------------------
+
+#----------------------编排节点----------------------
 class OrchestrateNode:
-    """
-    职责边界
+    """消费编排类调用（approved_orchestrate_calls），执行编排工具并合并写回 state。
+
+    编排工具（app/agent/tools.py 的 orchestrate_tool）与普通工具的关键区别：
+    不产生真实副作用，返回的是"要写回 state 的切片"——`{current_plan?, messages}`
+    其中 messages 是工具已经拼好的 ToolMessage 回执。因此本节点不像 ToolNode 那样
+    `ainvoke` 后 format_tool_result，而是：
+
+    - 逐个调用编排工具的底层原函数，显式注入 `state`（整份 AgentState）与
+      `tool_call_id`（本次调用 id）——这两个参数用 InjectedState / InjectedToolCallId
+      标注、对模型隐藏，由本节点代填；
+    - 同回合多次编排调用按顺序执行，并把上一步写回的 `current_plan` 链式传给下一步
+      （如 create_plan → update_plan_step → clear_plan 依次生效）；
+    - 把工具返回的 ToolMessage 原样并入 messages 交回模型；工具失败/未注册时生成
+      对应的错误 ToolMessage，且不改动 current_plan；
+    - 结束后清空 approved_orchestrate_calls；不动 approved_tool_calls（留给 tool_node）。
     """
 
-    def __init__(self,plan_tools:list[Callable]) -> None:
+    def __init__(self, orchestrate_tools: list[Callable]) -> None:
         self.tools_map = {}
-
-        for tool_obj in plan_tools:
+        for tool_obj in orchestrate_tools:
             name = getattr(tool_obj, "name", None)
             if name:
                 self.tools_map[name] = tool_obj
-        
 
-    async def __call__(self, state:AgentState) -> dict|AgentState:
+    @staticmethod
+    def _invoke(tool_obj: Callable, tool_args: dict, state:dict|AgentState, tool_call_id: str):
+        """调用编排工具的底层原函数，按签名注入 state / tool_call_id。
+
+        编排工具为 langchain @tool 包装的普通同步函数，`tool_obj.func` 即原函数；
+        直接以关键字调用，跳过 langchain 的注入管线（与 tests/test_plan_tools.py 一致）。
+        """
+        fn = getattr(tool_obj, "func", tool_obj)
+        kwargs = dict(tool_args)
+        # 只向签名里确实声明了对应注入参数的编排工具注入（覆写模型可能伪造的同名键）
+        params = signature(fn).parameters
+        if "state" in params:
+            kwargs["state"] = state
+        if "tool_call_id" in params:
+            kwargs["tool_call_id"] = tool_call_id
+
+        # 返回可能为 coroutine（若未来编排工具改为 async），由调用方 await
+        return fn(**kwargs)
+
+    async def __call__(self, state: AgentState) -> dict | AgentState:
         tool_calls = list(state.get("approved_orchestrate_calls", []))
+        if not tool_calls:
+            return {}
 
-        current_plan = state.get("current_plan", [])
-        results: AgentState|dict[str,Any] = {
-            "messages": [],
-            "current_plan":[]
-        }
+        # 链式工作的 state：同回合多次编排调用都基于它更新 current_plan
+        working = dict(state)
+        working.setdefault("current_plan", [])
+
+        messages: list[ToolMessage] = []
 
         for tool_call in tool_calls:
             tool_name = tool_call.get("name")
             tool_args = tool_call.get("args", {})
             tool_call_id = tool_call.get("id", "unknown")
 
-            if not tool_name or tool_name not in self.tools_map:
-                results["messages"].append(
+            tool_obj = self.tools_map.get(tool_name) if tool_name else None
+            if tool_obj is None:
+                messages.append(
                     ToolMessage(
                         content=f"工具不存在或未注册: {tool_name}",
                         tool_call_id=tool_call_id,
                         name=tool_name,
-                    ))
+                    )
+                )
                 continue
 
-            tool_obj = self.tools_map[tool_name]
             try:
-                res = tool_obj.ainvoke(tool_args)
-
-                for key,value in res.items():
-                    if key =="messages":
-                        continue
-                    results[key] = value
-
+                result = self._invoke(tool_obj, tool_args, working, tool_call_id)
+                if inspect.isawaitable(result):
+                    result = await result
             except Exception as exc:
-                result_content = f"工具执行失败: {exc}"
+                messages.append(
+                    ToolMessage(
+                        content=f"工具执行失败: {exc}",
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                    )
+                )
+                continue
 
-        return results
-        
+            if not isinstance(result, dict):
+                messages.append(
+                    ToolMessage(
+                        content=f"工具返回格式非法: {type(result).__name__}",
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                    )
+                )
+                continue
 
+            # 工具返回切片：有 current_plan 则链式更新；messages 回执原样收集
+            if "current_plan" in result:
+                working["current_plan"] = result["current_plan"]
+            for block in result.get("messages", []) or []:
+                if isinstance(block, ToolMessage):
+                    messages.append(block)
+                else:
+                    messages.append(
+                        ToolMessage(content=str(block), tool_call_id=tool_call_id, name=tool_name)
+                    )
+
+        return {
+            "approved_orchestrate_calls": [],
+            "messages": messages,
+            "current_plan": working["current_plan"],
+        }
 
 
 #----------------------审核队列处理节点-------------------
@@ -180,4 +242,3 @@ async def queue_node(state: AgentState) -> dict | AgentState:
         "approved_tool_calls": [],
         "approved_orchestrate_calls": []
     }
-
