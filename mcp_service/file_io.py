@@ -3,11 +3,12 @@
 
 工具清单：
 - create_file / create_dir            新建文件 / 新建目录
-- write_file / edit_file / read_file  整文件覆盖 / 字符串锚定增量编辑 / 读取
+- write_file / edit_file / read_file  整文件覆盖 / 字符串锚定增量编辑 / 读取（可按行号分段）
 - delete_file / delete_dir            删除文件 / 删除目录（非空需 recursive）
 - copy_path                           复制文件或目录
 - list_dir / get_directory_tree       列目录 / 递归目录树
-- search_content                      工作区内按内容检索（大小写不敏感子串）
+- glob                                按文件名/通配模式定位路径
+- search_content                      工作区内按内容检索（子串或正则，可带上下文）
 
 安全模型：
 - 全部工具（含读操作）都受工作区沙箱约束：相对路径以 WORKSPACE_PATH 为基准解析，
@@ -16,13 +17,14 @@
   不 raise——越界→workspace_violation / IO 失败→io_error / 内部 bug→internal_error，
   保证异常不漏到 FastMCP。
 """
-import shutil
 import os
+import re
+import shutil
 from pathlib import Path
-from app.exception import WorkspaceViolationError
 from mcp.server.fastmcp import FastMCP
+
+from app.exception import ConfigError, InvalidArgumentError, WorkspaceViolationError
 from app.schema.agent_schema import ToolResult
-from app.exception import ConfigError
 from mcp_service.utils import guard
 
 #----------------环境变量注入处理---------------#
@@ -265,12 +267,28 @@ def edit_file(
 
 @mcp.tool()
 @guard
-def read_file(path: str) -> ToolResult:
+def read_file(
+    path: str,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> ToolResult:
     """
-    读取指定路径的文件
+    读取指定路径的文件，可选只读某段行区间，避免大文件整段塞满上下文。
     Args:
-        path:需要读取文件的路径
+        path: 需要读取文件的路径。
+        start_line: 可选，起始行号（从 1 计、含）；只传它则从该行读到文件尾。
+        end_line: 可选，结束行号（含）；须不小于 start_line。留空默认读到文件尾。
     """
+    # 行号参数非法在文件 IO 前拦下，抛 InvalidArgumentError（guard 归成 invalid_argument）
+    if start_line is not None and start_line < 1:
+        raise InvalidArgumentError(f"start_line 从 1 开始计，收到 {start_line}")
+    if end_line is not None and end_line < 1:
+        raise InvalidArgumentError(f"end_line 从 1 开始计，收到 {end_line}")
+    if start_line is not None and end_line is not None and start_line > end_line:
+        raise InvalidArgumentError(
+            f"start_line({start_line}) 不能大于 end_line({end_line})"
+        )
+
     file_path = _resolve_path(path)  # 解析路径
     _is_in_workspace(file_path)  # 读取同样受工作区沙箱约束
 
@@ -279,7 +297,28 @@ def read_file(path: str) -> ToolResult:
             content = f.read()
     except OSError as e:
         return ToolResult(success=False, error_type="io_error", content=f"读取文件失败: {e}")
-    return ToolResult(success=True, content=content)
+
+    # 未指定行区间：整文件原样返回（保持原有行为，不附加行号标题，避免污染编辑锚定）
+    if start_line is None and end_line is None:
+        return ToolResult(success=True, content=content)
+
+    lines = content.splitlines()
+    total = len(lines)
+    lo = start_line if start_line is not None else 1
+    hi = end_line if end_line is not None else total
+
+    if total == 0 or lo > total:
+        return ToolResult(
+            success=True,
+            content=f"（{path} 共 {total} 行；请求的行区间 {lo}-{hi} 落在文件之外，无内容）",
+        )
+
+    effective_hi = min(hi, total)
+    body = "\n".join(lines[lo - 1 : effective_hi])
+    return ToolResult(
+        success=True,
+        content=f"[{path} 第 {lo}-{effective_hi} 行 / 共 {total} 行]\n{body}",
+    )
 
 
 @mcp.tool()
@@ -360,6 +399,144 @@ def get_directory_tree(path: str, max_depth: int = 3) -> ToolResult:
         return ToolResult(success=False, error_type="io_error", content=f"获取目录结构失败: {e}")
 
 
+# ---------------- glob：按文件名/通配模式定位 ----------------
+
+def _glob_segment_regex(segment: str) -> str:
+    """把单个 glob 段（不含 /）转成正则片段；* 不跨 /（跨目录靠 ** 由外层展开）。"""
+    out: list[str] = []
+    i, n = 0, len(segment)
+    while i < n:
+        ch = segment[i]
+        if ch == "*":
+            out.append("[^/]*")
+        elif ch == "?":
+            out.append("[^/]")
+        elif ch == "[":
+            j = segment.find("]", i + 1)
+            if j == -1:  # 缺闭合括号：整段按字面处理
+                out.append(re.escape(segment[i:]))
+                break
+            cls = segment[i + 1 : j]
+            if cls.startswith("!"):  # shell 的 [!..] 取反 → 正则的 [^..]
+                cls = "^" + cls[1:]
+            cls = cls.replace("\\", "\\\\")
+            out.append(f"[{cls}]")
+            i = j
+        else:
+            out.append(re.escape(ch))
+        i += 1
+    return "".join(out)
+
+
+def _compile_glob(pattern: str) -> re.Pattern:
+    """把以 root 为基准的 shell 通配编译成匹配相对路径的整串正则。"""
+    segments = pattern.split("/")
+    regex_parts: list[str] = []
+    for i, seg in enumerate(segments):
+        # 普通段之间补回被 split 吃掉的字面 '/'（如 "sub/*.py"）；紧跟 '**' 后的段
+        # 不再补——'**' 的展开式自带尾部 '/'，重复会要求两个斜杠。
+        if i > 0 and segments[i - 1] != "**":
+            regex_parts.append("/")
+        if seg == "**":
+            if i == len(segments) - 1:
+                # 结尾 '**'：匹配该前缀下的任意深度（文件或目录名），如 "a/**"
+                regex_parts.append("(?:[^/]+/)*[^/]*")
+            else:
+                regex_parts.append("(?:[^/]+/)*")
+        else:
+            regex_parts.append(_glob_segment_regex(seg))
+    return re.compile("^" + "".join(regex_parts) + "$")
+
+
+@mcp.tool()
+@guard
+def glob(
+    pattern: str,
+    path: str = ".",
+    include_dirs: bool = False,
+    max_results: int = 200,
+) -> ToolResult:
+    """
+    按文件名/通配模式在工作区内定位路径，返回相对工作区根的清单。
+    与 search_content（按内容）互补：知道"名字长什么样"找路径用它（找出所有
+    *_test.py、某目录下的 .ts 文件等），比 run_command 里裸 find/fd 免审批。
+
+    匹配规则（shell 通配，含 **）：
+    - pattern 不含 '/'：按"任意深度下的名字"匹配，如 "*.py" 会命中深层 .py 文件；
+    - pattern 含 '/'：按相对 path 的路径匹配，** 表示 0 或多级目录
+      （如 "src/**/*.ts"、"tests/**/test_*.py"）；
+    - 只列出名字、不读内容；检索时跳过隐藏目录（.git/.venv 等），但目录里以点开头
+      的文件（如 .env.example）只要名字匹配就会列出。
+    沙箱：结果只可能落在 path 起始目录内（path 须在工作区），不会触达工作区外。
+
+    Args:
+        pattern: shell 通配模式，如 "*.py"、"test_*.py"、"src/**/*.ts"。
+        path: 起始目录，默认整个工作区；须在工作区内。
+        include_dirs: 是否也列出目录（目录会带尾 '/'），默认 False（只列文件）。
+        max_results: 最多返回多少条命中，超出即截断并提示（默认 200）。
+    """
+    if not pattern or not pattern.strip():
+        raise InvalidArgumentError("pattern 不能为空，给出要找的文件名/通配模式")
+
+    root = _resolve_path(path)
+    _is_in_workspace(root)  # 起始目录越界抛给 guard
+    if not root.is_dir():
+        return ToolResult(success=False, content=f"路径不是目录或不存在: {root}")
+
+    max_results = max(1, int(max_results))
+    stripped = pattern.strip()
+    has_dir = "/" in stripped
+    try:
+        if has_dir:
+            matcher = _compile_glob(stripped)
+
+            def _match(entry: Path) -> bool:
+                return matcher.fullmatch(entry.relative_to(root).as_posix()) is not None
+        else:
+            matcher = re.compile("^" + _glob_segment_regex(stripped) + "$")
+
+            def _match(entry: Path) -> bool:
+                return matcher.fullmatch(entry.name) is not None
+    except re.error as e:
+        raise InvalidArgumentError(f"通配模式 {pattern!r} 无法解析: {e}") from e
+
+    hits: list[str] = []
+    capped = False
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        # 跳过隐藏目录：不向 .git/.venv 等内部钻（但同目录下的点文件仍会参与匹配）
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        if include_dirs:
+            for name in dirnames:
+                entry = Path(dirpath) / name
+                if _match(entry):
+                    hits.append(entry.relative_to(root).as_posix() + "/")
+                    if len(hits) >= max_results:
+                        capped = True
+                        break
+        if capped:
+            break
+        for name in sorted(filenames):
+            entry = Path(dirpath) / name
+            if _match(entry):
+                hits.append(entry.relative_to(root).as_posix())
+                if len(hits) >= max_results:
+                    capped = True
+                    break
+        if capped:
+            break
+
+    if not hits:
+        return ToolResult(success=True, content=f"未在 {root} 中找到匹配 {pattern!r} 的路径")
+
+    body = (
+        f"命中过多，仅显示前 {max_results} 条（可加长 pattern 或收窄 path）：\n"
+        if capped
+        else f"共命中 {len(hits)} 条：\n"
+    )
+    return ToolResult(success=True, content=body + "\n".join(hits))
+
+
 @mcp.tool()
 @guard
 def search_content(
@@ -367,19 +544,34 @@ def search_content(
     path: str = ".",
     max_results: int = 50,
     extensions: list[str] | None = None,
+    use_regex: bool = False,
+    case_sensitive: bool = False,
+    context_lines: int = 0,
 ) -> ToolResult:
     """
-    在工作区文件中按内容检索：大小写不敏感的子串匹配，返回命中位置（相对路径:行号:该行内容）。
+    在工作区文件中按内容检索，返回命中位置（相对路径:行号:该行内容）。
 
     这是"grep 式"检索，用来定位某段逻辑 / 某句报错文本 / 某个标识符出现在哪些文件。
-    找到位置后，可用 read_file 读取对应文件的上下文。
+    默认是大小写不敏感的子串匹配；需要更精确时可开正则、或带上下文减少一次 read_file。
+    找到位置后，可用 read_file 读取对应文件（配合其行号参数）取上下文。
+
+    匹配规则：
+    - 默认：query 按纯文本子串、忽略大小写（与原行为一致）；
+      case_sensitive=True 则区分大小写；
+    - use_regex=True：query 按 Python 正则编译（非法会报错并带原因，可修正重试），
+      此时 case_sensitive=True 会去掉 IGNORECASE；
+    - context_lines=N：每个命中附带前后 N 行（N=0 只返回命中行本身，默认）。
+    检索本身：自动跳过隐藏目录(. 开头)、二进制文件与指向工作区外的符号链接；
+    path/extensions/max_results 与原来一致。
 
     Args:
-        query: 要检索的字符串。纯文本子串、大小写不敏感，不是正则。
+        query: 检索词：纯文本子串（默认）或正则（use_regex=True）。
         path: 检索的起始目录，默认整个工作区；相对/绝对路径均可，须在工作区内。
         max_results: 最多返回多少条命中，超出即截断并提示。
-        extensions: 只在这些后缀里检索（如 [".py", ".md"]，不带点也接受）；默认不限定，
-            但自动跳过隐藏目录(. 开头)、二进制文件与指向工作区外的符号链接。
+        extensions: 只在这些后缀里检索（如 [".py", ".md"]，不带点也接受）；默认不限定。
+        use_regex: query 是否按正则匹配，默认 False（纯子串）。
+        case_sensitive: 是否区分大小写，默认 False（忽略）。
+        context_lines: 每个命中附带的前后行数，默认 0（只返回命中行本身）。
     """
     root = _resolve_path(path)
     _is_in_workspace(root)
@@ -390,18 +582,42 @@ def search_content(
         return ToolResult(success=False, content="query 不能为空")
 
     max_results = max(1, max_results)
-    query_lower = query.lower()
+    context_lines = max(0, int(context_lines or 0))
+
+    # 匹配器：正则 / 子串，按 case_sensitive 决定是否忽略大小写
+    if use_regex:
+        try:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            matcher = re.compile(query, flags)
+        except re.error as e:
+            raise InvalidArgumentError(f"query 不是合法正则: {e}") from e
+
+        def _is_match(line: str) -> bool:
+            return matcher.search(line) is not None
+    else:
+        if case_sensitive:
+            def _is_match(line: str) -> bool:
+                return query in line
+        else:
+            query_lower = query.lower()
+
+            def _is_match(line: str) -> bool:
+                return query_lower in line.lower()
+
     ext_set = None
     if extensions:
         ext_set = {e if e.startswith(".") else f".{e}" for e in extensions}
         ext_set = {e.lower() for e in ext_set}
 
-    hits: list[str] = []
+    lines_out: list[str] = []
+    total_hits = 0
     capped = False
 
     for dirpath, dirnames, filenames in os.walk(root):
         # 跳过隐藏目录（.git / .venv / node_modules 等以点开头的）
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        if capped:
+            break
         for filename in filenames:
             if filename.startswith("."):
                 continue
@@ -422,27 +638,50 @@ def search_content(
             if b"\x00" in data[:4096]:  # 粗略二进制探测，跳过
                 continue
             text = data.decode("utf-8", errors="replace")
-            for lineno, line in enumerate(text.splitlines(), 1):
-                if query_lower in line.lower():
-                    rel = real.relative_to(WORKSPACE_PATH)
-                    hits.append(f"{rel}:{lineno}: {line}")
-                    if len(hits) >= max_results:
-                        capped = True
-                        break
+            text_lines = text.splitlines()
+
+            # 本文件命中的行号（1 起始），截断到剩余额度再算上下文窗口
+            matched = [no for no, line in enumerate(text_lines, 1) if _is_match(line)]
+            if not matched:
+                continue
+            room = max_results - total_hits
+            if room <= 0:
+                capped = True
+                break
+            if len(matched) > room:
+                matched = matched[:room]
+                capped = True
+            total_hits += len(matched)
+
+            rel = real.relative_to(WORKSPACE_PATH)
+            if context_lines:
+                shown: set[int] = set()
+                for no in matched:
+                    shown.update(
+                        range(
+                            max(1, no - context_lines),
+                            min(len(text_lines), no + context_lines) + 1,
+                        )
+                    )
+                lines_out.extend(f"{rel}:{no}: {text_lines[no - 1]}" for no in sorted(shown))
+            else:
+                lines_out.extend(f"{rel}:{no}: {text_lines[no - 1]}" for no in matched)
+
             if capped:
                 break
         if capped:
             break
 
-    if not hits:
+    if total_hits == 0:
         return ToolResult(success=True, content=f"未在 {root} 中找到包含 {query!r} 的文本")
 
+    ctx = f"（含每处前后 {context_lines} 行）" if context_lines else ""
     body = (
-        f"命中过多，仅显示前 {max_results} 条（可缩小 path/extensions 或收窄 query）：\n"
+        f"命中过多，仅显示前 {max_results} 条命中{ctx}：\n"
         if capped
-        else f"共命中 {len(hits)} 条：\n"
+        else f"共命中 {total_hits} 条{ctx}：\n"
     )
-    return ToolResult(success=True, content=body + "\n".join(hits))
+    return ToolResult(success=True, content=body + "\n".join(lines_out))
 
 
 if __name__ == "__main__":

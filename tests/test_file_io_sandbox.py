@@ -24,6 +24,7 @@ from mcp_service.file_io import (
     delete_dir,
     delete_file,
     get_directory_tree,
+    glob,
     list_dir,
     read_file,
     search_content,
@@ -61,6 +62,7 @@ def test_all_tools_reject_outside_absolute_path(ws):
         ("get_directory_tree", lambda: get_directory_tree(str(outside))),
         ("copy_path 源越界", lambda: copy_path(str(outside), str(ws / "dst"))),
         ("copy_path 目标越界", lambda: copy_path(str(ws / "src"), str(outside))),
+        ("glob 起始目录越界", lambda: glob("*.py", path=str(outside))),
     ]
     for name, fn in cases:
         result = fn()

@@ -6,7 +6,9 @@ from mcp_service.file_io import (
     delete_file,
     edit_file,
     get_directory_tree,
+    glob,
     list_dir,
+    read_file,
     search_content,
     write_file,
 )
@@ -215,3 +217,176 @@ def test_search_content_skips_binary(tmp_path):
     result = search_content("hello", path=str(tmp_path))
     assert result.success is True
     assert "未" in result.content
+
+
+# ---------------- read_file 行号分段读取 ----------------
+
+def _write_5_lines(path):
+    path.write_text("\n".join(f"line{i}" for i in range(1, 6)) + "\n", encoding="utf-8")
+
+
+def test_read_file_whole_file_unchanged(tmp_path):
+    target = tmp_path / "whole.txt"
+    target.write_text("a\nb\n", encoding="utf-8")
+    result = read_file(str(target))
+    assert result.success is True
+    assert result.content == "a\nb\n"  # 整文件原样返回，不加行号标题
+
+
+def test_read_file_range(tmp_path):
+    target = tmp_path / "range.txt"
+    _write_5_lines(target)
+    result = read_file(str(target), start_line=2, end_line=4)
+    assert result.success is True
+    assert "第 2-4 行 / 共 5 行" in result.content
+    assert "line2" in result.content and "line4" in result.content
+    assert "line1" not in result.content
+    assert "line5" not in result.content
+
+
+def test_read_file_start_only_reads_to_end(tmp_path):
+    target = tmp_path / "tail.txt"
+    _write_5_lines(target)
+    result = read_file(str(target), start_line=4)
+    assert result.success is True
+    assert "line1" not in result.content
+    assert "line4" in result.content and "line5" in result.content
+
+
+def test_read_file_range_out_of_bounds_reports_empty(tmp_path):
+    target = tmp_path / "short.txt"
+    _write_5_lines(target)
+    result = read_file(str(target), start_line=10)
+    assert result.success is True
+    assert "共 5 行" in result.content
+
+
+def test_read_file_invalid_bounds_are_invalid_argument(tmp_path):
+    target = tmp_path / "x.txt"
+    _write_5_lines(target)
+    for kwargs in ({"start_line": 0}, {"end_line": -1}, {"start_line": 3, "end_line": 2}):
+        result = read_file(str(target), **kwargs)
+        assert result.success is False
+        assert result.error_type == "invalid_argument", kwargs
+
+
+# ---------------- glob 按文件名/通配定位 ----------------
+
+def _populate_glob_tree(tmp_path):
+    (tmp_path / "a.py").write_text("", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("", encoding="utf-8")
+    (tmp_path / ".env.example").write_text("", encoding="utf-8")
+    (tmp_path / ".hidden_dir").mkdir()
+    (tmp_path / ".hidden_dir" / "e.py").write_text("", encoding="utf-8")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "c.py").write_text("", encoding="utf-8")
+    (tmp_path / "sub" / "d.txt").write_text("", encoding="utf-8")
+
+
+def test_glob_basename_pattern_matches_any_depth(tmp_path):
+    _populate_glob_tree(tmp_path)
+    result = glob("*.py", path=str(tmp_path))
+    assert result.success is True
+    assert "a.py" in result.content
+    assert "sub/c.py" in result.content
+    assert "b.txt" not in result.content
+    assert ".hidden_dir/e.py" not in result.content  # 隐藏目录不钻入
+
+
+def test_glob_dotfile_matches_when_named(tmp_path):
+    _populate_glob_tree(tmp_path)
+    result = glob(".env.example", path=str(tmp_path))
+    assert result.success is True
+    assert ".env.example" in result.content
+
+
+def test_glob_slash_pattern_and_double_star(tmp_path):
+    _populate_glob_tree(tmp_path)
+    result = glob("sub/*.py", path=str(tmp_path))
+    assert result.success is True
+    assert "sub/c.py" in result.content
+    assert "sub/d.txt" not in result.content
+
+    result = glob("**/*.txt", path=str(tmp_path))
+    assert result.success is True
+    assert "b.txt" in result.content and "sub/d.txt" in result.content
+
+    # 中段 **（零或多级目录）与结尾 **（该前缀下任意深度）
+    result = glob("sub/**/c.py", path=str(tmp_path))
+    assert result.success is True
+    assert "sub/c.py" in result.content
+
+    result = glob("sub/**", path=str(tmp_path))
+    assert result.success is True
+    assert "sub/c.py" in result.content and "sub/d.txt" in result.content
+
+
+def test_glob_include_dirs_suffix(tmp_path):
+    _populate_glob_tree(tmp_path)
+    result = glob("sub", path=str(tmp_path), include_dirs=True)
+    assert result.success is True
+    assert "sub/" in result.content
+
+
+def test_glob_no_match_and_cap(tmp_path):
+    _populate_glob_tree(tmp_path)
+    result = glob("*.rs", path=str(tmp_path))
+    assert result.success is True
+    assert "未" in result.content
+
+    result = glob("*.py", path=str(tmp_path), max_results=1)
+    assert result.success is True
+    assert "仅显示前 1 条" in result.content
+
+
+def test_glob_empty_pattern_is_invalid_argument(tmp_path):
+    result = glob("", path=str(tmp_path))
+    assert result.success is False
+    assert result.error_type == "invalid_argument"
+
+
+# ---------------- search_content 正则 / 大小写 / 上下文 ----------------
+
+def test_search_content_regex_and_invalid(tmp_path):
+    (tmp_path / "log.txt").write_text("error 404\nok\nerror 500\n", encoding="utf-8")
+    result = search_content(r"error \d+", path=str(tmp_path), use_regex=True)
+    assert result.success is True
+    assert "log.txt:1:" in result.content
+    assert "log.txt:3:" in result.content
+
+    # 不带 use_regex：按子串匹配字面 "error \d+"
+    result = search_content(r"error \d+", path=str(tmp_path))
+    assert result.success is True
+    assert "未" in result.content
+
+    result = search_content("(unclosed", path=str(tmp_path), use_regex=True)
+    assert result.success is False
+    assert result.error_type == "invalid_argument"
+
+
+def test_search_content_case_sensitive(tmp_path):
+    (tmp_path / "words.txt").write_text("alpha said hi\nALPHA said hey\n", encoding="utf-8")
+    # 默认忽略大小写：两行都命中
+    result = search_content("alpha", path=str(tmp_path))
+    assert result.success is True
+    assert "words.txt:1:" in result.content
+    assert "words.txt:2:" in result.content
+    # 区分大小写：只有小写那行命中
+    result = search_content("alpha", path=str(tmp_path), case_sensitive=True)
+    assert result.success is True
+    assert "words.txt:1:" in result.content
+    assert "words.txt:2:" not in result.content
+
+
+def test_search_content_context_lines(tmp_path):
+    lines = ["head", "needle", "tail1", "needle2", "tail2"]
+    (tmp_path / "ctx.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    result = search_content("needle", path=str(tmp_path), context_lines=1)
+    assert result.success is True
+    content = result.content
+    # 上下文行与命中行都带前缀出现
+    assert "head" in content
+    assert "tail1" in content
+    assert "needle2" in content
+    assert "tail2" in content
+    assert "ctx.txt:2:" in content
