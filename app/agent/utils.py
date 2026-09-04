@@ -17,7 +17,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
-from app.schema.agent_schema import ToolResult
+from app.schema.agent_schema import ToolResult, PlanStep
 
 _TOOL_CONFIG_PATH = Path(__file__).with_name("tool.json")
 
@@ -45,6 +45,11 @@ def format_tool_result(result) -> str:
       让模型一眼看出这是哪一类失败（如 "[workspace_violation] 路径…"）。
     - `dict`：优先取 `content` 字段；若 content 是 content-block 列表则逐个取
       `text` 拼接（兼容 langchain MCP 适配器的返回形态）。
+    - `list`：MCP 工具经 ToolNode 拿到的真实形态——langchain MCP 适配器把每个
+      content block 转成 dict（text/id 等），FastMCP 又把工具返回的 ToolResult
+      整包 JSON 化进 text。这里逐个取 `text`（丢弃随机 id 噪声），json.loads
+      还原 ToolResult 后交上面 ToolResult 分支；还原失败（非 JSON / 非
+      ToolResult 形态，如未来直接返回 str 的工具）则拼接后原样透传。
     - 其它（str 等）：`str()` 原样透传。
 
     注意：模型读到的文本由这里决定，而不是 Python 侧的 `ToolResult.__str__`
@@ -67,6 +72,22 @@ def format_tool_result(result) -> str:
                     parts.append(str(block))
             return "\n".join(part for part in parts if part)
         return str(content)
+
+    if isinstance(result, list):
+        parts: list[str] = []
+        for block in result:
+            if isinstance(block, dict):
+                parts.append(block.get("text") or block.get("content") or "")
+            else:
+                parts.append(str(block))
+        text = "\n".join(part for part in parts if part)
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return text
+        if isinstance(data, dict) and "success" in data and isinstance(data.get("content"), str):
+            return format_tool_result(ToolResult(**data))
+        return text
 
     return str(result)
 
@@ -125,3 +146,27 @@ def format_tool_approval(interrupts) -> str:
             lines.append(f"  调用ID: {tool_call_id}")
 
     return "\n".join(lines)
+
+def format_plan_status(status: PlanStep) -> str:
+    """把 plan 状态转换为易读的字符串。"""
+    status_map = {
+        "pending": "待处理",
+        "in_progress": "进行中",
+        "done": "已完成",
+    }
+    if not isinstance(status, dict):
+        raise ValueError("status 必须是 PlanStatus 类型")
+
+    status_value = status.get("status")
+    if not isinstance(status_value, str):
+        raise ValueError("status['status'] 必须是字符串")
+
+    task = status.get("task")
+    task_str = task if isinstance(task, str) else "未知状态"
+    status_id = status.get("id")
+    status_id_str = status_id if isinstance(status_id, str) else "未知状态"
+
+    state = status_map.get(status_value, "错误")
+    return f"{status_id_str}. {task_str} 当前状态为 {state}"
+
+

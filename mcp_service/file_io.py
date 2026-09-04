@@ -28,6 +28,7 @@ from mcp_service.utils import guard
 #----------------环境变量注入处理---------------#
 
 _workspace_path = os.environ.get("WORKSPACE_PATH")
+
 if _workspace_path is None:
     raise ConfigError("WORKSPACE_PATH 未设置")
 

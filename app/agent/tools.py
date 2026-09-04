@@ -1,6 +1,5 @@
 """agent 侧工具（模型可见的都在这）。
 
-- `core_tools`：真实副作用/查询工具（web_search），走 review → ToolNode。
 - `orchestrate_tool`：编排工具（create_plan / update_plan_step / clear_plan），
   由编排节点（orchestrate_node）消费。与普通工具的关键区别：
 
@@ -24,17 +23,11 @@ from typing import Annotated, List
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 from langgraph.prebuilt import InjectedState
-from langchain_tavily import TavilySearch
-
-from app.config import get_settings
 from app.agent.state import AgentState
 from app.schema.agent_schema import PlanStatus, PlanStep
 
-settings = get_settings()
 
-web_search = TavilySearch(
-    tavily_api_key=settings.TAVILY_API_KEY
-)
+
 
 # 计划步骤允许的状态取值（与 PlanStatus Literal 保持一致）
 PLAN_STATUSES: tuple[str, ...] = ("pending", "in_progress", "done")
@@ -145,7 +138,7 @@ def update_plan_step(
         }
 
     # 浅拷贝出新列表再改，保证不改动原 state 里的列表（LangGraph state 应不可变更新）
-    plan:List[PlanStep] = [dict(step) for step in current]
+    plan:List[PlanStep] = [dict(step) for step in current]#type:ignore
     plan[idx] = {**plan[idx], "status": status}
 
     return {
@@ -187,11 +180,6 @@ def clear_plan(
             )
         ],
     }
-
-
-core_tools: List[BaseTool] = [
-    web_search
-]
 
 orchestrate_tool: List[BaseTool] = [
     create_plan,

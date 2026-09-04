@@ -9,7 +9,7 @@ from app.agent.state import AgentState
 from app.agent.nodes import *
 from app.agent.model import get_chat_model
 from app.agent.mcp import load_mcp_tool
-from app.agent.tools import core_tools, orchestrate_tool
+from app.agent.tools import  orchestrate_tool
 
 # 项目根：模块导入期由 __file__ 算好，避免在运行时调用阻塞式 os.getcwd()
 # （langgraph dev 的 blockbuster 会拦截事件循环内的同步阻塞调用）
@@ -24,12 +24,13 @@ def _resolve_workspace(config: RunnableConfig | None = None) -> str:
     LangGraph 平台/CLI 会把工厂函数的唯一参数当 Config 传入（见 langgraph_api
     _classify_factory），因此工作区不从函数参数取，而按上面优先级解析；都不提供时
     退回 <项目根>/tmp（__file__ 推导、非阻塞），便于 `uv run langgraph dev` 直接可用
-    （可用 env/config 覆盖）。
+    （可用 env/config 覆盖）。返回前 resolve() 成绝对路径，与 mcp_service/file_io 里
+    import 时对 WORKSPACE_PATH 的 resolve 保持一致，也作为给 LLM 显示的工作区根目录。
     """
     cfg = (config or {}).get("configurable") or {}
     workspace = cfg.get("workspace_path") or os.environ.get("WORKSPACE_PATH")
     if workspace:
-        return str(Path(workspace).expanduser())
+        return str(Path(workspace).expanduser().resolve())
     return str(DEFAULT_WORKSPACE)
 
 
@@ -72,15 +73,14 @@ async def get_graph(config: RunnableConfig | None = None):
     mcp_tools = await load_mcp_tool(workspace_path)
 
     # 模型能看到全部工具（含计划工具）；但只有"可执行工具"会进 review→tool_node
-    all_tools = core_tools + orchestrate_tool + mcp_tools
-    executable_tools = core_tools + mcp_tools
+    all_tools =  orchestrate_tool + mcp_tools
     model = get_chat_model().bind_tools(all_tools)
 
-    graph.add_node("llm_node", LLMNode(model=model))
+    graph.add_node("llm_node", LLMNode(model=model, workspace_path=workspace_path))
     graph.add_node("queue_node", queue_node)
-    graph.add_node("orchestrate_node", OrchestrateNode(orchestrate_tool))
+    graph.add_node("orchestrate_node", OrchestrateNode(orchestrate_tool))#type:ignore
     graph.add_node("review_node", ReviewNode())
-    graph.add_node("tool_node", ToolNode(executable_tools))  # type: ignore
+    graph.add_node("tool_node", ToolNode(mcp_tools))  # type: ignore
 
     graph.add_edge(START, "llm_node")
     graph.add_conditional_edges(

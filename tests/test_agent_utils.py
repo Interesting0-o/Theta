@@ -5,6 +5,8 @@
 """
 from types import SimpleNamespace
 
+import json
+
 from app.agent.utils import format_tool_approval, format_tool_result, truncate
 from app.schema.agent_schema import ToolResult
 
@@ -38,6 +40,45 @@ def test_format_tool_result_passthrough_string():
 
 def test_format_tool_result_dict_content():
     assert format_tool_result({"content": "来自字典"}) == "来自字典"
+
+
+def _mcp_block(payload, block_id="lc_random"):
+    """构造 langchain MCP 适配器返回的 content block（TextContent → dict）。"""
+    return {"type": "text", "text": payload, "id": block_id}
+
+
+def test_format_tool_result_mcp_blocks_rebuilds_toolresult():
+    block = _mcp_block(json.dumps(
+        {"success": True, "content": "1. 标题\n   http://x", "error_type": None},
+        ensure_ascii=False,
+    ))
+    assert format_tool_result([block]) == "1. 标题\n   http://x"
+
+
+def test_format_tool_result_mcp_blocks_error_prefix():
+    block = _mcp_block(json.dumps(
+        {"success": False, "content": "search_depth 必须是 basic", "error_type": "invalid_argument"},
+        ensure_ascii=False,
+    ))
+    assert format_tool_result([block]) == "[invalid_argument] search_depth 必须是 basic"
+
+
+def test_format_tool_result_mcp_blocks_plain_text():
+    block = _mcp_block("纯文本结果")
+    assert format_tool_result([block]) == "纯文本结果"
+
+
+def test_format_tool_result_mcp_blocks_non_toolresult_json():
+    block = _mcp_block('{"foo": 1}')
+    assert format_tool_result([block]) == '{"foo": 1}'
+
+
+def test_format_tool_result_mcp_blocks_drops_id_and_non_text():
+    blocks = [
+        _mcp_block("第一段", block_id="lc_1"),
+        {"type": "image", "base64": "xxx"},
+    ]
+    assert format_tool_result(blocks) == "第一段"
 
 
 def test_truncate_keeps_short_text():

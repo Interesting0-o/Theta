@@ -70,7 +70,9 @@ def test_mixed_turn_leaves_executable_queue_for_tool_node():
     out = asyncio.run(node(state))
 
     assert out["approved_orchestrate_calls"] == []
-    assert [c["id"] for c in out["approved_tool_calls"]] == ["call_exec"]
+    # 编排节点只消费编排调用：普通调用队列必须原样留在 state（LangGraph 合并部分更新，
+    # 节点返回里不出现该键即未改动），由 should_continue_after_orchestrate 路由给 tool_node
+    assert "approved_tool_calls" not in out
     assert len(out["current_plan"]) == 1
     assert len(_msgs(out)) == 1
 

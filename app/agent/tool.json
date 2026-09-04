@@ -1,8 +1,4 @@
 {
-    "web_search":{
-        "need_review":false,
-        "source":"agent"
-    },
     "create_plan":{
         "need_review":false,
         "source":"plan"
@@ -66,5 +62,21 @@
     "run_command":{
         "need_review":true,
         "source":"mcp_service/terminal"
+    },
+    "web_search":{
+        "need_review":true,
+        "source":"mcp_service/web_search"
+    },
+    "extract_urls":{
+        "need_review":true,
+        "source":"mcp_service/web_search"
+    },
+    "crawl_website":{
+        "need_review":true,
+        "source":"mcp_service/web_search"
+    },
+    "deep_research":{
+        "need_review":true,
+        "source":"mcp_service/web_search"
     }
 }

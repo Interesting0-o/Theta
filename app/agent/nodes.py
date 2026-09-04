@@ -2,26 +2,53 @@ import inspect
 from inspect import signature
 from typing import Any, Callable
 
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
-
 from app.agent.state import AgentState
+from app.agent.prompt import SYSTEM_PROMPT, workspace_context_block
 from app.agent.utils import (
     format_tool_result,
+    format_plan_status,
     get_tool_config,
     ORCHESTRATE_SOURCES,
 )
 
 #-------------------大模型节点----------------------
 class LLMNode:
-    def __init__(self, model: Runnable) -> None:
+    def __init__(
+        self,
+        model: Runnable,
+        workspace_path: str | None = None,
+    ) -> None:
         self.model: Runnable = model
+        self.workspace_path: str | None = workspace_path
 
     async def __call__(self, state: AgentState) -> dict | AgentState:
-        """大模型处理节点"""
-        messages = state["messages"]
+        """大模型处理节点。
+
+        每次生成都在头部拼接系统提示词：行为契约 SYSTEM_PROMPT（见 prompt.py）+
+        本次会话的具体工作区上下文 workspace_context_block（若有，含工作区根目录与
+        终端 cwd 差异提醒）+ 当前计划的状态回显（若有）。只构造成临时列表传给模型，
+        不改动 state["messages"]（LangGraph state 应不可变更新；系统消息也不应渗入
+        历史被持久化）。
+        """
+        system_messages = [SystemMessage(content=SYSTEM_PROMPT)]
+        if self.workspace_path:
+            system_messages.append(
+                SystemMessage(content=workspace_context_block(self.workspace_path))
+            )
+        plans = state.get("current_plan", [])
+        if plans:
+            system_messages.append(
+                SystemMessage(
+                    content="# 当前任务:\n"
+                    + "\n".join(format_plan_status(plan) for plan in plans)
+                )
+            )
+
+        messages = [*system_messages, *state["messages"]]
         res = await self.model.ainvoke(messages)
         return {"messages": [res]}
 

@@ -96,6 +96,9 @@ class WorkspaceViolationError(AgentError):
 
 class ToolExecutionError(AgentError):
     """工具可预期的执行失败（区别于代码 bug）。"""
+
+class InvalidArgumentError(AgentError):
+    """工具参数非法（违反输入契约，调用方可修正重试）。guard 依类名归成 invalid_argument。"""
 ```
 
 设计依据（Q1/Q2/Q3 逐条验证）：
@@ -105,6 +108,7 @@ class ToolExecutionError(AgentError):
 | `ConfigError` | ✅ 配置条件缺失，说得清 | ✅ 启动即停+引导，与"喂回模型继续"本质不同 | ✅ 抛在 config/file_io，接在 main/guard |
 | `WorkspaceViolationError` | ✅ 沙箱规则明确 | ✅ 安全事件：记日志、警告，不是普通失败 | ✅ write/terminal 跨工具共用 |
 | `ToolExecutionError` | ✅ 工具操作失败 | ⚠️ 代码层反应相同 → 与"内部 bug"区分即可 | ✅ 所有工具共用 |
+| `InvalidArgumentError` | ✅ 参数非法，说得清 | ✅ 输入错模型要修要重试，区别于"内部 bug 别管" | ✅ 各工具参数校验共用 |
 
 ---
 
@@ -271,7 +275,7 @@ except ValidationError as exc:
 
 ## 9. 落地清单
 
-- [ ] `app/exception.py`：`AgentError` + `ConfigError` + `WorkspaceViolationError` + `ToolExecutionError`
+- [ ] `app/exception.py`：`AgentError` + `ConfigError` + `WorkspaceViolationError` + `ToolExecutionError` + `InvalidArgumentError`
 - [ ] `app/schema/agent_schema.py`：`ToolResult` 增加 `error_type` 字段
 - [ ] `mcp_service/`：`guard` 装饰器（含 internal_error 桶）+ `_resolve_within_workspace` + `_workspace_root`
 - [ ] 各文件工具：`resolve` 移出 try，操作失败保留 `except OSError → ToolResult`

@@ -21,3 +21,12 @@ class WorkspaceViolationError(AgentError):
         self.path = str(path)
         self.workspace = str(workspace)
         super().__init__(f"路径 {self.path} 不在工作区{self.workspace}内")
+
+
+class InvalidArgumentError(AgentError):
+    """工具收到的参数非法（违反输入契约，调用方/模型可修正后重试），区别于代码 bug。
+
+    跨工具共用：各 MCP 工具在参数校验处 raise，guard 按类名归成 error_type="invalid_argument"，
+    正文携带合法取值，供大模型修正。用它替代裸 `raise ValueError`——后者会被 guard 当内部
+    bug（internal_error，明示"非输入问题、无需重试"），语义正好相反。
+    """
