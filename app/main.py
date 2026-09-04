@@ -114,19 +114,21 @@ async def tui_test():
         if user_input in ["quit","q","exit"]:
             break
 
-        state: dict|AgentState = {
+        # 每轮只带"新用户消息 + 本轮瞬态审批队列"；刻意不放 current_plan。
+        # 计划由编排工具（create_plan 等）写回、存于 checkpoint 中跨轮存活，
+        # 这里若注入 [] 会把上一轮建好的计划覆盖清空（曾导致计划无法跨用户轮延续）。
+        state: dict | AgentState = {
             "session_id": "conversation_456",
             "messages": [HumanMessage(content=user_input)],
             "pending_tool_calls": [],
             "approved_tool_calls": [],
-            "current_plan": [],
         }
 
         # res = compile_graph.invoke(state, config=config)
 
         inputs = state  # 首次进入传完整 state；恢复断点时传 Command
         while True:
-            result = await compile_graph.ainvoke(inputs, config)
+            result = await compile_graph.ainvoke(inputs, config)#type:ignore
 
             if "__interrupt__" in result:
                 interrupt_data = result["__interrupt__"]
