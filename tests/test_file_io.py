@@ -4,6 +4,7 @@ from mcp_service.file_io import (
     create_file,
     delete_dir,
     delete_file,
+    edit_file,
     get_directory_tree,
     list_dir,
     search_content,
@@ -11,15 +12,90 @@ from mcp_service.file_io import (
 )
 
 
-def test_create_file_and_write_incremental_lines(tmp_path):
+def test_create_file_then_edit_file_string_anchor(tmp_path):
     file_path = tmp_path / "demo.txt"
 
     result = create_file(str(file_path), "alpha\nbeta\ngamma\n")
     assert result.success is True
 
-    result = write_file(str(file_path), "delta\n", start_line=2, end_line=2)
+    result = edit_file(str(file_path), "beta", "delta")
     assert result.success is True
     assert file_path.read_text(encoding="utf-8") == "alpha\ndelta\ngamma\n"
+
+
+def test_create_file_rejects_existing_file(tmp_path):
+    file_path = tmp_path / "demo.txt"
+    file_path.write_text("old", encoding="utf-8")
+
+    result = create_file(str(file_path), "new")
+
+    assert result.success is False
+    assert "已存在" in result.content
+    assert file_path.read_text(encoding="utf-8") == "old"  # 既不清空也不追加
+
+
+def test_write_file_overwrites_whole_file(tmp_path):
+    file_path = tmp_path / "demo.txt"
+    file_path.write_text("old content", encoding="utf-8")
+
+    result = write_file(str(file_path), "brand new")
+
+    assert result.success is True
+    assert file_path.read_text(encoding="utf-8") == "brand new"
+
+
+def test_edit_file_replace_all(tmp_path):
+    file_path = tmp_path / "demo.txt"
+    file_path.write_text("x=1\nx=2\n", encoding="utf-8")
+
+    result = edit_file(str(file_path), "x=", "y=", replace_all=True)
+
+    assert result.success is True
+    assert file_path.read_text(encoding="utf-8") == "y=1\ny=2\n"
+
+
+def test_edit_file_multiple_matches_require_replace_all(tmp_path):
+    file_path = tmp_path / "demo.txt"
+    file_path.write_text("x=1\nx=2\n", encoding="utf-8")
+
+    result = edit_file(str(file_path), "x=", "y=")
+
+    assert result.success is False
+    assert result.error_type == "invalid_argument"
+    assert "2 处" in result.content
+    assert file_path.read_text(encoding="utf-8") == "x=1\nx=2\n"  # 未改动
+
+
+def test_edit_file_not_found_reports_invalid_argument(tmp_path):
+    file_path = tmp_path / "demo.txt"
+    file_path.write_text("hello", encoding="utf-8")
+
+    result = edit_file(str(file_path), "不存在", "x")
+
+    assert result.success is False
+    assert result.error_type == "invalid_argument"
+    assert file_path.read_text(encoding="utf-8") == "hello"  # 未改动
+
+
+def test_edit_file_missing_file(tmp_path):
+    result = edit_file(str(tmp_path / "nope.txt"), "a", "b")
+    assert result.success is False
+
+
+def test_edit_file_empty_old_string(tmp_path):
+    file_path = tmp_path / "demo.txt"
+    file_path.write_text("hello", encoding="utf-8")
+
+    result = edit_file(str(file_path), "", "x")
+
+    assert result.success is False
+    assert result.error_type == "invalid_argument"
+
+
+def test_edit_file_violation_carries_error_type():
+    result = edit_file("/etc/coding_agent_edit_outside.txt", "a", "b")
+    assert result.success is False
+    assert result.error_type == "workspace_violation"
 
 
 def test_copy_and_delete_dir(tmp_path):

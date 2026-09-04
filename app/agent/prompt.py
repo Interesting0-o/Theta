@@ -43,6 +43,19 @@ SYSTEM_PROMPT = """\
 - search_content(query, path=".", max_results, extensions)：在工作区文件里按内容检索。
   注意：是"大小写不敏感的子串匹配"，不是正则；返回 相对路径:行号:行 的命中清单，
   用于定位某段逻辑/某标识符出现在哪，定位后再 read_file 取上下文。
+- list_repos()：列出工作区内所有 git 仓库（各仓库根目录的绝对路径清单）；
+  工作区里没有任何仓库时会明确说明。免审批。
+- git_status(repo_path)：查看某个 git 仓库的工作区状态（中文渲染的分支信息 +
+  改动/未跟踪文件清单），repo_path 传 list_repos 给出的绝对路径（相对工作区根
+  的路径也可）。免审批。
+- git_branches(repo_path)：列出某个 git 仓库的本地/远程分支并标出当前分支
+  （游离 HEAD 会单独说明）。免审批。
+- git_diff(repo_path, path="")：查看某个 git 仓库的改动内容（暂存区 + 未暂存工作区
+  分开的 diff）。注意不含未跟踪文件；改动量大时用 path 参数只查某文件/目录。免审批。
+- git_log(repo_path, max_count=20)：查看某个 git 仓库最近提交历史（新→旧，含
+  短哈希/日期/提交摘要），max_count 控制条数（上限 500）。免审批。
+- git_fetch(repo_path, remote="origin")：从远程拉取最新对象到远程跟踪引用，
+  不动工作树与当前分支。免审批。
 
 [联网检索]（均需审批，见"审批闸门"）
 - web_search(query)：联网搜索（Tavily），查资料、API 文档、报错信息用。
@@ -53,13 +66,25 @@ SYSTEM_PROMPT = """\
 - deep_research(query)：深度研究报告（慢、消耗大），只在需要综合调研时用，别顺手调。
 
 [写 / 删 / 复制]（均需审批，见"审批闸门"）
-- create_file(path, content="")：新建文件并写入；**若文件已存在则是在末尾追加，不会覆盖**。
-- write_file(path, content, start_line, end_line)：整文件覆盖；或带 start_line/end_line
-  时按行区间（含两端、从 1 起）做局部替换。改已有代码的主要手段，见"工具语义细节"。
+- create_file(path, content="")：新建文件并写入；**文件已存在则报错**，改已有文件用
+  edit_file / write_file。
+- edit_file(path, old_string, new_string, replace_all=False)：字符串锚定增量编辑，
+  改已有代码的首选（见"工具语义细节"）。
+- write_file(path, content)：整文件覆盖；只在改动面覆盖大半时才用，小改走 edit_file。
 - create_dir(dir_path)：新建目录（含父级）。
 - delete_file(path) / delete_dir(dir_path, recursive=False)：删除文件 / 目录
   （目录非空需 recursive=True）。
 - copy_path(source, destination, recursive=True)：复制文件或目录。
+- git_add(repo_path, files)：把文件列表加入某仓库的暂存区（需审批）。repo_path 用
+  list_repos 给出的绝对路径；files 是相对 repo_path 的路径，不允许越过仓库边界。
+- git_commit(repo_path, message, all_changes=False)：提交（需审批）。默认只提交暂存区
+  （先 git_add 精确选择再提交）；all_changes=True 才连带提交所有已跟踪文件的修改
+  （注意：不含未跟踪文件）。提交身份沿用设备 git 配置；提交信息末尾会自动追加
+  "Co-authored-by: Coding Agent" 尾注，不要在 message 里重复写。
+- git_switch(repo_path, branch)：切换当前分支（需审批）。本地没有该分支时，若恰好
+  一个远程有同名跟踪分支会自动创建并切换；有未提交改动且会被覆盖时 git 会拒绝切换。
+- git_pull(repo_path, remote="origin", branch="")：从远程拉取并合并到当前分支（需审批）。
+  工作树有冲突的未提交改动时 git 会拒绝；未配置上游时留空 branch 会失败，按回显提示处理。
 
 [执行]（需审批）
 - run_command(command, cwd="", timeout=30)：在终端执行一条 shell 命令并返回输出
@@ -99,12 +124,11 @@ SYSTEM_PROMPT = """\
 ========================================================================
 五、工具语义细节（schema docstring 里看不清、但会坑到你的点）
 ========================================================================
-- 改已有文件优先 write_file 的行区间替换，不要整文件重写一个上百行文件（除非改动面
-  覆盖大半）。行号基于"当前磁盘内容"，动手前先 read_file 拿到最新且准确的行号；
-  行区间替换是含端点的：要换第 10~12 行传 start_line=10, end_line=12。
-- 你刚改完的文件，后续再改必须重新 read_file 算行号（内容变了，旧行号会漂移）。
-- create_file 是"追加"语义：对已存在文件重复 create_file 不会清空重写，只会越接越长；
-  想整体覆盖用 write_file（不带行区间）。
+- 改已有文件优先 edit_file 字符串锚定替换，不要整文件重写一个上百行文件（除非改动面
+  覆盖大半）。old_string 必须与当前磁盘内容**精确一致**（含缩进、空白、标点），且默认
+  唯一匹配：报"命中 N 处"就加长锚定片段或传 replace_all=True；报"未找到"说明文件内容
+  已变，先 read_file 拿到最新内容再编辑。edit_file 不需要数行号。
+- create_file 只用于新建：文件已存在会报错（想改内容用 edit_file / write_file）。
 - search_content 是子串检索不是正则；需要正则/更快的全仓搜索时改用 run_command
   里的 grep -rn 等。
 - run_command 默认 30 秒超时、同步阻塞：长命令显式调大 timeout，或拆成多步短命令；

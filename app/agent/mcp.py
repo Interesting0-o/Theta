@@ -1,14 +1,15 @@
-"""MCP 工具加载：以 stdio 子进程拉起 file_io / terminal / web_search 三个 MCP server。
+"""MCP 工具加载：以 stdio 子进程拉起 file_io / terminal / git / web_search 四个 MCP server。
 
 工作区 WORKSPACE_PATH 由 get_graph 解析后传入；这里在拉起子进程前先做前置校验
 （未提供 / 目录不存在 → ConfigError），避免把坏配置传进子进程再等它 import 时失败。
 子进程约定：
-- env 注入 WORKSPACE_PATH（mcp_service.file_io 在 import 时校验）与 PYTHONPATH=项目根；
-- 三个 server 的 cwd 都设为工作区根目录，使 terminal.run_command 不传 cwd 时默认
+- env 注入 WORKSPACE_PATH（mcp_service.file_io / mcp_service.git 在 import 时校验）
+  与 PYTHONPATH=项目根；
+- 四个 server 的 cwd 都设为工作区根目录，使 terminal.run_command 不传 cwd 时默认
   在工作区里执行（而非 CodingAgent 仓库根），降低误删自身源码的风险；
 - web_search 额外注入 TAVILY_API_KEY（mcp_service/web_search 在 import 时校验）。
   密钥为空（.env 里留空）时跳过该 server 并告警——联网检索是可选能力，
-  不阻塞主流程；文件/终端能力不受影响。
+  不阻塞主流程；文件/终端/git 能力不受影响。
 """
 import asyncio
 import logging
@@ -39,7 +40,7 @@ def _validate_workspace(workspace_path) -> str:
 def _build_servers(workspace_path: str) -> dict[str, Connection]:
     """按当前配置构造要拉起的 MCP server 连接集合（不实际拉起子进程，便于单测）。
 
-    - file_io / terminal：必选，cwd 设为工作区根；
+    - file_io / terminal / git：必选，cwd 设为工作区根；
     - web_search：TAVILY_API_KEY 为空则跳过并告警（可选能力不阻塞主流程）。
     """
     env = {
@@ -49,8 +50,8 @@ def _build_servers(workspace_path: str) -> dict[str, Connection]:
         "PYTHONPATH": str(PROJECT_ROOT),
     }
 
-    # 三个 server 都以工作区为启动目录（而非项目根）：
-    # - file_io 本身按 WORKSPACE_PATH 解析路径，cwd 与解析无关，切到工作区保持一致；
+    # 各 server 都以工作区为启动目录（而非项目根）：
+    # - file_io / git 本身按 WORKSPACE_PATH 解析路径，cwd 与解析无关，切到工作区保持一致；
     # - terminal 的 run_command 不显式传 cwd 时就在该进程 cwd 里执行，
     #   切到工作区可避免命令默认落在 CodingAgent 仓库根、误伤自身源码；
     # - web_search 不碰文件系统，切到工作区仅保持约定一致。
@@ -68,10 +69,18 @@ def _build_servers(workspace_path: str) -> dict[str, Connection]:
         cwd=workspace_path,
         env=env,
     )
+    git_connection = StdioConnection(
+        transport="stdio",
+        command=sys.executable,
+        args=["-m", "mcp_service.git"],
+        cwd=workspace_path,
+        env=env,
+    )
 
     servers: dict[str, Connection] = {
         "file_io": file_io_connection,
         "terminal": terminal_connection,
+        "git": git_connection,
     }
 
     tavily_key = get_settings().TAVILY_API_KEY.get_secret_value()

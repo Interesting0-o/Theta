@@ -24,6 +24,7 @@ dependencies = [
     "dotenv>=0.9.9",
     # ── 可观测性 ──
     "langsmith>=0.8.3",
+    "gitpython>=3.1.61",
 ]
 
 # 可选扩展：按需安装，如  uv sync --extra web

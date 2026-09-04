@@ -2,8 +2,8 @@
 文件IO操作的MCP服务器：在工作区沙箱（WORKSPACE_PATH）内提供文件与目录操作。
 
 工具清单：
-- create_file / create_dir            新建文件（追加写）/ 新建目录
-- write_file / read_file              整文件写 / 按行区间替换 / 读取
+- create_file / create_dir            新建文件 / 新建目录
+- write_file / edit_file / read_file  整文件覆盖 / 字符串锚定增量编辑 / 读取
 - delete_file / delete_dir            删除文件 / 删除目录（非空需 recursive）
 - copy_path                           复制文件或目录
 - list_dir / get_directory_tree       列目录 / 递归目录树
@@ -70,7 +70,7 @@ mcp = FastMCP("FileIO")
 @guard
 def create_file(path: str, content: str = "") -> ToolResult:
     """
-    新建或追加写入一个文件。
+    新建一个文件并写入内容；若文件已存在则报错（改已有文件请用 edit_file / write_file）。
     Args:
         path: 包含父级目录的文件地址同时还需要包含文件名以及后缀名。
         content: 要写入文件的内容,如果不提供content参数,则默认为空
@@ -81,9 +81,13 @@ def create_file(path: str, content: str = "") -> ToolResult:
     _is_in_workspace(file_path)
 
     try:
+        if file_path.exists():
+            return ToolResult(
+                success=False,
+                content=f"文件已存在: {file_path}（改已有文件请用 edit_file / write_file）",
+            )
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        with file_path.open("a", encoding="utf-8") as f:
-            f.write(content)
+        file_path.write_text(content, encoding="utf-8")
     except OSError as e:
         # 环境性失败（磁盘满/无权限等）→ 返回数据让模型可重试；内部 bug 交给 guard
         return ToolResult(success=False, error_type="io_error", content=f"写入文件失败: {e}")
@@ -182,60 +186,82 @@ def copy_path(source: str, destination: str, recursive: bool = True) -> ToolResu
 
 @mcp.tool()
 @guard
-def write_file(
-    path: str,
-    content: str,
-    start_line: int | None = None,
-    end_line: int | None = None,
-) -> ToolResult:
+def write_file(path: str, content: str) -> ToolResult:
     """
-    写入文件内容。
-    当提供 start_line / end_line 时，按指定行区间做增量替换；
-    如果未提供，则直接覆盖整个文件。
+    整文件覆盖写入。小范围修改请用 edit_file（字符串锚定），不要整文件重写。
     Args:
         path: 所要写入文件的路径
-        content: 要写入的内容
-        start_line: 写入文件大的开始行数
-        end_ine:写入文件的结束行数
+        content: 要写入的完整内容（覆盖原文件）
     """
     file_path = _resolve_path(path)
     _is_in_workspace(file_path)  # 检查路径是否在工作区路径内
 
     try:
-        if not file_path.parent.exists():  # 确保父目录存在
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if start_line is None and end_line is None:
-            file_path.write_text(content, encoding="utf-8")
-            return ToolResult(success=True, content=f"文件已写入: {file_path}")
-
-        start_index = 1 if start_line is None else max(1, start_line)
-        end_index = start_index if end_line is None else max(start_index, end_line)
-
-        if start_index < 1 or end_index < start_index:
-            return ToolResult(
-                success=False,
-                content=f"非法行区间: start_line={start_line}, end_line={end_line}",
-            )
-
-        if not file_path.exists():
-            file_path.write_text("", encoding="utf-8")
-
-        existing = file_path.read_text(encoding="utf-8").splitlines(keepends=True)
-        start_pos = start_index - 1
-        end_pos = end_index
-
-        if start_pos > len(existing):
-            existing.extend(["\n"] * (start_pos - len(existing)))
-
-        existing[start_pos:end_pos] = [content]
-        file_path.write_text("".join(existing), encoding="utf-8")
-        return ToolResult(
-            success=True,
-            content=f"文件已按行区间写入: {file_path} (lines {start_index}-{end_index})",
-        )
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
     except OSError as e:
         return ToolResult(success=False, error_type="io_error", content=f"写入文件失败: {e}")
+    return ToolResult(success=True, content=f"文件已写入: {file_path}")
+
+
+@mcp.tool()
+@guard
+def edit_file(
+    path: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+) -> ToolResult:
+    """
+    用字符串锚定做增量编辑：把文件中的 old_string 精确替换为 new_string。
+
+    这是修改已有代码的首选方式——不需要数行号（行号会随前序编辑漂移），也不重写整个文件。
+    规则：
+    - old_string 必须在文件中精确出现（含空白与缩进），否则报错并提示先 read_file 核对；
+    - 默认要求唯一匹配：多处出现时返回命中次数，需加长锚定片段使其唯一，或传 replace_all；
+    - replace_all=True 时替换全部匹配。
+
+    Args:
+        path: 要编辑的文件路径
+        old_string: 要被替换的原文片段（须唯一匹配）
+        new_string: 替换后的新内容
+        replace_all: 是否替换全部匹配，默认 False
+    """
+    file_path = _resolve_path(path)
+    _is_in_workspace(file_path)  # 检查路径是否在工作区路径内
+
+    try:
+        if not file_path.exists():
+            return ToolResult(success=False, content=f"文件不存在: {file_path}")
+        text = file_path.read_text(encoding="utf-8")
+    except OSError as e:
+        return ToolResult(success=False, error_type="io_error", content=f"读取文件失败: {e}")
+
+    if not old_string:
+        return ToolResult(success=False, error_type="invalid_argument", content="old_string 不能为空")
+
+    count = text.count(old_string)
+    if count == 0:
+        return ToolResult(
+            success=False,
+            error_type="invalid_argument",
+            content="未找到 old_string（文件内容可能已变化，请先 read_file 核对后再编辑）",
+        )
+    if count > 1 and not replace_all:
+        return ToolResult(
+            success=False,
+            error_type="invalid_argument",
+            content=f"old_string 命中 {count} 处，不是唯一匹配：请加长锚定片段使其唯一，或传 replace_all=True",
+        )
+
+    updated = text.replace(old_string, new_string)
+    try:
+        file_path.write_text(updated, encoding="utf-8")
+    except OSError as e:
+        return ToolResult(success=False, error_type="io_error", content=f"写入文件失败: {e}")
+
+    times = count if replace_all else 1
+    return ToolResult(success=True, content=f"文件 {file_path} 已编辑（替换 {times} 处）")
 
 @mcp.tool()
 @guard

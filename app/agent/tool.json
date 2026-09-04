@@ -43,6 +43,10 @@
         "need_review":true,
         "source":"mcp_service/file_io"
     },
+    "edit_file":{
+        "need_review":true,
+        "source":"mcp_service/file_io"
+    },
     "read_file":{
         "need_review":false,
         "source":"mcp_service/file_io"
@@ -62,6 +66,46 @@
     "run_command":{
         "need_review":true,
         "source":"mcp_service/terminal"
+    },
+    "list_repos":{
+        "need_review":false,
+        "source":"mcp_service/git"
+    },
+    "git_status":{
+        "need_review":false,
+        "source":"mcp_service/git"
+    },
+    "git_branches":{
+        "need_review":false,
+        "source":"mcp_service/git"
+    },
+    "git_diff":{
+        "need_review":false,
+        "source":"mcp_service/git"
+    },
+    "git_log":{
+        "need_review":false,
+        "source":"mcp_service/git"
+    },
+    "git_fetch":{
+        "need_review":false,
+        "source":"mcp_service/git"
+    },
+    "git_add":{
+        "need_review":true,
+        "source":"mcp_service/git"
+    },
+    "git_commit":{
+        "need_review":true,
+        "source":"mcp_service/git"
+    },
+    "git_switch":{
+        "need_review":true,
+        "source":"mcp_service/git"
+    },
+    "git_pull":{
+        "need_review":true,
+        "source":"mcp_service/git"
     },
     "web_search":{
         "need_review":true,
