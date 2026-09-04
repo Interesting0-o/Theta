@@ -20,20 +20,14 @@ Literal 后 FastMCP 会在 JSON Schema 里生成 enum，模型只看到合法取
 失败 ToolResult / 特制渲染的字符串正文（content 恒为 str，不违反 ToolResult schema）。
 """
 import os
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from langchain_tavily import TavilyCrawl, TavilyExtract, TavilyResearch, TavilySearch
 from mcp.server.fastmcp import FastMCP
 
 from app.exception import ConfigError, InvalidArgumentError
 from app.schema.agent_schema import ToolResult
-from mcp_service.utils import (
-    guard,
-    _crawl_result_to_text,
-    _extract_result_to_text,
-    _research_result_to_text,
-    _search_result_to_text,
-)
+from mcp_service.utils import guard
 
 # 枚举与上游 TavilySearch 的合法取值保持一致
 SearchDepth = Literal["basic", "advanced", "fast", "ultra-fast"]
@@ -211,6 +205,195 @@ async def deep_research(
 
     raw_result = await tool.ainvoke({"input": query})
     return _research_result_to_text(raw_result)
+
+
+# ---------------- Tavily 上游返回翻译（四个工具共用，只被本模块使用） ----------------
+#
+# Tavily 各 wrapper（Search / Extract / Crawl / Research）把上游失败吞成**返回值**、从不
+# raise：空结果抛 ToolException 被 handle_tool_error 渲染成字符串，其余异常返回
+#  {"error": ...}。guard 拦不到这些失败，因此在这里显式分类，否则"错误"会以 success=True
+# 喂给模型。四类形态：
+# - dict 且含顶层 "error" → upstream_error（key 无效 / 限流 / 网络等）
+# - dict 正常 → success，正文由各工具的 render 函数渲染（各工具返回结构不同，各自提供）
+# - str → no_results（Tavily 的空结果/无内容错误串，含改进建议，模型可据此调整参数）
+# - 其它 → upstream_error（如 stream=True 时 research 返回的字节流对象）
+#
+# 渲染原则：
+# - **不截断工具结果**。截断会静默丢失信息且不可恢复（模型会把残缺当完整来推理）；结果
+#   大小应由**工具参数**控制（模型自己选 max_results / URL 粒度等），渲染层只做保真呈现。
+# - 成功 dict 的正文由 render_success 渲染成字符串——ToolResult.content 的类型是 str，
+#   直接塞 dict 会在构造时抛 ValidationError。
+# - search 渲染剔除 score/raw_content 等是**有意的字段选择**：那是可选附料，不是被请求
+#   的交付物；模型若要整页正文应组合调用 extract_urls。extract/crawl/research 的特制渲染
+#   遵循同一原则：只渲染交付物（提取正文 / 页面正文 / 报告），附料（response_time/usage
+#   等）一律不渲染。
+
+def _translate_upstream(raw: Any, *, render_success: Callable[[Dict[str, Any]], str]) -> ToolResult:
+    """把 Tavily 系 wrapper 的返回统一翻译成 ToolResult。"""
+    if isinstance(raw, dict):
+        if "error" in raw:
+            return ToolResult(
+                success=False,
+                error_type="upstream_error",
+                content=f"上游返回错误：{raw['error']}",
+            )
+        return ToolResult(success=True, content=render_success(raw))
+    if isinstance(raw, str):
+        return ToolResult(success=False, error_type="no_results", content=raw)
+    # 无法识别的类型（如 stream=True 时的字节流）不是交付物，repr 只截前 500 字符防止
+    # 巨量垃圾灌入上下文；与"不截断工具结果"原则不冲突——那一条只针对成功交付物。
+    return ToolResult(
+        success=False,
+        error_type="upstream_error",
+        content=f"返回了无法识别的数据：{str(raw)[:500]}",
+    )
+
+
+def _render_results(raw: Dict[str, Any]) -> str:
+    """把 TavilySearch 成功返回的 results 列表压成模型友好的 markdown 文本。
+
+    按"交付物"取舍：保留 AI 摘要（若有）+ 每条结果的标题/URL/content 片段；剔除
+    score / follow_up_questions / response_time 与可选的大字段 raw_content——那是附料，
+    模型若要整页正文应改用 extract_urls 定向提取。
+    """
+    lines: List[str] = []
+    answer = raw.get("answer")
+    if isinstance(answer, str) and answer.strip():
+        lines.append(f"AI 摘要：{answer}\n")
+
+    items = raw.get("results") or []
+    for i, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            lines.append(f"{i}. {item}")
+            continue
+        title = str(item.get("title") or "无标题")
+        url = item.get("url")
+        content = str(item.get("content") or "").strip()
+        lines.append(f"{i}. {title}")
+        if url:
+            lines.append(f"   {url}")
+        if content:
+            lines.append(f"   {content}")
+
+    if not lines:
+        return f"未找到与 {raw.get('query', '')!r} 相关的结果。"
+    return "\n".join(lines)
+
+
+def _search_result_to_text(raw: Any) -> ToolResult:
+    """web_search 的返回翻译：成功 dict 用 _render_results 渲染，失败形态走 _translate_upstream。"""
+    return _translate_upstream(raw, render_success=_render_results)
+
+
+def _render_failed(raw: Dict[str, Any], label: str, lines: List[str]) -> None:
+    """把 Tavily 返回里的 failed_results（未取到的 URL 列表）显式追加进渲染行。"""
+    failed = raw.get("failed_results") or []
+    if failed:
+        lines.append(f"{label}: {', '.join(str(u) for u in failed)}")
+
+
+def _render_extract(raw: Dict[str, Any]) -> str:
+    """把 TavilyExtract 成功返回渲染成文本：每条结果 = 编号 + URL + 提取正文。
+
+    提取正文（raw_content）就是本工具的交付物，不截断；附料（response_time/usage 等）
+    不渲染。失败的 URL 单独列出，让模型知道哪些源没取到。
+    """
+    lines: List[str] = []
+    items = raw.get("results") or []
+    for i, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            lines.append(f"{i}. {item}")
+            continue
+        url = item.get("url")
+        lines.append(f"{i}. {url or '(无 URL)'}")
+        content = item.get("raw_content")
+        if content:
+            lines.append(str(content).strip())
+        images = item.get("images")
+        if isinstance(images, list) and images:
+            lines.append(f"   图片: {', '.join(str(u) for u in images)}")
+
+    _render_failed(raw, "提取失败的 URL", lines)
+
+    if not lines:
+        return "未从指定 URL 提取到内容。"
+    return "\n".join(lines)
+
+
+def _render_crawl(raw: Dict[str, Any]) -> str:
+    """把 TavilyCrawl 成功返回渲染成文本：每条结果 = 编号 + 标题 + URL + 页面正文。"""
+    lines: List[str] = []
+    items = raw.get("results") or []
+    for i, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            lines.append(f"{i}. {item}")
+            continue
+        title = item.get("title") or "(无标题)"
+        url = item.get("url")
+        content = item.get("content") or item.get("raw_content") or ""
+        lines.append(f"{i}. {title}")
+        if url:
+            lines.append(f"   {url}")
+        if content:
+            lines.append(str(content).strip())
+
+    _render_failed(raw, "爬取失败的 URL", lines)
+
+    if not lines:
+        return "未爬取到任何页面内容。"
+    return "\n".join(lines)
+
+
+def _render_research(raw: Dict[str, Any]) -> str:
+    """把 TavilyResearch 成功返回渲染成文本。
+
+    创建接口只回任务回执（status/request_id/input/model）；若返回里带报告正文
+    （content）与引用来源（sources，如已完成的检索结果），一并渲染。
+    """
+    lines: List[str] = [
+        f"研究任务状态: {raw.get('status', '未知')}",
+        f"request_id: {raw.get('request_id', '未知')}",
+        f"研究课题: {raw.get('input', '未知')}",
+    ]
+    model = raw.get("model")
+    if model:
+        lines.append(f"使用模型: {model}")
+    created = raw.get("created_at")
+    if created:
+        lines.append(f"创建时间: {created}")
+
+    content = raw.get("content")
+    if content:
+        lines.append(str(content))
+    sources = raw.get("sources") or []
+    if sources:
+        lines.append("引用来源:")
+        for src in sources:
+            if isinstance(src, dict):
+                title = src.get("title")
+                url = src.get("url")
+                if title and url:
+                    lines.append(f"- {title}  {url}")
+                else:
+                    lines.append(f"- {url or title or src}")
+            else:
+                lines.append(f"- {src}")
+    return "\n".join(lines)
+
+
+def _extract_result_to_text(raw: Any) -> ToolResult:
+    """extract_urls 的返回翻译：成功 dict 用 _render_extract 渲染，失败形态走 _translate_upstream。"""
+    return _translate_upstream(raw, render_success=_render_extract)
+
+
+def _crawl_result_to_text(raw: Any) -> ToolResult:
+    """crawl_website 的返回翻译：成功 dict 用 _render_crawl 渲染，失败形态走 _translate_upstream。"""
+    return _translate_upstream(raw, render_success=_render_crawl)
+
+
+def _research_result_to_text(raw: Any) -> ToolResult:
+    """deep_research 的返回翻译：成功 dict 用 _render_research 渲染，失败形态走 _translate_upstream。"""
+    return _translate_upstream(raw, render_success=_render_research)
 
 
 if __name__ == "__main__":

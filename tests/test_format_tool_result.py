@@ -1,13 +1,11 @@
-"""app/agent/utils.py::format_tool_result 的测试（对应 EXCEPTION_DESIGN.md §10 L4）。
+"""app/agent/nodes.py::format_tool_result 的测试（对应 EXCEPTION_DESIGN.md §10 L4）。
 
-注意：import app.agent.utils 会触发 app.agent/__init__ → graph → model，
+注意：import app.agent.nodes 会触发 app.agent/__init__ → graph → model，
 而 model 顶层调用 get_settings()，因此运行本文件要求 .env 存在（CLAUDE.md 前提）。
 """
-from types import SimpleNamespace
-
 import json
 
-from app.agent.utils import format_tool_approval, format_tool_result, truncate
+from app.agent.nodes import format_tool_result
 from app.schema.agent_schema import ToolResult
 
 
@@ -79,31 +77,3 @@ def test_format_tool_result_mcp_blocks_drops_id_and_non_text():
         {"type": "image", "base64": "xxx"},
     ]
     assert format_tool_result(blocks) == "第一段"
-
-
-def test_truncate_keeps_short_text():
-    assert truncate("abc") == "abc"
-
-
-def test_truncate_long_text_marks_cut():
-    out = truncate("x" * 300)
-    assert out.startswith("x" * 200)
-    assert "已截断" in out
-
-
-def test_format_tool_approval_extracts_fields():
-    items = [
-        SimpleNamespace(
-            value={
-                "tool_name": "write_file",
-                "current_step": 3,
-                "tool_args": {"path": "/ws/demo.txt", "content": "y" * 300},
-                "tool_call_id": "call_1",
-            }
-        )
-    ]
-    text = format_tool_approval(items)
-    assert "[write_file]" in text
-    assert "步骤 3" in text
-    assert "调用ID: call_1" in text
-    assert "已截断" in text  # 超长参数内容被 truncate

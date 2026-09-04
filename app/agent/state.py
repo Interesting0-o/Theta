@@ -15,7 +15,7 @@ class AgentState(TypedDict):
     approved_tool_calls: List[dict[str, Any]]
 
     #--------------编排模式-----------------
-    # 已批准待执行的编排类调用（source ∈ ORCHESTRATE_SOURCES），由 orchestrate_node 消费
+    # 已批准待执行的编排类调用（source 命中 nodes.py 的 ORCHESTRATE_SOURCES），由 orchestrate_node 消费
     approved_orchestrate_calls: List[dict[str, Any]]
     # 当前计划：每步 {id: str, task: str, status: PlanStatus}
     # 由编排节点写回；模型通过编排工具（create_plan/update_plan_step/clear_plan）驱动

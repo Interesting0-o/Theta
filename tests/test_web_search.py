@@ -1,7 +1,8 @@
 """web_search 上游返回翻译的测试：_translate_upstream + extract/crawl/research 三个特制渲染。
 
-只 import mcp_service.utils（不 import mcp_service.web_search，避免 TAVILY_API_KEY 依赖），
-因此**不要求 .env / WORKSPACE_PATH**，可独立运行：
+翻译逻辑已随单一职责移到 mcp_service/web_search.py（只被该 server 使用）；这里直接
+import 它。web_search.py 在 import 期检查 TAVILY_API_KEY，故先用 setdefault 塞一个
+测试占位键（不发起真实网络请求），因此**不要求 .env / WORKSPACE_PATH**，可独立运行：
 
     uv run python -m pytest tests/test_web_search.py
 
@@ -12,7 +13,11 @@
   无法识别的类型 → upstream_error；
 - 特制渲染保留交付物（正文/URL/状态），并显式列出失败项。
 """
-from mcp_service.utils import (
+import os
+
+os.environ.setdefault("TAVILY_API_KEY", "test-key")
+
+from mcp_service.web_search import (
     _crawl_result_to_text,
     _extract_result_to_text,
     _render_crawl,
