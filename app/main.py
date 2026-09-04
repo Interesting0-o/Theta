@@ -51,6 +51,11 @@ def format_tool_approval(interrupts) -> str:
         lines.append(header)
 
         args = value.get("tool_args", {})
+        # 终端等工具带必填 description（模型对命令的人话解释）：单独一行突出展示，
+        # 让人先看到"意图"，再核对下方命令本身是否一致。
+        if isinstance(args, dict) and args.get("description"):
+            lines.append(f"  解释: {truncate(str(args['description']))}")
+            args = {k: v for k, v in args.items() if k != "description"}
         if args:
             lines.append("  参数:")
             if isinstance(args, dict):

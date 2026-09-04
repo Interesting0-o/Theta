@@ -61,13 +61,14 @@ TAVILY_API_KEY=tvly-...              # 网页搜索 Key
 uv run python -m app.main
 ```
 
-输入任意问题即可开始对话。当模型请求调用 `write_file`、`run_command` 等敏感工具时，会看到类似这样的审批提示：
+输入任意问题即可开始对话。当模型请求调用 `write_file`、`run_command` 等敏感工具时，会看到类似这样的审批提示——终端命令会强制模型附带一句 `解释`（它在干什么、预期什么），与命令本身同屏展示，让你先看意图再核对命令：
 
 ```
 +---------+
 | Command |
 +---------+
 [run_command]   步骤 1/1
+  解释: 删除临时演示目录 /tmp/demo
   参数:
     - command: rm -rf /tmp/demo
   调用ID: call_xxx
@@ -121,7 +122,7 @@ asyncio.run(main())
 | 工具 | 来源 | 审批 |
 | --- | --- | --- |
 | `web_search` | Tavily | 免审 |
-| `read_file` / `list_dir` / `get_directory_tree` | mcp_service/file_io | 免审 |
+| `read_file` / `list_dir` / `get_directory_tree` / `glob` / `search_content` | mcp_service/file_io | 免审 |
 | `create_file` / `create_dir` / `delete_file` / `delete_dir` / `copy_path` / `write_file` | mcp_service/file_io | 需审批 |
 | `run_command` | mcp_service/terminal | 需审批 |
 
