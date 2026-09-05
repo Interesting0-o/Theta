@@ -1,11 +1,11 @@
 import asyncio
 import json
-import sqlite3
 from pathlib import Path
 
+import aiosqlite
 from langchain_core.runnables import RunnableConfig
 from langchain.messages import HumanMessage
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
 from app.agent.graph import get_graph
@@ -78,10 +78,11 @@ async def tui_test():
     TUI测试
     """
     db_path = get_agent_db_path()
-    connection = sqlite3.connect(str(db_path), check_same_thread=False)
-    checkpointer = SqliteSaver(connection)
+    # ainvoke 走异步循环，必须用 AsyncSqliteSaver（同步 SqliteSaver 不支持 async 方法）
+    connection = await aiosqlite.connect(str(db_path))
+    checkpointer = AsyncSqliteSaver(connection)
     # 创建表
-    checkpointer.setup()
+    await checkpointer.setup()
 
     graph = await get_graph()
     compile_graph = graph.compile(checkpointer=checkpointer)
@@ -107,48 +108,52 @@ async def tui_test():
         }
     }
     
-    while True:
-        print(user_title)
-        try:
-            user_input = input()
-        except EOFError:
-            print("\n输入流已关闭，已退出。")
-            break
-        print()
-
-        if user_input in ["quit","q","exit"]:
-            break
-
-        # 每轮只带"新用户消息 + 本轮瞬态审批队列"；刻意不放 current_plan。
-        # 计划由编排工具（create_plan 等）写回、存于 checkpoint 中跨轮存活，
-        # 这里若注入 [] 会把上一轮建好的计划覆盖清空（曾导致计划无法跨用户轮延续）。
-        state: dict | AgentState = {
-            "session_id": "conversation_456",
-            "messages": [HumanMessage(content=user_input)],
-            "pending_tool_calls": [],
-            "approved_tool_calls": [],
-        }
-
-        # res = compile_graph.invoke(state, config=config)
-
-        inputs = state  # 首次进入传完整 state；恢复断点时传 Command
+    try:
         while True:
-            result = await compile_graph.ainvoke(inputs, config)#type:ignore
+            print(user_title)
+            try:
+                user_input = input()
+            except EOFError:
+                print("\n输入流已关闭，已退出。")
+                break
+            print()
 
-            if "__interrupt__" in result:
-                interrupt_data = result["__interrupt__"]
-                print(command_title)
-                print(format_tool_approval(interrupt_data))
-                print()
-                decision = input("是否批准该操作？(y/n): ").strip().lower()
-                is_approved = decision in ("y", "yes", "是")
-                inputs = Command(resume={"approved": is_approved})
-                continue
-            
-            if "messages" in result:
-                print(ai_title)
-                print(result["messages"][-1].content)
-            break
+            if user_input in ["quit","q","exit"]:
+                break
+
+            # 每轮只带"新用户消息 + 本轮瞬态审批队列"；刻意不放 current_plan。
+            # 计划由编排工具（create_plan 等）写回、存于 checkpoint 中跨轮存活，
+            # 这里若注入 [] 会把上一轮建好的计划覆盖清空（曾导致计划无法跨用户轮延续）。
+            state: dict | AgentState = {
+                "session_id": "conversation_456",
+                "messages": [HumanMessage(content=user_input)],
+                "pending_tool_calls": [],
+                "approved_tool_calls": [],
+            }
+
+            # res = compile_graph.invoke(state, config=config)
+
+            inputs = state  # 首次进入传完整 state；恢复断点时传 Command
+            while True:
+                result = await compile_graph.ainvoke(inputs, config)#type:ignore
+
+                if "__interrupt__" in result:
+                    interrupt_data = result["__interrupt__"]
+                    print(command_title)
+                    print(format_tool_approval(interrupt_data))
+                    print()
+                    decision = input("是否批准该操作？(y/n): ").strip().lower()
+                    is_approved = decision in ("y", "yes", "是")
+                    inputs = Command(resume={"approved": is_approved})
+                    continue
+
+                if "messages" in result:
+                    print(ai_title)
+                    print(result["messages"][-1].content)
+                break
+    finally:
+        # 关闭 aiosqlite 连接：不关会让后台 sqlite 线程残留、python 进程无法退出
+        await connection.close()
 
 if __name__ == "__main__":
     
