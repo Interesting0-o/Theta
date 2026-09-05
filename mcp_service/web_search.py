@@ -1,6 +1,6 @@
 """web_search MCP server：把 Tavily 搜索能力封装成 async 工具，返回统一 ToolResult。
 
-错误处理约定（与 EXCEPTION_DESIGN.md 对齐，区别于文件工具处"抛 typed 异常"的做法——
+错误处理约定（与 docs/EXCEPTION_DESIGN.md 对齐，区别于文件工具处"抛 typed 异常"的做法——
 见下）：
 - 参数非法：**raise `InvalidArgumentError`（AgentError 子类）**，替代裸 ValueError / 就地
   return。guard 按类名归成 error_type="invalid_argument"，正文携带合法取值，模型可修正重试；

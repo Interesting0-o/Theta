@@ -3,7 +3,7 @@
 - `guard`：工具异常安全网（唯一的分类点）。把工具抛出的异常收口成 `ToolResult`，
   **保证异常绝不漏出工具边界**——否则异常会一路冒到 FastMCP，导致 MCP 子进程崩溃。
   同步与异步工具函数都支持（`inspect.iscoroutinefunction` 分派）。
-  分类规则（EXCEPTION_DESIGN.md §4/§7）：
+  分类规则（docs/EXCEPTION_DESIGN.md §4/§7）：
   - `AgentError` 及其子类（可预期的业务失败）→ 按类名转成 `error_type` 标记
     （例：InvalidArgumentError → "invalid_argument"、WorkspaceViolationError →
     "workspace_violation"），正文携带事实，供大模型分析、调整；
@@ -47,7 +47,7 @@ def _error_result(fn_name: str, exc: BaseException) -> ToolResult:
     """把一次已捕获的工具异常分类成 `ToolResult`。
 
     必须在 `except` 块内调用，`logger.exception` 才能取到当前异常的 traceback。
-    分类依据（EXCEPTION_DESIGN.md §4/§7）：
+    分类依据（docs/EXCEPTION_DESIGN.md §4/§7）：
     - `AgentError` 及其子类（可预期的业务失败，如路径越界、参数非法）→
       转成 `error_type=语义标记` 的 `ToolResult`，正文携带事实，供大模型分析、调整；
     - 其余 `Exception`（内部 bug）→ `logger.exception` 留全 traceback 给开发者，

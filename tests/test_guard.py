@@ -1,4 +1,4 @@
-"""guard 装饰器 + 领域异常体系的测试（对应 EXCEPTION_DESIGN.md §10 的 L1/L3）。
+"""guard 装饰器 + 领域异常体系的测试（对应 docs/EXCEPTION_DESIGN.md §10 的 L1/L3）。
 
 直接调用原始函数、不经过 FastMCP，与 tests/test_file_io.py 一致。
 本文件不 import mcp_service.file_io，因此**不要求设置 WORKSPACE_PATH**，可独立运行：
