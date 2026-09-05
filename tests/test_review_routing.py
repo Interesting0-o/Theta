@@ -6,6 +6,8 @@
 """
 import asyncio
 
+from langchain_core.messages import ToolMessage
+
 from app.agent.nodes import ReviewNode
 from app.agent.graph import should_review_or_execute, should_continue_after_orchestrate
 
@@ -70,16 +72,52 @@ def test_need_review_tool_interrupts_and_approval_lets_it_pass(monkeypatch):
     assert [c["name"] for c in out["approved_tool_calls"]] == ["web_search"]
 
 
-def test_need_review_tool_rejection_drops_call(monkeypatch):
-    """被拒绝的需审批调用不放行、不回传模型，队列被消费掉。"""
+def test_need_review_tool_rejection_injects_denial_message(monkeypatch):
+    """被拒的需审批调用不放行，但须回灌一条 ToolMessage 告知模型（兑现悬空 tool_call）。"""
     monkeypatch.setattr(
         "app.agent.nodes.interrupt",
         lambda payload: {"approved": False},
     )
-    out = _run(ReviewNode(), _state([_call("web_search")]))
+    out = _run(ReviewNode(), _state([_call("web_search", call_id="call_w1")]))
     assert out["pending_tool_calls"] == []
     assert out["approved_tool_calls"] == []
     assert out["approved_orchestrate_calls"] == []
+    # 拒绝必须回模型一条显式信号：以原 tool_call_id 兑现，内容标明被拒
+    msgs = out.get("messages", [])
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert isinstance(msg, ToolMessage)
+    assert msg.tool_call_id == "call_w1"
+    assert msg.name == "web_search"
+    assert "approval_denied" in msg.content
+
+
+def test_need_review_tool_approval_injects_no_message(monkeypatch):
+    """批准路径不应注入多余 ToolMessage（只有拒绝才需要反馈）。"""
+    monkeypatch.setattr(
+        "app.agent.nodes.interrupt",
+        lambda payload: {"approved": True},
+    )
+    out = _run(ReviewNode(), _state([_call("web_search")]))
+    assert out.get("messages") is None
+
+
+def test_denied_call_only_gets_denial_message_in_mixed_turn(monkeypatch):
+    """同一 AIMessage 的多个调用：被拒的那个收到拒绝消息，免审放行的那个不注入。"""
+    monkeypatch.setattr(
+        "app.agent.nodes.interrupt",
+        lambda payload: {"approved": False},  # web_search 被拒；read_file 免审不会走到这里
+    )
+    node = ReviewNode()
+    out1 = _run(node, _state([_call("web_search", call_id="c1"), _call("read_file", call_id="c2")]))
+    # 第一次：c1 被拒 → 注入 c1 的拒绝消息，c2 留在 pending
+    assert [m.tool_call_id for m in out1.get("messages", [])] == ["c1"]
+    assert [c["id"] for c in out1["pending_tool_calls"]] == ["c2"]
+
+    out2 = _run(node, out1)
+    # 第二次：c2 免审放行入 approved_tool_calls，不再注入消息
+    assert out2.get("messages") is None
+    assert [c["id"] for c in out2["approved_tool_calls"]] == ["c2"]
 
 
 def test_should_review_or_execute_prefers_orchestrate():

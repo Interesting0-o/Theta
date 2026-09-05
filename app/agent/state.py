@@ -1,6 +1,6 @@
-from typing import TypedDict,Annotated,List,Any
+from typing import TypedDict,Annotated,List,Any,Dict
 from langgraph.graph.message import add_messages,BaseMessage
-from app.schema.agent_schema import PlanStep
+from app.schema.agent_schema import PlanStep,NoteEntry
 
 class AgentState(TypedDict):
     #--------------会话的唯一标识------------
@@ -15,8 +15,13 @@ class AgentState(TypedDict):
     approved_tool_calls: List[dict[str, Any]]
 
     #--------------编排模式-----------------
-    # 已批准待执行的编排类调用（source 命中 nodes.py 的 ORCHESTRATE_SOURCES），由 orchestrate_node 消费
+    # 已批准待执行的编排类调用（source 命中 ReviewNode.ORCHESTRATE_SOURCES），由 orchestrate_node 消费
     approved_orchestrate_calls: List[dict[str, Any]]
     # 当前计划：每步 {id: str, task: str, status: PlanStatus}
     # 由编排节点写回；模型通过编排工具（create_plan/update_plan_step/clear_plan）驱动
     current_plan: List[PlanStep]
+
+    #--------------上下文留存-----------------
+    # 笔记区：折叠时"不可免费重取"的联网检索正文落点；外层 dict 的 key = notes#<n>（稳定 ref），
+    # 随 checkpoint 存亡（不做跨会话语义库）。无 reducer → 写入方读改写合并。
+    notes: Dict[str, NoteEntry]

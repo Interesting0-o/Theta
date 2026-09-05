@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 from langgraph.graph import StateGraph, START, END
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from app.agent.state import AgentState
 from app.agent.nodes import *
@@ -32,13 +32,6 @@ def _resolve_workspace(config: RunnableConfig | None = None) -> str:
     if workspace:
         return str(Path(workspace).expanduser().resolve())
     return str(DEFAULT_WORKSPACE)
-
-
-def should_continue(state: AgentState):
-    last_message: BaseMessage = state["messages"][-1]
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        return "queue_node"
-    return END
 
 
 def should_review_or_execute(state: AgentState):
@@ -77,17 +70,28 @@ async def get_graph(config: RunnableConfig | None = None):
     model = get_chat_model().bind_tools(all_tools)
 
     graph.add_node("llm_node", LLMNode(model=model, workspace_path=workspace_path))
-    graph.add_node("queue_node", queue_node)
+    graph.add_node("queue_node", QueueNode())
     graph.add_node("orchestrate_node", OrchestrateNode(orchestrate_tool))#type:ignore
     graph.add_node("review_node", ReviewNode())
     graph.add_node("tool_node", ToolNode(mcp_tools))  # type: ignore
+    compact_node = CompactNode()
+    graph.add_node("compact_node", compact_node)
+
+    # llm 收尾路由：还有 tool_calls → 审批；已给最终答复 → 历史超预算才进 compact_node，
+    # 否则直接 END（省掉欠费轮次的节点执行与 checkpoint）。预算口径与 CompactNode 一致。
+    def route_after_llm(state: AgentState):
+        last_message = state["messages"][-1]
+        if isinstance(last_message, AIMessage) and last_message.tool_calls:
+            return "queue_node"
+        return "compact_node" if needs_compact(state, compact_node.content_budget_chars) else END
 
     graph.add_edge(START, "llm_node")
     graph.add_conditional_edges(
         "llm_node",
-        should_continue,
-        {"queue_node": "queue_node", END: END},
+        route_after_llm,
+        {"queue_node": "queue_node", "compact_node": "compact_node", END: END},
     )
+    graph.add_edge("compact_node", END)
     # queue → review：编排与普通调用统一走审批，由 review 按 source 分流
     graph.add_edge("queue_node", "review_node")
     graph.add_conditional_edges(
