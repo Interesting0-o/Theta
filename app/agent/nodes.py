@@ -240,9 +240,9 @@ class ReviewNode:
     与 ToolNode/OrchestrateNode 共用同一份 tool.json（_tool_config 整进程缓存）。
     """
 
-    # 编排类工具在 tool.json 的 source 取值集合：命中即分流进 approved_orchestrate_calls，
-    # 交 OrchestrateNode 处理。
-    ORCHESTRATE_SOURCES: frozenset[str] = frozenset({"plan"})
+    # "state 工具"在 tool.json 的 source 取值集合：命中即分流进 approved_orchestrate_calls，
+    # 交 OrchestrateNode（通用 state 工具执行器）处理。plan=编排；notes=笔记读回。
+    ORCHESTRATE_SOURCES: frozenset[str] = frozenset({"plan", "notes"})
 
     @classmethod
     @lru_cache(maxsize=1)

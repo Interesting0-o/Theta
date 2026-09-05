@@ -181,8 +181,46 @@ def clear_plan(
         ],
     }
 
+@tool
+def read_note(
+    note_id: str,
+    state: Annotated[AgentState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> dict:
+    """按 ref 读取会话笔记正文（此前联网检索等被折叠归档的原文）。
+
+    何时用：折叠摘要/系统提示里出现「详情见 notes#rN」之类的指针、需要看原文时才调用。
+    notes 本身只注入一行索引，正文都通过本工具按需取回；取回的正文是短命消息，看完即弃。
+
+    Args:
+        note_id: 笔记 ref，形如 "notes#r3"（来自折叠摘要行尾的「详情见」指针）。
+        state: （系统自动注入，无需传入）当前 AgentState，读取 notes。
+        tool_call_id: （系统自动注入，无需传入）本次调用 id。
+
+    Returns:
+        命中：笔记正文（markdown，含标题头）；未命中：提示该 ref 不存在的错误消息。
+    """
+    note = (state.get("notes") or {}).get(note_id)
+    if not note:
+        content = f"笔记不存在: {note_id}"
+    else:
+        title = (note.get("title") or "").strip() or note_id
+        body = str(note.get("content") or "").strip()
+        content = f"### {note_id} · {title}\n\n{body}" if body else f"### {note_id} · {title}\n（空笔记）"
+    return {
+        "messages": [
+            ToolMessage(name="read_note", tool_call_id=tool_call_id, content=content)
+        ]
+    }
+
+
 orchestrate_tool: List[BaseTool] = [
     create_plan,
     update_plan_step,
     clear_plan,
+]
+
+# 笔记读回工具：与编排工具同属"agent 侧 state 工具"，走 OrchestrateNode 执行器（source="notes"）。
+note_tools: List[BaseTool] = [
+    read_note,
 ]

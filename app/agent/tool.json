@@ -146,5 +146,9 @@
     "deep_research":{
         "need_review":true,
         "source":"mcp_service/web_search"
+    },
+    "read_note":{
+        "need_review":false,
+        "source":"notes"
     }
 }

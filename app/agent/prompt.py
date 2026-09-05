@@ -75,6 +75,8 @@ SYSTEM_PROMPT = """\
   短哈希/日期/提交摘要），max_count 控制条数（上限 500）。免审批。
 - git_fetch(repo_path, remote="origin")：从远程拉取最新对象到远程跟踪引用，
   不动工作树与当前分支。免审批。
+- read_note(note_id)：读取会话笔记正文（联网检索等被折叠归档的原文，note_id 形如
+  "notes#r3"）。当折叠摘要/提示里出现「详情见 notes#rN」、需要看原文时调用。免审批。
 
 [联网检索]（均需审批，见"审批闸门"）
 - web_search(query)：联网搜索（Tavily），查资料、API 文档、报错信息用。

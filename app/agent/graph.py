@@ -9,7 +9,7 @@ from app.agent.state import AgentState
 from app.agent.nodes import *
 from app.agent.model import get_chat_model
 from app.agent.mcp import load_mcp_tool
-from app.agent.tools import  orchestrate_tool
+from app.agent.tools import  orchestrate_tool, note_tools
 
 # 项目根：模块导入期由 __file__ 算好，避免在运行时调用阻塞式 os.getcwd()
 # （langgraph dev 的 blockbuster 会拦截事件循环内的同步阻塞调用）
@@ -66,12 +66,12 @@ async def get_graph(config: RunnableConfig | None = None):
     mcp_tools = await load_mcp_tool(workspace_path)
 
     # 模型能看到全部工具（含计划工具）；但只有"可执行工具"会进 review→tool_node
-    all_tools =  orchestrate_tool + mcp_tools
+    all_tools =  orchestrate_tool + note_tools + mcp_tools
     model = get_chat_model().bind_tools(all_tools)
 
     graph.add_node("llm_node", LLMNode(model=model, workspace_path=workspace_path))
     graph.add_node("queue_node", QueueNode())
-    graph.add_node("orchestrate_node", OrchestrateNode(orchestrate_tool))#type:ignore
+    graph.add_node("orchestrate_node", OrchestrateNode(orchestrate_tool + note_tools))#type:ignore
     graph.add_node("review_node", ReviewNode())
     graph.add_node("tool_node", ToolNode(mcp_tools))  # type: ignore
     compact_node = CompactNode()
