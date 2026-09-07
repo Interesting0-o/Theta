@@ -100,7 +100,7 @@ async def drive_turn(step, initial, queue):
 # ---------------------------------------------------------------------------
 
 
-async def _race(factories):
+async def _race(*factories):
     """并发跑若干协程工厂，返回先完成者的 (index, result)，其余取消。
 
     用于"等 user 行 / 等审批 / 等 turn 结束"这类多来源唤醒，避免忙轮询。

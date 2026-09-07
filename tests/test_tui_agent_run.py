@@ -15,7 +15,7 @@ import asyncio
 from langgraph.types import Command
 
 from app.tui.approval_inbox import ApprovalInbox
-from app.tui.driver import drive_turn
+from app.tui.driver import _race, drive_turn
 
 FINAL = {"messages": ["done"]}
 
@@ -151,5 +151,37 @@ def test_interrupt_payload_marks_main_worker():
         dec = asyncio.create_task(decider())
         await drive_turn(step, {"messages": []}, queue)
         await dec
+
+    asyncio.run(go())
+
+
+# --- run_tui 用的事件唤醒 _race：位置参数 + 多源竞态/取消语义 ---
+
+
+def test_race_returns_first_completed_index():
+    async def go():
+        a, b = asyncio.Event(), asyncio.Event()
+        b.set()
+        # 位置参数传多个事件.wait（修复回归：曾误把 *factories 当单参 list）
+        idx, val = await _race(a.wait, b.wait)
+        assert idx == 1
+        assert val is True  # Event.wait 置位时返回 True（driver 不消费此值，仅取其唤醒）
+
+    asyncio.run(go())
+
+
+def test_race_wakes_on_later_event_and_cancels_others():
+    async def go():
+        a, b = asyncio.Event(), asyncio.Event()
+
+        async def set_b_later():
+            await asyncio.sleep(0.01)
+            b.set()
+
+        setter = asyncio.create_task(set_b_later())
+        idx, _ = await _race(a.wait, b.wait)
+        await setter
+        assert idx == 1
+        assert not a.is_set()  # 另一个事件被取消，未置位
 
     asyncio.run(go())
