@@ -15,7 +15,8 @@ from langchain_core.messages import (
 )
 from langgraph.graph.message import add_messages
 
-from app.agent.nodes import CompactNode, ToolNode, needs_compact
+from app.agent.nodes import CompactNode, needs_compact
+from app.agent.utils import coerce_tool_result
 
 # 触发折叠的小预算：任何有内容的历史都会超
 BUDGET = 40
@@ -226,11 +227,11 @@ def test_coerce_tool_result_reconstructs_mcp_payload():
 
     payload = [{"type": "text",
                 "text": '{"success": false, "content": "越界", "error_type": "workspace_violation"}'}]
-    tr = ToolNode._coerce_tool_result(payload)
+    tr = coerce_tool_result(payload)
     assert tr is not None and tr.success is False and tr.error_type == "workspace_violation"
-    assert ToolNode._coerce_tool_result([{"type": "text", "text": "普通文本"}]) is None
-    assert ToolNode._coerce_tool_result(ToolResult(success=True, content="ok")) is not None
-    assert ToolNode._coerce_tool_result("纯字符串") is None
+    assert coerce_tool_result([{"type": "text", "text": "普通文本"}]) is None
+    assert coerce_tool_result(ToolResult(success=True, content="ok")) is not None
+    assert coerce_tool_result("纯字符串") is None
 
 
 def test_tm_status_prefers_stamp_over_content():

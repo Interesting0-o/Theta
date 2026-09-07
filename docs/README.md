@@ -8,6 +8,7 @@
 | --- | --- | --- |
 | [EXCEPTION_DESIGN.md](EXCEPTION_DESIGN.md) | 异常体系 | 异常的边界是语义过滤器——决定什么信息能进大模型的推理 |
 | [CONTEXT_ENGINEERING.md](CONTEXT_ENGINEERING.md) | 上下文工程 | work_log（意图+事实双半行）、notes 笔记区（会话级 + promote 进 repo）、滚动块折叠 |
+| [MULTI_AGENT.md](MULTI_AGENT.md) | 多 Agent 编排（草稿） | 拉起形态 / 审批回流 / 并行分发 vs DAG / 状态隔离 |
 
 ## 写作约定
 

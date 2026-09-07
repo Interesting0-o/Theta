@@ -1,12 +1,13 @@
-"""app/main.py 的 TUI 辅助函数测试：get_agent_db_path / truncate / format_tool_approval。
+"""app/tui 的 TUI 辅助函数测试：get_agent_db_path / truncate / format_tool_approval。
 
-注意：import app.main 会触发 app.agent/__init__ → graph → model，
-而 model 顶层调用 get_settings()，因此运行本文件要求 .env 存在（CLAUDE.md 前提）。
+辅助随 TUI 重构从 app/main.py 迁入 app/tui：truncate/format_tool_approval 在 approval.py，
+get_agent_db_path 在 driver.py。app.tui 模块 import 期不触发 app.agent → 本文件无需 .env。
 """
 from pathlib import Path
 from types import SimpleNamespace
 
-from app.main import format_tool_approval, get_agent_db_path, truncate
+from app.tui.approval import format_tool_approval, truncate
+from app.tui.driver import get_agent_db_path
 
 
 def test_agent_db_path_resolves_under_resource_dir():

@@ -18,13 +18,20 @@
 - status ∈ pending / in_progress / done；
 - 工具响应会把最新计划快照回显，供模型跨轮跟踪；没有独立的"查看计划"工具。
 """
+import asyncio
+import sys
+from pathlib import Path
 from typing import Annotated, List
 
 from langchain_core.messages import ToolMessage
-from langchain_core.tools import BaseTool, InjectedToolCallId, tool
+from langchain_core.tools import BaseTool, InjectedToolArg, InjectedToolCallId, tool
 from langgraph.prebuilt import InjectedState
 from app.agent.state import AgentState
+from app.agent.utils import format_tool_result
 from app.schema.agent_schema import PlanStatus, PlanStep
+
+# 项目根：spawn worker 子进程时 cwd 用项目根使 .env 可读（worker 内懒加载 get_chat_model）
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 
@@ -223,4 +230,118 @@ orchestrate_tool: List[BaseTool] = [
 # 笔记读回工具：与编排工具同属"agent 侧 state 工具"，走 OrchestrateNode 执行器（source="notes"）。
 note_tools: List[BaseTool] = [
     read_note,
+]
+
+# ------------------------- 派发子任务（dispatch，source="dispatch"）-------------------------
+# 仿 create_plan、走 orchestrate 层（不普通 MCP 工具）。设计：不静态绑 worker，每次调用按
+# 子任务"现场 spawn"独立 worker（mcp_service/sub_agent.py）跑 run_subtask，N 个经
+# asyncio.gather 并发、干完即回收——不受"先启动服务 / 最多一个子 agent"限制。
+# worker_runner 做成模块级可替换，便于测试注入假执行器、不真 spawn。
+
+
+class InjectedWorkspace(InjectedToolArg):
+    """标记 dispatch 的 workspace 参数为运行时注入（对模型隐藏）。"""
+
+
+async def _spawn_subagent_worker(task: str, workspace: str) -> str:
+    """默认 worker 执行器：现场 spawn 一个 sub_agent stdio 子进程跑 run_subtask。
+
+    langchain_mcp_adapters 的 get_tools 工具是"每次调用开一个新会话"：每次 ainvoke 拉起
+    一个 `python -m mcp_service.sub_agent` 子进程、调用 run_subtask、结束后回收，因此
+    N 次并发 = N 个独立 worker 进程，无预启动、无常驻泄漏。cwd=项目根使 worker 进程能
+    读到项目 .env 的 CHAT_*；WORKSPACE_PATH 指向本 agent 工作区（worker 在其上只读干活）。
+    """
+    from langchain_mcp_adapters.client import MultiServerMCPClient  # noqa: PLC0415
+
+    client = MultiServerMCPClient(
+        {
+            "worker": {
+                "transport": "stdio",
+                "command": sys.executable,
+                "args": ["-m", "mcp_service.sub_agent"],
+                "cwd": str(_PROJECT_ROOT),
+                "env": {
+                    "WORKSPACE_PATH": str(workspace),
+                    "PYTHONPATH": str(_PROJECT_ROOT),
+                },
+            }
+        }
+    )
+    tools = await client.get_tools()
+    run_subtask = next(t for t in tools if t.name == "run_subtask")
+    result = await run_subtask.ainvoke({"task": task})
+    # MCP adapters 返回 content-block 形态 → 复用工具结果归一化（utils），空正文兜底
+    return format_tool_result(result) or "（worker 未返回正文）"
+
+
+# 模块级可替换的 worker 执行器；None = 用默认 _spawn_subagent_worker（测试注入假执行器）
+worker_runner = None
+
+
+async def run_subtask_batch(
+    sub_tasks: list[str],
+    workspace: str,
+    runner=None,
+) -> list[dict]:
+    """并发跑一批只读子任务；每个子任务一个独立 worker（默认 spawn sub_agent 进程）。
+
+    返回按输入顺序排列的 [{task, ok, content}]；单 worker 失败不拖垮整批
+    （记 ok=False，content 带原因），由调用方决定是否重试/换法。
+    """
+    run = runner or worker_runner or _spawn_subagent_worker
+
+    async def _one(task: str) -> dict:
+        try:
+            content = await run(task, workspace)
+            return {"task": task, "ok": True, "content": str(content)}
+        except Exception as exc:  # noqa: BLE001 —— worker 进程失败等，收口为条目
+            return {"task": task, "ok": False, "content": f"worker 执行失败：{exc}"}
+
+    return list(await asyncio.gather(*(_one(t) for t in sub_tasks)))
+
+
+@tool
+async def dispatch_subtasks(
+    sub_tasks: list[str],
+    workspace: Annotated[str, InjectedWorkspace],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> dict:
+    """把多个**只读**子任务并发派发给独立 worker（子 agent），拿回每个的结论。
+
+    何时用：手里的任务能拆成几个相互独立的调查/分析/出方案子任务（各写各的边界、
+    互不依赖）时，一次把清单给我，由系统对每个子任务起一个独立 worker 进程执行——
+    它们只读当前工作区（文件检索 + git 只读），不能改文件、不能执行命令，需要落地
+    改动时由你基于结论自行执行。完成后每个子任务给一段结论正文（带出处）。
+
+    何时别用：子任务之间有依赖（下游要等上游产物）——那是先后顺序的事，别并发；
+    或单条任务根本不需要拆——直接自己做即可，不要为派发而派发。
+
+    Args:
+        sub_tasks: 子任务描述列表（每条约一个独立调查/分析目标，含期望结论要点）。
+            每个子任务各由一个独立 worker 执行；互不共享上下文。
+
+    Returns:
+        汇总文本：逐个子任务的结果（✓/✗ + 结论或失败原因）。
+    """
+    results = await run_subtask_batch(sub_tasks, workspace)
+    # 汇总正文很短，直接内联（不再抽独立渲染函数）
+    lines = [f"已并发派发 {len(results)} 个只读子任务，结果："]
+    for i, r in enumerate(results, 1):
+        mark = "✓" if r["ok"] else "✗"
+        lines.append(f"[{i}] ({mark}) 子任务「{r['task']}」")
+        lines.append(str(r["content"]))
+    summary = "\n".join(lines)
+    return {
+        "messages": [
+            ToolMessage(
+                name="dispatch_subtasks",
+                tool_call_id=tool_call_id,
+                content=summary,
+            )
+        ]
+    }
+
+
+dispatch_tool: List[BaseTool] = [
+    dispatch_subtasks,
 ]

@@ -11,8 +11,9 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 from app.agent.state import AgentState
+from app.agent.utils import coerce_tool_result, format_tool_result
 from app.agent.prompt import SYSTEM_PROMPT, workspace_context_block
-from app.schema.agent_schema import NoteEntry, PlanStep, ToolResult
+from app.schema.agent_schema import NoteEntry, PlanStep
 
 _TOOL_CONFIG_PATH = Path(__file__).with_name("tool.json")
 
@@ -22,9 +23,11 @@ class LLMNode:
         self,
         model: Runnable,
         workspace_path: str | None = None,
+        system_prompt: str = SYSTEM_PROMPT,
     ) -> None:
         self.model: Runnable = model
         self.workspace_path: str | None = workspace_path
+        self.system_prompt: str = system_prompt
 
     @staticmethod
     def format_plan_status(step: PlanStep) -> str:
@@ -58,7 +61,7 @@ class LLMNode:
         不改动 state["messages"]（LangGraph state 应不可变更新；系统消息也不应渗入
         历史被持久化）。
         """
-        system_messages = [SystemMessage(content=SYSTEM_PROMPT)]
+        system_messages = [SystemMessage(content=self.system_prompt)]
         if self.workspace_path:
             system_messages.append(
                 SystemMessage(content=workspace_context_block(self.workspace_path))
@@ -80,101 +83,10 @@ class LLMNode:
 class ToolNode:
     """执行已批准的普通 MCP 工具，并把工具返回渲染成 ToolMessage 回传模型。
 
-    工具返回统一走 format_tool_result 归一成模型可见文本；若返回里带 ToolResult 且失败，
-    再打结构化戳（error_type 进 additional_kwargs），供压缩消费端直接读字段。
+    工具返回的归一化已抽到 app/agent/utils.py（format_tool_result 产模型可见文本、
+    coerce_tool_result 还原结构化 ToolResult 供打戳，ToolNode 与 dispatch 共用），
+    本节点只负责 ainvoke 执行已批准工具 + 拼 ToolMessage。
     """
-
-    @staticmethod
-    def _coerce_tool_result(result) -> ToolResult | None:
-        """从工具返回值还原结构化 ToolResult（若其中带 ToolResult 信息），否则 None。
-
-        探测逻辑与 format_tool_result 一致，但只解析不渲染——供构造 ToolMessage 时打
-        结构化戳（失败时把 error_type 挂 additional_kwargs），让压缩消费端
-        直接读字段、不必再解析 content 前缀。
-        """
-        if isinstance(result, ToolResult):
-            return result
-        if isinstance(result, dict):
-            if "success" in result and isinstance(result.get("content"), str):
-                try:
-                    return ToolResult(**result)
-                except Exception:
-                    return None
-            return None
-        if isinstance(result, list):
-            # MCP 适配器形态：content-block dict 列表，ToolResult 被 FastMCP JSON 化进 text
-            parts: list[str] = []
-            for block in result:
-                if isinstance(block, dict):
-                    parts.append(block.get("text") or block.get("content") or "")
-                else:
-                    parts.append(str(block))
-            text = "\n".join(part for part in parts if part)
-            try:
-                data = json.loads(text)
-            except (json.JSONDecodeError, TypeError):
-                return None
-            if isinstance(data, dict) and "success" in data and isinstance(data.get("content"), str):
-                try:
-                    return ToolResult(**data)
-                except Exception:
-                    return None
-        return None
-
-    @staticmethod
-    def format_tool_result(result) -> str:
-        """把工具返回统一格式化为模型可见的字符串。
-
-        处理顺序：
-        - `ToolResult`：取 `content`，若有 `error_type` 则加 `[error_type] ` 前缀，
-          让模型一眼看出这是哪一类失败（如 "[workspace_violation] 路径…"）。
-        - `dict`：优先取 `content` 字段；若 content 是 content-block 列表则逐个取
-          `text` 拼接（兼容 langchain MCP 适配器的返回形态）。
-        - `list`：MCP 工具经 ToolNode 拿到的真实形态——langchain MCP 适配器把每个
-          content block 转成 dict（text/id 等），FastMCP 又把工具返回的 ToolResult
-          整包 JSON 化进 text。这里逐个取 `text`（丢弃随机 id 噪声），json.loads
-          还原 ToolResult 后交上面 ToolResult 分支；还原失败（非 JSON / 非
-          ToolResult 形态，如未来直接返回 str 的工具）则拼接后原样透传。
-        - 其它（str 等）：`str()` 原样透传。
-
-        注意：模型读到的文本由这里决定，而不是 Python 侧的 `ToolResult.__str__`
-        （MCP 跨进程返回时走的是 FastMCP 的 JSON 序列化，见 mcp_service/utils.py 注释）。
-        """
-        if isinstance(result, ToolResult):
-            prefix = f"[{result.error_type}] " if result.error_type else ""
-            return prefix + result.content
-
-        if isinstance(result, dict):
-            content = result.get("content", result)
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts: list[str] = []
-                for block in content:
-                    if isinstance(block, dict):
-                        parts.append(block.get("text") or block.get("content") or "")
-                    else:
-                        parts.append(str(block))
-                return "\n".join(part for part in parts if part)
-            return str(content)
-
-        if isinstance(result, list):
-            parts: list[str] = []
-            for block in result:
-                if isinstance(block, dict):
-                    parts.append(block.get("text") or block.get("content") or "")
-                else:
-                    parts.append(str(block))
-            text = "\n".join(part for part in parts if part)
-            try:
-                data = json.loads(text)
-            except (json.JSONDecodeError, TypeError):
-                return text
-            if isinstance(data, dict) and "success" in data and isinstance(data.get("content"), str):
-                return ToolNode.format_tool_result(ToolResult(**data))
-            return text
-
-        return str(result)
 
     def __init__(self, tools: list[Callable] | list[BaseTool]) -> None:
         self.tools_map = {}
@@ -211,10 +123,10 @@ class ToolNode:
                 # MCP 工具是 async-only(只实现了 coroutine)，必须用 ainvoke
                 # (同步 invoke 会抛 "StructuredTool does not support sync invocation")
                 result_value = await tool_obj.ainvoke(tool_args)
-                result_content = self.format_tool_result(result_value)
+                result_content = format_tool_result(result_value)
                 # 结构化戳：返回里若带 ToolResult 且失败，把 error_type 挂到消息上，
                 # 压缩消费端直接读字段、不必解析 content 前缀。
-                tr = self._coerce_tool_result(result_value)
+                tr = coerce_tool_result(result_value)
                 if tr is not None and not tr.success:
                     extra = {"error_type": tr.error_type or "tool_error"}
             except Exception as exc:
@@ -241,8 +153,9 @@ class ReviewNode:
     """
 
     # "state 工具"在 tool.json 的 source 取值集合：命中即分流进 approved_orchestrate_calls，
-    # 交 OrchestrateNode（通用 state 工具执行器）处理。plan=编排；notes=笔记读回。
-    ORCHESTRATE_SOURCES: frozenset[str] = frozenset({"plan", "notes"})
+    # 交 OrchestrateNode（通用 state 工具执行器）处理。plan=编排；notes=笔记读回；
+    # dispatch=并发派发子任务（app/agent/tools.py::dispatch_subtasks）。
+    ORCHESTRATE_SOURCES: frozenset[str] = frozenset({"plan", "notes", "dispatch"})
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -333,21 +246,38 @@ class OrchestrateNode:
     - 结束后清空 approved_orchestrate_calls；不动 approved_tool_calls（留给 tool_node）。
     """
 
-    def __init__(self, orchestrate_tools: list[Callable]) -> None:
+    def __init__(
+        self,
+        orchestrate_tools: list[Callable],
+        workspace_path: str | None = None,
+    ) -> None:
         self.tools_map = {}
+        self.workspace_path: str | None = workspace_path
         for tool_obj in orchestrate_tools:
             name = getattr(tool_obj, "name", None)
             if name:
                 self.tools_map[name] = tool_obj
 
     @staticmethod
-    def _invoke(tool_obj: Callable, tool_args: dict, state:dict|AgentState, tool_call_id: str):
-        """调用编排工具的底层原函数，按签名注入 state / tool_call_id。
+    def _invoke(
+        tool_obj: Callable,
+        tool_args: dict,
+        state: dict | AgentState,
+        tool_call_id: str,
+        workspace: str | None = None,
+    ):
+        """调用编排工具的底层原函数，按签名注入 state / tool_call_id / workspace。
 
-        编排工具为 langchain @tool 包装的普通同步函数，`tool_obj.func` 即原函数；
-        直接以关键字调用，跳过 langchain 的注入管线（与 tests/test_plan_tools.py 一致）。
+        编排工具为 langchain @tool 包装的同步或异步函数：同步取 `tool_obj.func`，
+        异步取 `tool_obj.coroutine`（async @tool 的 func 为 None）。直接以关键字调用，
+        跳过 langchain 的注入管线（与 tests/test_plan_tools.py 一致）。workspace 供
+        dispatch 类编排工具用（对模型隐藏的 InjectedWorkspace 参数），node 持有。
         """
-        fn = getattr(tool_obj, "func", tool_obj)
+        fn = (
+            getattr(tool_obj, "coroutine", None)
+            or getattr(tool_obj, "func", None)
+            or tool_obj
+        )
         kwargs = dict(tool_args)
         # 只向签名里确实声明了对应注入参数的编排工具注入（覆写模型可能伪造的同名键）
         params = signature(fn).parameters
@@ -355,8 +285,10 @@ class OrchestrateNode:
             kwargs["state"] = state
         if "tool_call_id" in params:
             kwargs["tool_call_id"] = tool_call_id
+        if "workspace" in params and workspace is not None:
+            kwargs["workspace"] = workspace
 
-        # 返回可能为 coroutine（若未来编排工具改为 async），由调用方 await
+        # 返回可能为 coroutine（async 编排工具），由调用方 await
         return fn(**kwargs)
 
     async def __call__(self, state: AgentState) -> dict | AgentState:
@@ -387,7 +319,9 @@ class OrchestrateNode:
                 continue
 
             try:
-                result = self._invoke(tool_obj, tool_args, working, tool_call_id)
+                result = self._invoke(
+                    tool_obj, tool_args, working, tool_call_id, self.workspace_path
+                )
                 if inspect.isawaitable(result):
                     result = await result
             except Exception as exc:
