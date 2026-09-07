@@ -24,6 +24,13 @@ from app.tui.input import _ask_yes_no
 # 本地主 agent 中断入 broker 时用的 worker_id 标记（远端 worker 用真实 id）
 LOCAL_WORKER_ID = "main"
 
+# 审批面板标题：沿用仓库初始 main.py（git 295a775）的 ASCII 框样式
+_COMMAND_TITLE = """
++---------+
+| Command |
++---------+
+"""
+
 
 def truncate(text: str, limit: int = 200) -> str:
     """超长文本截断显示，避免整屏刷出大段文件内容。"""
@@ -83,14 +90,18 @@ def _record_to_value(record: ApprovalRecord) -> dict:
     """把 broker 里一条待审记录归一成 interrupt 同构的 value。
 
     value 与 ReviewNode interrupt payload 对齐：{tool_name, current_step, tool_args,
-    description?}，供 decide_approval 渲染。来源标记取自 payload.worker_id：
-    "main"（本地主 agent interrupt）渲染成"主 agent"，远端 worker 渲染成 worker:<id>。
+    description?, tool_call_id?}，供 decide_approval 渲染。
+    - 步骤：本地主 agent 中断带 driver 塞的 ReviewNode current_step（如 "1/1"，保持旧面板
+      样式）；远端 worker 无该字段时回退为来源标记（主 agent / worker:<id>）。
+    - tool_call_id：仅本地中断携带（纯展示）。
     description 在 payload 层（ApprovalRequest 语义），format_tool_approval 主要展示
     tool_args.description。
     """
     payload = record.get("payload") or {}
     worker_id = payload.get("worker_id", "")
-    step = "主 agent" if worker_id == LOCAL_WORKER_ID else f"worker:{worker_id}"
+    step = payload.get("current_step") or (
+        "主 agent" if worker_id == LOCAL_WORKER_ID else f"worker:{worker_id}"
+    )
     value: dict = {
         "tool_name": payload.get("tool_name", "?"),
         "tool_args": payload.get("tool_args") or {},
@@ -98,20 +109,19 @@ def _record_to_value(record: ApprovalRecord) -> dict:
     }
     if step:
         value["current_step"] = step
+    if payload.get("tool_call_id"):
+        value["tool_call_id"] = payload["tool_call_id"]
     return value
 
 
-def _provenance_label(worker_id: str) -> str:
-    return "主 agent" if worker_id == LOCAL_WORKER_ID else f"worker:{worker_id}"
+async def decide_approval(value: dict, out_q) -> bool:
+    """审核判定单元：渲染 Command 框 + 面板，向用户收 y/n、返回是否批准。
 
-
-async def decide_approval(value: dict, out_q, *, header: str = "[审批]") -> bool:
-    """审核判定单元：把一条待审请求渲染成面板、向用户收 y/n、返回是否批准。
-
-    这里是人审的交互实现（渲染 + 提问），不产生其它副作用；决定由调用方消费
+    沿用初始 main.py 样式：`print(command_title)` → 工具面板 → 空行 → 问 y/n。
+    这里是人审的交互实现，不产生其它副作用；决定由调用方消费
     （主图 resume → Command(resume)；worker 请求 → queue.complete）。
     """
-    print(header)
+    print(_COMMAND_TITLE)
     print(format_tool_approval([SimpleNamespace(value=value)]))
     print()
     return await _ask_yes_no(out_q, "是否批准该操作？(y/n): ")
@@ -120,16 +130,10 @@ async def decide_approval(value: dict, out_q, *, header: str = "[审批]") -> bo
 async def drain_approvals(inbox, out_q) -> None:
     """排空 broker 里全部 pending（本地主 agent interrupt + worker HTTP 请求）。
 
-    逐条渲染 → 收 y/n → inbox.complete 回填（唤醒 park 的本地 run / 长轮询的 worker）。
-    判定权威在人；一条面板只服务一个请求，判定互不阻塞进程（pending 期间事件循环自由）。
+    逐条渲染 Command 框 + 收 y/n → inbox.complete 回填（唤醒 park 的本地 run / 长轮询的
+    worker）。判定权威在人；一条面板只服务一个请求，判定互不阻塞进程。
     """
     for entry in inbox.pending():
-        payload = (entry.get("payload") or {})
-        worker_id = payload.get("worker_id", "")
-        label = _provenance_label(worker_id)
-        approved = await decide_approval(
-            _record_to_value(entry), out_q, header=f"\n[审批 · {label}]"
-        )
+        approved = await decide_approval(_record_to_value(entry), out_q)
         inbox.complete(entry["approval_id"], approved)
-        print("→ 已" + ("批准" if approved else "拒绝"))
     inbox.clear_new()

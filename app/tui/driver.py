@@ -31,6 +31,18 @@ from app.tui.input import _pump_stdin, _start_stdin_reader
 # 会话 thread_id（与旧 app/main.py 保持一致；checkpoint 持久化按它续）
 THREAD_ID = "conversation_456"
 
+# 界面标题：沿用仓库初始 main.py（git 历史 295a775 "初始化"）的 ASCII 框样式。
+_USER_TITLE = """
++------+
+| User |
++------+
+"""
+_AI_TITLE = """
++-------+
+| Agent |
++-------+
+"""
+
 
 def get_agent_db_path() -> Path:
     """agent checkpoint 的持久化 SQLite 路径（项目根/resource/agent.db，自动建目录）。"""
@@ -49,12 +61,16 @@ def _interrupt_value_to_request(value: dict) -> ApprovalRequest:
 
     worker_id="main" 标记本地来源（与远端 worker 区分，只用于渲染 provenance；
     决定路径与远端完全一致——都走 broker 的 enqueue/wait 与 complete）。
+    current_step / tool_call_id 是**纯展示字段**（复用 ReviewNode 的"步骤 1/1"与调用 ID，
+    让审批面板保持旧样式），不参与决定逻辑；远端 worker 不带。
     """
     return {
         "worker_id": LOCAL_WORKER_ID,
         "tool_name": value.get("tool_name", "?"),
         "tool_args": value.get("tool_args") or {},
         "description": value.get("description"),
+        "current_step": value.get("current_step") or "1/1",
+        "tool_call_id": value.get("tool_call_id"),
     }
 
 
@@ -132,7 +148,7 @@ async def _run_turn(step, initial, queue, turn_done: asyncio.Event) -> None:
         result = await drive_turn(step, initial, queue)
         messages = result.get("messages") or []
         if messages:
-            print("\n[agent]")
+            print(_AI_TITLE)
             print(messages[-1].content)
     except asyncio.CancelledError:
         raise  # 关闭清理主动取消，放行
@@ -176,9 +192,7 @@ async def run_tui() -> None:
     inbox = ApprovalInboxServer()
     pump: asyncio.Task | None = None
     try:
-        await inbox.start()
-        print(f"[收件箱] 监听 {inbox.url}  (worker 待审请求 POST /requests)")
-        print("[提示] 输入 q/quit/exit 退出\n")
+        await inbox.start()  # worker 待审请求收件箱（HTTP，静默监听 127.0.0.1:8010）
 
         reader_q = _start_stdin_reader()
         out_q: asyncio.Queue = asyncio.Queue()
@@ -199,21 +213,24 @@ async def run_tui() -> None:
                 await _race(turn_done.wait, inbox.queue.new_pending.wait)
                 continue
 
-            # 3) 空闲 → 等用户行或新 worker 审批
+            # 3) 空闲 → 打 User 框并等一条有效用户行（新 worker 审批可插队服务）
             inbox.queue.clear_new()
-            idx, line = await _race(
-                out_q.get, inbox.queue.new_pending.wait
-            )
-            if idx == 1:  # 审批先到（worker 请求），回顶部 drain
+            print(_USER_TITLE)
+            while True:
+                idx, line = await _race(
+                    out_q.get, inbox.queue.new_pending.wait
+                )
+                if idx == 1:  # 审批先到（worker 请求）→ 回顶部 drain
+                    break
+                if line is None or line in ("quit", "q", "exit"):
+                    break  # EOF / 退出
+                if line:
+                    break  # 拿到有效消息
+                # 空行：保持同一个 User 框继续等，不重打
+            if idx == 1:
                 continue
-            if line is None:
-                break  # EOF
-            if line in ("quit", "q", "exit"):
-                break
-            if not line:
-                continue
-
-            print("\n[user] " + line)
+            if line is None or line in ("quit", "q", "exit"):
+                break  # EOF / quit 直接退出外层
             turn_done.clear()
             turn = asyncio.create_task(_run_turn(step, _build_turn_state(line), inbox.queue, turn_done))
             # 回循环顶部：新 turn 的审批/终态都从 drain 与 turn_done 两个信号驱动

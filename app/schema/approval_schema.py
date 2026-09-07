@@ -15,6 +15,10 @@ class ApprovalRequest(TypedDict):
     tool_args: dict[str, Any]
     # 终端/命令类必填的人话解释，审批时与命令同屏展示
     description: NotRequired[str]
+    # 仅本地（主 agent 自身 interrupt）携带的**纯展示**字段：保持审批面板旧样式
+    # （"步骤 1/1" + 调用ID），不参与决定逻辑；远端 worker 请求不带。
+    current_step: NotRequired[str]
+    tool_call_id: NotRequired[str | None]
 
 
 class ApprovalRecord(TypedDict):
