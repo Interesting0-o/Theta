@@ -17,6 +17,25 @@ from app.schema.agent_schema import NoteEntry, PlanStep
 
 _TOOL_CONFIG_PATH = Path(__file__).with_name("tool.json")
 
+
+#----------------------工具调用日志（审核节点逐条输出）----------------------
+
+def _short(text: str, limit: int = 120) -> str:
+    """压成单行并截断，用于控制台日志的紧凑展示。"""
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _tool_call_log(tool_call: dict) -> str:
+    """把一条待审工具调用渲染成一行日志（工具名 + 紧凑参数）。"""
+    name = tool_call.get("name") or "?"
+    args = tool_call.get("args") or {}
+    try:
+        brief = json.dumps(args, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        brief = str(args)
+    return f"→ 工具调用: {name}  {_short(brief)}"
+
 #-------------------大模型节点----------------------
 class LLMNode:
     def __init__(
@@ -174,6 +193,8 @@ class ReviewNode:
 
         current_tool = pending[0]
         tool_name = current_tool.get("name")
+        # 工具调用日志：每条待审调用过审核节点时打一行（含需要人工审批与免审放行者）
+        print(_tool_call_log(current_tool))
         tool_cfg = self.tool_review.get(tool_name, {}) if tool_name else {}
         approved = True
         denied_messages: list[ToolMessage] = []
