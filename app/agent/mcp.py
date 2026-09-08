@@ -1,6 +1,6 @@
 """MCP 工具加载：以 stdio 子进程拉起 file_io / terminal / git / web_search 四个 MCP server。
 
-工作区 WORKSPACE_PATH 由 get_graph 解析后传入；这里在拉起子进程前先做前置校验
+工作区 WORKSPACE_PATH 由 get_main_agent_graph 解析后传入；这里在拉起子进程前先做前置校验
 （未提供 / 目录不存在 → ConfigError），避免把坏配置传进子进程再等它 import 时失败。
 子进程约定：
 - env 注入 WORKSPACE_PATH（mcp_service.file_io / mcp_service.git 在 import 时校验）
@@ -99,7 +99,7 @@ def _build_servers(workspace_path: str) -> dict[str, Connection]:
     return servers
 
 
-# 进程级 MCP 工具缓存：按工作区键复用，避免 langgraph dev 每次访问 get_graph
+# 进程级 MCP 工具缓存：按工作区键复用，避免 langgraph dev 每次访问 get_main_agent_graph
 # 都重新拉起 MCP 子进程并握手（那会让 schema/run 请求慢到秒级）。
 _MCP_TOOLS_CACHE: dict[str, list] = {}
 # 单飞锁：同一工作区的并发冷加载只真正拉起一次，其余等锁后直接复用缓存。

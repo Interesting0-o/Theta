@@ -5,7 +5,7 @@ from app.config import get_settings
 
 settings = get_settings()
 
-def get_chat_model():
+def get_main_chat_model():
     return init_chat_model(
         model = settings.CHAT_MODEL_NAME,
         base_url = settings.CHAT_MODEL_URL,

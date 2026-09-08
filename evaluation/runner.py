@@ -13,7 +13,7 @@ app/main.py 的循环是评估的原型——这里唯一的变化是把 `input(
 与 TUI 的差异：
 - 图用 InMemorySaver 编译（不落 resource/agent.db，评估不污染正式会话）；
 - thread_id 按任务名区分，checkpoint 互不串扰；
-- 每任务一个隔离临时工作区（setup 预置文件），经 get_graph 的
+- 每任务一个隔离临时工作区（setup 预置文件），经 get_main_agent_graph 的
   configurable.workspace_path 注入，天然受 file_io 沙箱约束；
 - 加 max_rounds 上限：拒绝路径若死循环，评估必须能报错收场而不是挂死。
 
@@ -38,7 +38,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
-from app.agent.graph import get_graph
+from app.agent.graph import get_main_agent_graph
 from app.agent.state import AgentState
 
 from .policy import Policy
@@ -73,10 +73,10 @@ class EvalResult:
 async def build_eval_graph(workspace: Path):
     """按评估工作区编译图（InMemorySaver，不碰正式 agent.db）。
 
-    get_graph 已支持 config.configurable.workspace_path：评估不用改核心代码，
+    get_main_agent_graph 已支持 config.configurable.workspace_path：评估不用改核心代码，
     工作区注入、MCP 子进程拉起、沙箱校验都走现有链路。
     """
-    graph = await get_graph({"configurable": {"workspace_path": str(workspace)}})
+    graph = await get_main_agent_graph({"configurable": {"workspace_path": str(workspace)}})
     return graph.compile(checkpointer=InMemorySaver())
 
 

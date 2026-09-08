@@ -173,7 +173,7 @@ class ReviewNode:
 
     # "state 工具"在 tool.json 的 source 取值集合：命中即分流进 approved_orchestrate_calls，
     # 交 OrchestrateNode（通用 state 工具执行器）处理。plan=编排；notes=笔记读回；
-    # dispatch=并发派发子任务（app/agent/tools.py::dispatch_subtasks）。
+    # dispatch=并发资料收集派发（app/agent/tools.py::dispatch_subtasks）。
     ORCHESTRATE_SOURCES: frozenset[str] = frozenset({"plan", "notes", "dispatch"})
 
     @classmethod
@@ -183,8 +183,10 @@ class ReviewNode:
         with _TOOL_CONFIG_PATH.open("r", encoding="utf-8") as file:
             return json.load(file)
 
-    def __init__(self) -> None:
+    def __init__(self, log: bool = True) -> None:
+        """log=False 供 stdio MCP server 型 worker 使用（stdout 即 JSON-RPC 协议，不能 print）。"""
         self.tool_review = self._tool_config()
+        self.log = log
 
     async def __call__(self, state: AgentState) -> dict | AgentState:
         pending = list(state.get("pending_tool_calls", []))
@@ -193,8 +195,9 @@ class ReviewNode:
 
         current_tool = pending[0]
         tool_name = current_tool.get("name")
-        # 工具调用日志：每条待审调用过审核节点时打一行（含需要人工审批与免审放行者）
-        print(_tool_call_log(current_tool))
+        if self.log:
+            # 工具调用日志：每条待审调用过审核节点时打一行（含需要人工审批与免审放行者）
+            print(_tool_call_log(current_tool))
         tool_cfg = self.tool_review.get(tool_name, {}) if tool_name else {}
         approved = True
         denied_messages: list[ToolMessage] = []

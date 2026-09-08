@@ -86,10 +86,10 @@ uv run python -m app.main
 ```python
 import asyncio
 from langchain_core.messages import HumanMessage
-from app.agent.graph import get_graph
+from app.agent.graph import get_main_agent_graph
 
 async def main():
-    graph = await get_graph()
+    graph = await get_main_agent_graph()
     app = graph.compile()  # 传入 SqliteSaver 可持久化会话
 
     result = await app.ainvoke({

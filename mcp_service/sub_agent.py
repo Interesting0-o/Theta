@@ -1,30 +1,28 @@
-"""子任务 worker MCP server（多 agent 候选 B 的 isolated 首步，见 docs/MULTI_AGENT.md）。
+"""子任务 worker MCP server（stdio；worker 图在 app/agent.graph::get_sub_agent_graph）。
 
 暴露单个工具 `run_subtask(task)`：调用方（主 agent 的 dispatch_subtasks 编排工具，见
-app/agent/tools.py）把一条**只读子任务**派过来，本 server 在自己进程里、以**独立消息栈**
-跑一个迷你 agent 循环，返回结论正文。
+app/agent/tools.py）把一条**子任务**（并发资料收集）派过来，本 server 在自己进程里、以独立
+消息栈跑一个 worker 子 agent，返回结论正文。
 
-本模块是 **worker 进程侧的家**（对端是主侧的 app/agent/tools.py::dispatch_subtasks）：
-- worker 侧的 agent 逻辑也收在这里（原 app/agent/subtask.py 已并入）：WORKER_SYSTEM_PROMPT、
-  `read_only_tools`（只读检索过滤）、`authorize_node`、`build_subtask_graph`。主 agent
-  **不用**它们，只经由 spawn `python -m mcp_service.sub_agent` + `run_subtask` 跨进程调用。
-- **只读、无写/命令工具 → 无 interrupt / 无审批回传**：run_subtask 是普通 request/response
-  工具。写工具 + 审批回传是后续里程碑（docs §6）。
-- **app.agent 相关 import 全部懒加载**（config.py 的 .env 相对 cwd 解析；app/agent/model
-  顶层 get_settings）→ 模块 import 不触发 get_settings，冷启动无需 .env；真正跑子任务、
-  要建 worker 图时才 import（cwd=项目根可读到 .env 的 CHAT_*）。
-- 工作区取自 env `WORKSPACE_PATH`（与 file_io 约定一致；缺失/非目录 → ConfigError，
-  由 @guard 归成 config_error）。
+本模块是 **worker 进程的 server / run 壳**——业务（子图、人设、工具子集）归 app.agent：
+- 子图 = `app/agent/graph.py::get_sub_agent_graph`（复用 Queue/Review/Tool/LLM 节点 +
+  InMemorySaver compile，need_review 调用 interrupt，免审放行进 approved_tool_calls）；
+- 人设 = `app/agent/prompt.py::WORKER_SYSTEM_PROMPT`；
+- 可用工具子集 = `app/agent/tools.py::worker_tools`（工作区只读检索 ∪ 联网四件套）。
+本模块只在 run_subtask 真正执行时才懒加载它们 → 模块 import 不碰 app.agent、无需 .env。
+- 本模块自留：FastMCP(stdio) 入口 + run 编排（run_subtask_impl：建 state / 跑图 / 提结论）+
+  审批回传 driver（interrupt → POST 主侧 ApprovalInboxServer → 长轮询 → Command(resume)）。
+- worker = 主 agent 的并发资料收集助手：只读工作区 + 可联网；联网触发主 agent 人工审批；
+  **无工作区写/命令**（其下放是后续里程碑，docs §6）。
+- 工作区取自 env WORKSPACE_PATH（缺失/非目录 → ConfigError，由 @guard 归成 config_error）。
 """
-import json
 import os
+import time
 import uuid
 from pathlib import Path
-from typing import Sequence
 
 from langchain_core.messages import AIMessage, HumanMessage
-from langchain_core.tools import BaseTool
-from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command
 from mcp.server.fastmcp import FastMCP
 
 from app.exception import ConfigError, InvalidArgumentError
@@ -33,30 +31,13 @@ from mcp_service.utils import guard
 
 mcp = FastMCP("SubAgent")
 
-# worker 子任务图的递归上限（节点执行 superstep 数）；只读循环靠它兜底，防模型无限调工具
+# worker 子任务图的递归上限（superstep 数）；只读/审批循环靠它兜底
 _MAX_STEPS = 100
 
-# 项目根：spawn 本 worker 时 cwd 用项目根，使 .env 可被读到（CHAT_*）；tool.json 在此取
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_TOOL_CONFIG_PATH = _PROJECT_ROOT / "app" / "agent" / "tool.json"
-
-# 只读检索工具允许的 source：file_io 读 + git 读
-_READ_SOURCES: frozenset[str] = frozenset({"mcp_service/file_io", "mcp_service/git"})
-
-
-WORKER_SYSTEM_PROMPT = """\
-你是 CodingAgent 的**子任务执行 agent（worker）**。你会被单独派发一条边界清晰的子任务，
-用**只读**工具在当前工作区里调查后，把结论作为最终答复交回。
-
-- 你能做的：read_file / list_dir / get_directory_tree / glob / search_content
-  （工作区文件检索）与 list_repos / git_status / git_branches / git_diff / git_log /
-  git_fetch（git 只读）。信息不足就先补读，不要脑补不存在的文件内容。
-- 你不能做的：**不能改动任何文件、不能执行命令**——写/执行类工具对你不可用，不要尝试
-  也不要在结论里假装已改动；需要落地改动时，把"要改哪里、怎么改"写清楚，由主 agent 执行。
-- 所有文件类路径以注入的"当前工作区根目录"为准，相对路径都以它为基准；越界会被拦下。
-- 收尾（不再需要读信息时）直接把**结论**作为最终答复返回：简明、给出关键出处
-  （文件:行 或工具回执），若任务要求产出方案则给出可执行要点。默认用中文作答。\
-"""
+# 主侧统一审批收件箱（ApprovalInboxServer）默认地址；env AGENT_INBOX_URL 可覆盖
+_INBOX_DEFAULT_URL = "http://127.0.0.1:8010"
+# 单条审批决定等待的总上限（秒）；server 单次 block 最多等 120s，driver 外层循环重试到该上限
+_APPROVAL_TIMEOUT_S = 300.0
 
 
 def _resolve_workspace() -> str:
@@ -70,80 +51,116 @@ def _resolve_workspace() -> str:
     return str(path)
 
 
-def read_only_tools(tools: Sequence[BaseTool], cfg: dict | None = None) -> list[BaseTool]:
-    """从工具表里筛出"只读检索"子集（按 tool.json 的 need_review / source）。
+def _worker_id() -> str:
+    """生成一条 run_subtask 的 worker 标记（展示用，主侧渲染成 worker:<id>）。"""
+    return f"worker-{uuid.uuid4().hex[:8]}"
 
-    - cfg：tool.json 解析结果 {tool_name: {need_review, source}}；默认读 app/agent/tool.json。
-    - 保留：name 命中 cfg 且 `need_review:false`、source ∈ {file_io, git} 的工具；
-      剔除写/删/命令/联网/web/编排（plan/notes/dispatch）等会改状态或需审批者。
-    - 纯函数：不依赖 MCP 加载，便于单测注入假 cfg 验证过滤语义。
+
+def _inbox_base_url() -> str:
+    """主侧审批收件箱（ApprovalInboxServer）基地址；每次现取以便运行时覆盖。"""
+    return os.environ.get("AGENT_INBOX_URL", _INBOX_DEFAULT_URL)
+
+
+# ---------------------------------------------------------------------------
+# 审批回传：interrupt 值 → HTTP POST 主侧 → 长轮询等决定
+# ---------------------------------------------------------------------------
+
+
+def _value_to_approval(value) -> tuple[str, dict, str]:
+    """一条 graph interrupt value（ReviewNode payload）→ (tool_name, tool_args, description)。
+
+    ReviewNode payload 键：type/tool_name/tool_args/current_step/tool_call_id。description 取
+    tool_args.description（终端类工具的人话解释），缺省回退成"worker 需审批的调用: <tool>"。
     """
-    if cfg is None:
-        with _TOOL_CONFIG_PATH.open("r", encoding="utf-8") as file:
-            cfg = json.load(file)
-    allowed = {
-        name
-        for name, conf in cfg.items()
-        if not conf.get("need_review") and conf.get("source") in _READ_SOURCES
+    if not isinstance(value, dict):
+        return ("?", {}, f"worker 需审批的调用：{value!r}")
+    tool_name = value.get("tool_name") or "?"
+    tool_args = value.get("tool_args") or {}
+    description = tool_args.get("description") if isinstance(tool_args, dict) else None
+    if not description:
+        description = f"worker 需审批的调用: {tool_name}"
+    return tool_name, dict(tool_args) if isinstance(tool_args, dict) else {}, str(description)
+
+
+async def _await_main_decision(
+    description: str,
+    tool_name: str,
+    tool_args: dict,
+    *,
+    worker_id: str,
+    base_url: str | None = None,
+    timeout: float = _APPROVAL_TIMEOUT_S,
+) -> bool:
+    """把一条 worker 需审批的调用发进主侧统一 broker 并长轮询等人工决定，返回是否批准。
+
+    协议与主侧 ApprovalInboxServer（app/tui/approval_inbox.py）对齐：POST /requests 入队拿
+    approval_id → 循环 GET /requests/{id}?block=1 直到 status=="decided"（server 单次最多 block
+    120s 会回 {"status":"pending"}，故外层循环）。失败（非 200 / 超时）抛 RuntimeError，
+    由 @guard 收成 error ToolResult——worker 不静默放行。
+    """
+    import httpx  # noqa: PLC0415 —— 只在真 interrupt 时才需要网络，保持模块 import 轻
+
+    url = base_url or _inbox_base_url()
+    payload: dict = {
+        "worker_id": worker_id,
+        "tool_name": tool_name,
+        "tool_args": tool_args,
+        "description": description,
     }
-    return [t for t in tools if getattr(t, "name", None) in allowed]
+    deadline = time.monotonic() + timeout
+    async with httpx.AsyncClient(base_url=url, timeout=60.0) as client:
+        resp = await client.post("/requests", json=payload)
+        if resp.status_code != 200:
+            raise RuntimeError(f"审批收件箱入队失败: HTTP {resp.status_code} {resp.text[:200]}")
+        approval_id = resp.json()["approval_id"]
+        while True:
+            rr = await client.get(f"/requests/{approval_id}", params={"block": "1"})
+            if rr.status_code != 200:
+                raise RuntimeError(f"等待审批决定失败: HTTP {rr.status_code}")
+            decision = rr.json()
+            if decision.get("status") == "decided":
+                return bool(decision.get("approved"))
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"等待审批决定超时（{timeout:.0f}s），未获得主侧决定")
 
 
-async def authorize_node(state: dict) -> dict:
-    """免审放行本轮 tool_calls → approved_tool_calls。
+async def _run_with_remote_approval(
+    graph,
+    state: dict,
+    *,
+    base_url: str | None = None,
+    worker_id: str | None = None,
+) -> dict:
+    """跑子任务图：遇 __interrupt__ 经 HTTP 送回主侧审批、以 Command(resume) 续跑。
 
-    worker 只绑定只读检索工具（read_only_tools 保证 need_review:false），无需像主图那样
-    经 ReviewNode 逐条 interrupt/drain——本轮模型发起的调用整批放行给 ToolNode 即可。
-    （主图里 queue_node 只填 pending、靠 review_node 搬进 approved；worker 跳过 review，
-    故不能直接复用 QueueNode，否则 approved 永远为空、工具永不执行。）
+    与主侧 app/tui/driver.py::drive_turn 同形态，只把"本地 broker park"换成"POST 主侧收件箱 +
+    长轮询取回"。worker 图由 ReviewNode 产生 interrupt（逐条 drain，一次一条 need_review 调用），
+    因此正常路径单 interrupt/轮；多条走兜底合成一次审批（与 drive_turn 兜底语义一致）。
+    返回终态（无 __interrupt__ 的 result），由调用方提取结论。
     """
-    tool_calls = getattr(state["messages"][-1], "tool_calls", None) or []
-    return {
-        "pending_tool_calls": [],
-        "approved_tool_calls": list(tool_calls),
-        "approved_orchestrate_calls": [],
+    config: dict = {
+        "configurable": {"thread_id": uuid.uuid4().hex},
+        "recursion_limit": _MAX_STEPS,
     }
-
-
-def build_subtask_graph(read_tools, workspace_path: str, model=None):
-    """compile 一张只读子任务图（无 checkpointer）。
-
-    - model：默认 get_chat_model()；有 read_tools 才 bind_tools（便于测试注入假模型）。
-    - 路由：llm 末条 AIMessage 有 tool_calls → authorize_node（免审放行）→ tool → llm；
-      无 tool_calls → END。比主图少了 review/interrupt/编排/压缩——worker 全只读、单次调用。
-    - compile 不挂 checkpointer：worker 子任务单次调用即可跑完，无需跨轮持久化。
-    - app.agent 依赖懒加载：进本函数才 import（避免模块 import 期触发 get_settings）。
-    """
-    from app.agent.model import get_chat_model  # noqa: PLC0415
-    from app.agent.nodes import LLMNode, ToolNode  # noqa: PLC0415
-    from app.agent.state import AgentState  # noqa: PLC0415
-
-    chat = model if model is not None else get_chat_model()
-    if read_tools:
-        chat = chat.bind_tools(list(read_tools))
-
-    graph = StateGraph(AgentState)
-    graph.add_node(
-        "llm_node",
-        LLMNode(model=chat, workspace_path=workspace_path, system_prompt=WORKER_SYSTEM_PROMPT),
-    )
-    graph.add_node("authorize_node", authorize_node)
-    graph.add_node("tool_node", ToolNode(list(read_tools)))  # type: ignore[arg-type]
-
-    def route_after_llm(state: AgentState):
-        last_message = state["messages"][-1]
-        if isinstance(last_message, AIMessage) and last_message.tool_calls:
-            return "authorize_node"
-        return END
-
-    graph.add_edge(START, "llm_node")
-    graph.add_conditional_edges(
-        "llm_node", route_after_llm, {"authorize_node": "authorize_node", END: END}
-    )
-    graph.add_edge("authorize_node", "tool_node")
-    graph.add_edge("tool_node", "llm_node")
-
-    return graph.compile()
+    wid = worker_id or _worker_id()
+    inputs = state
+    for _ in range(_MAX_STEPS):
+        result = await graph.ainvoke(inputs, config)
+        interrupts = result.get("__interrupt__")
+        if not interrupts:
+            return result
+        values = [getattr(it, "value", it) for it in list(interrupts)]
+        if len(values) == 1 and isinstance(values[0], dict):
+            tool_name, tool_args, description = _value_to_approval(values[0])
+        else:
+            # 兜底：多条 interrupt 合成一次审批（正常路径不会到这）
+            names = [
+                (v.get("tool_name") if isinstance(v, dict) else "?") for v in values
+            ]
+            tool_name, tool_args, description = "多工具审批", {}, "一次请求审批多项 worker 工具：" + "、".join(names)
+        approved = await _await_main_decision(description, tool_name, tool_args, worker_id=wid, base_url=base_url)
+        inputs = Command(resume={"approved": approved})
+    raise RuntimeError(f"worker 子任务超过步数上限 {_MAX_STEPS}")
 
 
 def _extract_conclusion(result: dict) -> str:
@@ -167,16 +184,24 @@ async def run_subtask_impl(
     *,
     model=None,
     tools=None,
+    inbox_url: str | None = None,
 ) -> ToolResult:
     """run_subtask 的核心实现；参数可注入便于测试（假 model / 假 tools，不拉真实子进程）。
 
     - task：子任务描述；空白 → InvalidArgumentError。
     - workspace：工作区绝对路径（须存在）。
-    - tools：默认经 load_mcp_tool(workspace) 拉取后按 read_only_tools 筛成只读检索子集；
-      注入时直接用（测试绕开真实 MCP 孙进程）。
-    - model：默认 build_subtask_graph 内建 get_chat_model()；注入假模型则无需真实 LLM。
+    - tools：默认经 load_mcp_tool(workspace) 拉取后按 app.agent.tools::worker_tools 筛成可用
+      子集（只读检索 + 联网，后者 need_review 会触发审批）；注入时直接用。
+    - model：默认 app.agent.graph::get_sub_agent_graph 内建 get_main_chat_model()；注入假模型则无需
+      真实 LLM。
+    - inbox_url：主侧审批收件箱基地址；默认读 env AGENT_INBOX_URL。仅 need_review 调用被
+      interrupt 时才发起 HTTP（只读路径全程不需主侧）。
+
+    子图/人设/工具子集均为懒加载（app.agent），模块 import 阶段不触发 get_settings。
     """
-    from app.agent.mcp import load_mcp_tool  # 懒加载：见模块 docstring
+    from app.agent.mcp import load_mcp_tool  # noqa: PLC0415 —— 懒加载：见模块 docstring
+    from app.agent.tools import worker_tools  # noqa: PLC0415
+    from app.agent.graph import get_sub_agent_graph  # noqa: PLC0415
 
     if not isinstance(task, str) or not task.strip():
         raise InvalidArgumentError("task 不能为空")
@@ -184,9 +209,9 @@ async def run_subtask_impl(
     workspace = str(Path(workspace).expanduser().resolve())
 
     if tools is None:
-        tools = read_only_tools(await load_mcp_tool(workspace))
+        tools = worker_tools(await load_mcp_tool(workspace))
 
-    graph = build_subtask_graph(tools, workspace, model=model)
+    graph = get_sub_agent_graph(tools, workspace, model=model)
 
     state: dict = {
         "session_id": uuid.uuid4().hex,
@@ -197,18 +222,18 @@ async def run_subtask_impl(
         "current_plan": [],
         "notes": {},
     }
-    result = await graph.ainvoke(state, config={"recursion_limit": _MAX_STEPS})
+    result = await _run_with_remote_approval(graph, state, base_url=inbox_url)
     return ToolResult(success=True, content=_extract_conclusion(result))
 
 
 @mcp.tool()
 @guard
 async def run_subtask(task: str) -> ToolResult:
-    """把一条**只读**子任务（调研 / 分析 / 读码 / 出方案）派发给独立子 agent 执行。
+    """把一条**子任务**（工作区调研 / 联网检索 / 读码 / 出方案）派发给独立子 agent 执行。
 
-    子 agent 在本 server 进程里用只读工具（工作区文件检索 + git 只读）调查当前工作区，
-    跑完返回一段结论正文。它**不能改动任何文件、不能执行命令**——需要落地改动时，
-    由你在收到结论后自行执行。
+    子 agent 用**只读**工具（工作区文件检索 + git 只读）调查当前工作区，也可**联网检索**
+    （web_search 等）——联网调用会先请求主 agent 人工审批、可能等待。它**不能改动工作区任何
+    文件、不能执行命令**——需要落地改动时，由你在收到结论后自行执行。
 
     Args:
         task: 一条边界清晰的子任务描述（含目标与期望结论要点），如

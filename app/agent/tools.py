@@ -19,6 +19,7 @@
 - 工具响应会把最新计划快照回显，供模型跨轮跟踪；没有独立的"查看计划"工具。
 """
 import asyncio
+import json
 import sys
 from pathlib import Path
 from typing import Annotated, List
@@ -30,7 +31,7 @@ from app.agent.state import AgentState
 from app.agent.utils import format_tool_result
 from app.schema.agent_schema import PlanStatus, PlanStep
 
-# 项目根：spawn worker 子进程时 cwd 用项目根使 .env 可读（worker 内懒加载 get_chat_model）
+# 项目根：spawn worker 子进程时 cwd 用项目根使 .env 可读（worker 内懒加载 get_main_chat_model）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
@@ -38,6 +39,37 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 # 计划步骤允许的状态取值（与 PlanStatus Literal 保持一致）
 PLAN_STATUSES: tuple[str, ...] = ("pending", "in_progress", "done")
+
+# ------------------------- worker（子 agent）可用工具子集 -------------------------
+# worker 定位 = 主 agent 的并发资料收集助手，其可用工具按 tool.json 过滤：
+#   工作区只读检索（file_io 读 + git 读，need_review:false，免审批）
+#   ∪ 联网检索四件套（web_search 系，need_review:true → 触发主侧审批）。
+# 终端（连只读 process_*）、git 写、plan/notes/dispatch 一概不进 worker。
+_WORKSPACE_SOURCES: frozenset[str] = frozenset({"mcp_service/file_io", "mcp_service/git"})
+_WEB_SOURCES: frozenset[str] = frozenset({"mcp_service/web_search"})
+_WORKER_TOOL_CONFIG = Path(__file__).with_name("tool.json")
+
+
+def worker_tools(tools, cfg: dict | None = None):
+    """从工具表筛出 worker 可用子集（工作区只读检索 + 联网检索）。
+
+    - cfg：tool.json 解析结果 {tool_name: {need_review, source}}；默认读 app/agent/tool.json。
+    - 保留：name 命中 cfg 且（`need_review:false` 且 source∈{file_io,git}）——免审的只读检索；
+      或 source∈{web_search}——联网四件套（need_review:true，会触发主侧审批）。
+    - 剔除：写/删/命令/git 写/plan/notes/dispatch 等（或改状态、或需更高权限、或会再派生子任务）。
+    - 纯函数：不依赖 MCP 加载，便于单测注入假 cfg 验证过滤语义。
+    """
+    if cfg is None:
+        with _WORKER_TOOL_CONFIG.open("r", encoding="utf-8") as file:
+            cfg = json.load(file)
+    allowed: set[str] = set()
+    for name, conf in cfg.items():
+        source = conf.get("source")
+        if source in _WORKSPACE_SOURCES and not conf.get("need_review"):
+            allowed.add(name)
+        elif source in _WEB_SOURCES:
+            allowed.add(name)
+    return [t for t in tools if getattr(t, "name", None) in allowed]
 
 
 def _snapshot(plan: list[PlanStep]) -> str:
@@ -283,7 +315,7 @@ async def run_subtask_batch(
     workspace: str,
     runner=None,
 ) -> list[dict]:
-    """并发跑一批只读子任务；每个子任务一个独立 worker（默认 spawn sub_agent 进程）。
+    """并发跑一批资料收集子任务；每个子任务一个独立 worker（默认 spawn sub_agent 进程）。
 
     返回按输入顺序排列的 [{task, ok, content}]；单 worker 失败不拖垮整批
     （记 ok=False，content 带原因），由调用方决定是否重试/换法。
@@ -306,26 +338,39 @@ async def dispatch_subtasks(
     workspace: Annotated[str, InjectedWorkspace],
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> dict:
-    """把多个**只读**子任务并发派发给独立 worker（子 agent），拿回每个的结论。
+    """把多个**相互独立**的查证/调研问题，并行派给一批一次性 worker 子 agent 快速收集资料，
+    拿回每个的结论正文。
 
-    何时用：手里的任务能拆成几个相互独立的调查/分析/出方案子任务（各写各的边界、
-    互不依赖）时，一次把清单给我，由系统对每个子任务起一个独立 worker 进程执行——
-    它们只读当前工作区（文件检索 + git 只读），不能改文件、不能执行命令，需要落地
-    改动时由你基于结论自行执行。完成后每个子任务给一段结论正文（带出处）。
+    何时用：当前任务需要"先并行搜集一堆互不相关的资料/事实"时——例如分别调研工作区里几个
+    模块各自怎么实现、分别查几份 API 文档/报错资料、分别读几块代码的职责。把每个独立问题写成
+    一条 sub_task 一次派出，由系统对每条起一个独立 worker 进程**并发**执行，比你自己逐条串行
+    读/搜快得多。派发本身免审批。
 
-    何时别用：子任务之间有依赖（下游要等上游产物）——那是先后顺序的事，别并发；
-    或单条任务根本不需要拆——直接自己做即可，不要为派发而派发。
+    worker 的能力边界（重要）：
+    - worker 能：只读当前工作区（文件检索 + git 只读）+ **联网检索**（web_search 等；其联网
+      调用会以"子任务审批"形式出现在人工审批、可能等待）。
+    - worker 不能：改任何文件、执行任何命令、做最终决策——它返回"结论正文 + 出处"，**只是给
+      你做判断的素材**；它上下文独立，看不到其它 worker 的结果。
+    - 因此真正"干活"（改动、验证、给用户答复）仍是你自己：收到结论先汇总/交叉核对，需要落地
+      改动时由你用写/命令工具执行，不要指望 worker 替你改。
+
+    何时别用：子问题之间有依赖（下游要吃上游产物、需按先后做）——那不该并发，留给你自己按
+    计划推进；或单问单答、拆无可拆——直接自己做即可，不要为派发而派发。
+
+    用法提示：每条 sub_task 写成一条**自包含**的调研问题（含想要拿到的结论要点与出处要求），
+    让 worker 查完即可回报、不必依赖别人；一次别派太多（建议 ≤5 条），太长就分批，避免并行
+    结果过长、审批轰炸。
 
     Args:
-        sub_tasks: 子任务描述列表（每条约一个独立调查/分析目标，含期望结论要点）。
-            每个子任务各由一个独立 worker 执行；互不共享上下文。
+        sub_tasks: 相互独立的调研/资料收集问题列表（每条约一个调查目标，含期望结论要点）。
+            每条各由一个独立 worker 执行；互不共享上下文。
 
     Returns:
         汇总文本：逐个子任务的结果（✓/✗ + 结论或失败原因）。
     """
     results = await run_subtask_batch(sub_tasks, workspace)
     # 汇总正文很短，直接内联（不再抽独立渲染函数）
-    lines = [f"已并发派发 {len(results)} 个只读子任务，结果："]
+    lines = [f"已并发派出 {len(results)} 个资料收集 worker，结果："]
     for i, r in enumerate(results, 1):
         mark = "✓" if r["ok"] else "✗"
         lines.append(f"[{i}] ({mark}) 子任务「{r['task']}」")

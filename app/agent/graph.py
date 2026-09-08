@@ -3,11 +3,13 @@ import os
 from pathlib import Path
 
 from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from app.agent.state import AgentState
 from app.agent.nodes import *
-from app.agent.model import get_chat_model
+from app.agent.model import get_main_chat_model
+from app.agent.prompt import WORKER_SYSTEM_PROMPT
 from app.agent.mcp import load_mcp_tool
 from app.agent.tools import orchestrate_tool, note_tools, dispatch_tool
 
@@ -50,7 +52,7 @@ def should_continue_after_orchestrate(state: AgentState):
     return "tool_node" if state.get("approved_tool_calls") else "llm_node"
 
 
-async def get_graph(config: RunnableConfig | None = None):
+async def get_main_agent_graph(config: RunnableConfig | None = None):
     """
     返回未编译的 StateGraph（compile 由调用方完成，以支持挂 checkpointer 的 interrupt 审批）。
 
@@ -67,7 +69,7 @@ async def get_graph(config: RunnableConfig | None = None):
 
     # 模型能看到全部工具（含计划工具）；但只有"可执行工具"会进 review→tool_node
     all_tools = orchestrate_tool + note_tools + dispatch_tool + mcp_tools
-    model = get_chat_model().bind_tools(all_tools)
+    model = get_main_chat_model().bind_tools(all_tools)
 
     graph.add_node("llm_node", LLMNode(model=model, workspace_path=workspace_path))
     graph.add_node("queue_node", QueueNode())
@@ -120,3 +122,58 @@ async def get_graph(config: RunnableConfig | None = None):
     graph.add_edge("tool_node", "llm_node")
 
     return graph
+
+
+def get_sub_agent_graph(read_tools=None, workspace_path: str | None = None, model=None, review_log: bool = False):
+    """compile 一张 worker（子 agent）子任务图，供 mcp_service.sub_agent 等以 stdio/http 拉起。
+
+    worker = 主 agent 的并发资料收集助手：图复用主图节点，但更小——`llm_node → queue_node →
+    review_node → tool_node`（无编排/压缩）：
+    - 路由：llm 末条 AIMessage 有 tool_calls → queue_node，无 → END；
+      queue→review；review：pending→review_node、approved_tool_calls→tool_node、否则 END。
+    - 审核判定单点复用 ReviewNode；`need_review` 的调用（如联网四件套）会 interrupt()，免审的
+      放行进 approved_tool_calls。review_log 默认 False：worker 走 stdio 时 stdout 即 JSON-RPC，
+      不能 print（需日志的调用方传 True）。
+    - compile 挂 InMemorySaver：worker 每次被拉起只跑一条 run_subtask，interrupt 挂起 →
+      Command(resume) 续跑都在同进程同 thread 内完成，内存检查点足够，不落盘。
+    - model：默认 get_main_chat_model()；有 read_tools 才 bind_tools（便于测试注入假模型/假工具）。
+    """
+    chat = model if model is not None else get_main_chat_model()
+    if read_tools:
+        chat = chat.bind_tools(list(read_tools))
+
+    graph = StateGraph(AgentState)
+    graph.add_node(
+        "llm_node",
+        LLMNode(model=chat, workspace_path=workspace_path, system_prompt=WORKER_SYSTEM_PROMPT),
+    )
+    graph.add_node("queue_node", QueueNode())
+    graph.add_node("review_node", ReviewNode(log=review_log))
+    graph.add_node("tool_node", ToolNode(list(read_tools or [])))  # type: ignore[arg-type]
+
+    def route_after_llm(state: AgentState):
+        last_message = state["messages"][-1]
+        if isinstance(last_message, AIMessage) and last_message.tool_calls:
+            return "queue_node"
+        return END
+
+    def route_after_review(state: AgentState):
+        if state.get("pending_tool_calls"):
+            return "review_node"
+        if state.get("approved_tool_calls"):
+            return "tool_node"
+        return END
+
+    graph.add_edge(START, "llm_node")
+    graph.add_conditional_edges(
+        "llm_node", route_after_llm, {"queue_node": "queue_node", END: END}
+    )
+    graph.add_edge("queue_node", "review_node")
+    graph.add_conditional_edges(
+        "review_node",
+        route_after_review,
+        {"review_node": "review_node", "tool_node": "tool_node", END: END},
+    )
+    graph.add_edge("tool_node", "llm_node")
+
+    return graph.compile(checkpointer=InMemorySaver())

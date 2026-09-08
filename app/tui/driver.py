@@ -177,14 +177,14 @@ async def run_tui() -> None:
     """
     import aiosqlite  # noqa: PLC0415
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver  # noqa: PLC0415
-    from app.agent.graph import get_graph  # noqa: PLC0415
+    from app.agent.graph import get_main_agent_graph  # noqa: PLC0415
 
     db_path = get_agent_db_path()
     connection = await aiosqlite.connect(str(db_path))
     checkpointer = AsyncSqliteSaver(connection)
     await checkpointer.setup()
 
-    graph = await get_graph()
+    graph = await get_main_agent_graph()
     compiled = graph.compile(checkpointer=checkpointer)
     config: dict = {"configurable": {"thread_id": THREAD_ID}}
     step = lambda inputs: compiled.ainvoke(inputs, config)  # noqa: E731

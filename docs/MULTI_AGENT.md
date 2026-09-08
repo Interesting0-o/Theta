@@ -60,7 +60,7 @@
 ## 5. 拉起形态：主/worker 分层（关键约束；起点 = 同进程子图，升级 = worker=MCP）
 
 先厘清两层定位，避免把镜像当方向：
-- **主 agent = orchestrator**：拆解任务、定依赖、审批、调度、归并，是**调用方**；保持现有 graph（`get_graph` 那套）不动，按需加 DAG/调度能力。
+- **主 agent = orchestrator**：拆解任务、定依赖、审批、调度、归并，是**调用方**；保持现有 graph（`get_main_agent_graph` 那套）不动，按需加 DAG/调度能力。
 - **worker（子 agent）= 执行单元**：跑单个子任务，是**被调方**，才需要"做成可调用的东西"。N 个 worker 复用同一套 agent 代码、各实例独立上下文；"把主 agent 做成 MCP 给别人调"属被更外层系统编排的远期选项，与内部多 agent 解耦，不在本设计内。
 
 worker 放哪个进程，直接决定"审批这道坎"长什么样。**已定：先 A、后 B**——A 是当前工作形态；B 等 A 出现瓶颈再做（判据见本节末尾）。
@@ -70,7 +70,7 @@ worker 放哪个进程，直接决定"审批这道坎"长什么样。**已定：
 **候选 A · 同进程子图（起点，P0/P1 采用）**
 - worker = 用同一套 nodes 再 compile 的"子任务图"：同 model + **收束的子任务 prompt** + **裁剪的工具子集**（只读检索/规划/notes），每子任务独立消息栈/上下文；主图调度节点按 DAG 就绪 **asyncio 并发 ainvoke 多个 worker 图**。
 - **审批零成本**：worker 不授写/命令工具 → 主图 review→interrupt 单点原样成立，写动作执行权永远在主侧 ToolNode，**无需跨进程审批回传**。
-- 底层工具复用现成：`app/agent/mcp.py` 已有按工作区键的进程级工具缓存 + 单飞锁（`_MCP_TOOLS_CACHE` / `_MCP_LOADING_LOCKS`，当初为 langgraph dev 反复 `get_graph` 提速而加），**主 + worker 直接 bind 同一批工具对象**即可，不再各自拉起子进程。
+- 底层工具复用现成：`app/agent/mcp.py` 已有按工作区键的进程级工具缓存 + 单飞锁（`_MCP_TOOLS_CACHE` / `_MCP_LOADING_LOCKS`，当初为 langgraph dev 反复 `get_main_agent_graph` 提速而加），**主 + worker 直接 bind 同一批工具对象**即可，不再各自拉起子进程。
 - 代价：与主同进程，无故障隔离；worker 上下文隔离要自管（独立消息栈）。二者短期都非目标。
 
 **候选 B · worker = MCP server（升级路径：A 出现瓶颈再做）**
@@ -164,6 +164,19 @@ interrupt 的契约 = **阻塞图、不阻塞进程**（LangGraph 原生）：ru
   2. `create_dag`-类工具（带 deps/produces/consumes，仿 create_plan，tool.json 归 state/plan 通道）产出依赖图 → interrupt 审批计划表；
   3. worker 执行单元 = 编译子任务图（收束子任务 prompt + 只读工具子集，§5 候选 A）；先做"审批留主侧"的最小版：worker 只读/提案，敏感动作回主侧（§6）。
      - **isolated 首步已落地（2026-09-06）**：只读"分析师"worker MCP server——`mcp_service/sub_agent.py` 即 **worker 进程侧的家**：运输层（`run_subtask(task)`）+ worker agent 逻辑（`WORKER_SYSTEM_PROMPT` / `read_only_tools` 只读过滤 / `authorize_node` + `build_subtask_graph`：LLMNode + 免审放行 + ToolNode，无 checkpointer）同收一处；主 agent **不 import 它**，只经 spawn + `run_subtask` 跨进程调用。独立进程/独立消息栈跑只读子任务并返回结论；**未接 main、无写工具**。它铺平"写工具 + §6 审批回传"后续里程碑（届时注意：sub_agent 被主 agent 以 cwd=工作区拉起时读不到项目 .env 的 CHAT_*，需注入 env 或改 cwd）。
+     - **worker 审核门 + 审批回传闭环已接（2026-09-08）**：worker 默认工具子集从"只读检索"放开到
+       只读检索 ∪ 联网四件套（`read_only_tools` → `worker_tools`；web_search 系 need_review:true
+       触发审批）；图删 `authorize_node`（免审），改复用主图 QueueNode/ReviewNode（ReviewNode 加
+       `log` 开关——worker 是 stdio MCP server、stdout 即 JSON-RPC，不能 print）+ **InMemorySaver**
+       checkpointer（worker 每次 spawn 只跑一条 run_subtask，interrupt 挂起 → `Command(resume)`
+       续跑都在同进程同 thread 内完成，内存检查点足够、不落盘）；`run_subtask` 内新增 driver：
+       遇 `__interrupt__` 把中断值 POST 进主侧统一 broker（ApprovalInboxServer）、长轮询等人工
+       决定后 resume——**批准即执行、拒绝回灌 [approval_denied]**。主侧 run_tui 事件驱动，在
+       dispatch 进行中也能并发服务 worker 审批（new_pending 唤醒 drain）。**仍不下放工作区写/命令**。
+       闭环测试 tests/test_sub_agent_approval.py（批准/拒绝/只读休眠三向）；主侧整链另由
+       tests/test_dispatch_worker_approval.py 覆盖（OrchestrateNode → dispatch → worker 审批 →
+       resume → 汇总回主）。同日重构：worker 子图迁 app/agent.graph::get_sub_agent_graph、
+       mcp_service/sub_agent 瘦身为 run 壳，见文末"模块落点"。
      - **HTTP 传输层已通（同日）**：`mcp_service/http_agent.py`——streamable-http transport 的最小 MCP server，`chat(task)` 一次性 LLM 回复（无工具/状态）；验收 = 起服务 → HTTP 客户端 ListTools + CallTool 拿到回复（已手动验证）。`SUBAGENT_HTTP_HOST`/`SUBAGENT_HTTP_PORT` 可覆盖监听地址。
      - **spawn-per-task 派发已落地（同日）**：主 graph **不静态绑 worker**（避免"先启动服务/最多一个子 agent"），而是加编排工具 `dispatch_subtasks(sub_tasks)`（收在 `app/agent/tools.py`，与 create_plan 等编排工具同住；source=dispatch 走 orchestrate 层）：每次调用按任务 `asyncio.gather` **现场 spawn N 个独立 sub_agent 子进程**跑 `run_subtask`，各独立上下文、干完即回收，返回汇总结论；`workspace` 以 `InjectedToolArg` 对模型隐藏、由 OrchestrateNode 注入。worker 子进程 cwd=项目根以读 .env 的 CHAT_*。测试 tests/test_dispatch.py。
      - **主侧审批控制面落地（同日，idle-only；后收窄为纯请求队列）**：主 agent 保留 TUI、不做常驻后端。`app/main.py` 输入解耦（阻塞 `input()` → 单 stdin reader 线程 + asyncio.Queue，循环不再被键盘占死）；`app/approval_inbox.py` 合一**待审请求队列 ApprovalInbox + 薄 HTTP 收件箱 ApprovalInboxServer**（starlette/uvicorn 同事件循环任务，POST /requests 入队、GET /requests/{id}?block=1 长轮询、POST /requests/{id}/decision 回填；不 import app.agent）。**语义定界**：本模块只做队列 + 送达（enqueue/complete/wait），不做审批判定——判定单点在图的审核节点（§6）；complete 只记录审核方给的决定并唤醒等待者。TUI **idle 时**能收/审/回 worker 待审请求（复用 `format_tool_approval` 面板 + y/n）；**dispatch 中途弹审批与 worker 写工具未做**（留后续里程碑，届时复用 queue 的 enqueue/wait 原语）。测试 tests/test_approval_inbox.py。（本段的输入解耦 / 收件箱 / 审批判定已随 2026-09-07 main 事件化重构迁入 `app/tui`：input.py / approval_inbox.py / approval.py / driver.py，并升格为"主 agent 自身 interrupt 也入同一 broker park"的统一审批，见 §6 统一审批视图与 §10 已定(2026-09-07)。）
@@ -174,7 +187,8 @@ interrupt 的契约 = **阻塞图、不阻塞进程**（LangGraph 原生）：ru
        把内联的"渲染面板 + 收 y/n"抽成可复用判定单元 `decide_approval(value, out_q)`（主图
        interrupt 与收件箱 worker 请求两处共用；判定权威仍在人）。**仍无真实写/命令工具、无
        worker driver、主侧仍 idle 裁决**——本步只证明 §6 回传"入队→判定→httpx 回决定"最小回路
-       能通；写权限下放与逐次回传留后续里程碑。测试 tests/test_http_agent.py。
+       能通；写权限下放与逐次回传留后续里程碑。测试 tests/test_http_agent.py
+       （2026-09-08：http_agent 与其测试已删，同回传现由 tests/test_sub_agent_approval 覆盖）。
      - **main 事件化重构（下一步，2026-09-07 定）**：agent 图作为 main 的**模块而非全部**、main 改事件驱动壳（run 可 park）；主 agent 自身 interrupt 改走事件与 worker 对齐（§6 统一审批视图：ApprovalPending + marker 路由）。代码落点 `app/tui` 包（骨架已建；`app/main.py` 保留为入口、`python -m app.main` 不变）。顺带消除"图内联等 y/n 占死进程、worker 审批被推迟"的互阻塞；写权限下放 / worker 审核门仍留后续里程碑。
   4. 拓扑调度 + 交付物验证门（自写）→ 归并。
 - **P1 · 并行分发**：独立子任务并发跑（复用同底座/同 checkpoint 分工或轻量并发段）。
@@ -184,10 +198,12 @@ interrupt 的契约 = **阻塞图、不阻塞进程**（LangGraph 原生）：ru
 ## 10. 待定 / 待验
 
 **已定（2026-09-07 · 统一审批语义 + main 事件化）**：
-- 跨进程审批的**决定往返最小回路已闭环并测试**（worker 侧审核点 → HTTP POST 收件箱 → `decide_approval` → `queue.complete` → 长轮询取回；test_http_agent 批准/拒绝两向）。但那是**运输层**——worker 图仍未接审核门（worker 只读、`authorize_node` 免审放行，无 `need_review` 工具），见 §9 P0。
+- 跨进程审批的**决定往返最小回路已闭环并测试**（worker 侧审核点 → HTTP POST 收件箱 → `decide_approval` → `queue.complete` → 长轮询取回；当时 test_http_agent 批准/拒绝两向，2026-09-08 该模块已删，同回传现由 test_sub_agent_approval 覆盖）。但那是**运输层**——worker 图仍未接审核门（worker 只读、`authorize_node` 免审放行，无 `need_review` 工具），见 §9 P0。（2026-09-08 已把 worker 审核门接上、并放开联网工具触发审批，
+   本条为当时旧状态留档，见 §9 同节 bullet。）
 - **main 侧改事件驱动壳、agent 图作为其一个模块**：run 可 park——interrupt **阻塞图、不阻塞进程**；主 agent 自身 interrupt 也改走事件（不再内联等 y/n）。主/子 interrupt 语义对齐，审核收敛为**同一 `decide()` + marker 路由**（§6 统一审批视图）。
 - 落地：`app/tui/` 包骨架 = main 重构的家；`app/main.py` **保留为程序入口**（`python -m app.main` 不变），逻辑后续迁入包内演进。
-- **worker 形态本次不动**（维持 spawn-per-task 只读 sub_agent）；事件化 main 令候选 A（进程内 worker 子图）变便宜 → §5 A/B 分叉重开，留单独决策。
+- **worker 形态本次不动**（维持 spawn-per-task 形态；2026-09-08 起 worker 已可联网调查并触发
+  审批，工作区写/命令仍未下放）；事件化 main 令候选 A（进程内 worker 子图）变便宜 → §5 A/B 分叉重开，留单独决策。
 
 **已定（2026-09-06）**：worker 形态**先 A 后 B**——起点同进程子图（P0/P1 载体）；同进程出现瓶颈（故障隔离 / 最小权限 / 对外复用 / 并发压力，判据见 §5 末尾）才升级 worker=MCP server。B 落地所需的"回传审批"已非空位：通道有具体候选（§6 HTTP 控制面），且 B 若要绕开它可走"派发即授权"粗粒度档。代码现状不动（`mcp.py` 工具缓存已就绪，仅待 P0 验证 bind 同一批对象）。
 
@@ -201,6 +217,26 @@ interrupt 的契约 = **阻塞图、不阻塞进程**（LangGraph 原生）：ru
 - [ ] **worker 提示词**：复用现 SYSTEM_PROMPT 还是给"子任务专用"更收束系统提示（形态 A 的裁剪工具子集须与提示词配套）。
 - [ ] **工具共享验证（前提已大体落地）**：`load_mcp_tool` 缓存已在 `mcp.py`（为 langgraph dev 提速所加）；P0 验证主 + worker bind 同一批对象、不再各自拉起子进程。
 - [ ] **@mention/A2A 通信层**：消息/协议形态、是否跨 runtime（远期再定）。
+
+**传输形态（2026-09-08 定）**：worker 当前**继续走 stdio spawn-per-task**，HTTP 不在此刻做。worker 子图
+（`app/agent.graph::get_sub_agent_graph`）作**可复用基座**保持传输无关；待 DAG/@mention 落地时，worker
+再切 **streamable-http MCP**（届时新建 http 入口 import 同一子图，只换 transport + host/port + 常驻
+生命周期）。HTTP 是既定未来方向，但**不与当前 stdio 形态并行做**——在 DAG/@mention 阶段统一切。
+
+**模块落点（2026-09-08 重构定稿）**：worker 子图归 **app/agent**，mcp_service 只留 server/run 壳：
+- 子图构建 → `app/agent/graph.py::get_sub_agent_graph(read_tools, workspace_path, model=None,
+  review_log=False)`：复用主图 QueueNode/ReviewNode(log)/ToolNode/LLMNode + InMemorySaver compile；
+- worker 人设 → `app/agent/prompt.py::WORKER_SYSTEM_PROMPT`；可用工具子集 →
+  `app/agent/tools.py::worker_tools`（工作区只读检索 ∪ 联网四件套）；
+- `mcp_service/sub_agent.py` 瘦身为 **server / run 壳**：FastMCP(stdio) 入口 + `run_subtask_impl`
+  （建 state / 跑图 / 提结论）+ 审批回传 driver（interrupt → HTTP 收件箱 → resume）；
+- .env 耦合如何不扩散：`app/agent/__init__` 顶层 import graph → model（get_settings）→ **import
+  app.agent.* 强制要 .env**，故 mcp_service/sub_agent 对 app.agent **全懒加载**（run_subtask 内才
+  import get_sub_agent_graph / worker_tools / load_mcp_tool），server 模块 import 阶段仍无需 .env；
+- `mcp_service/http_agent.py` **已删（2026-09-08）**：演示使命完成，HTTP 审批回传已由 worker 内嵌
+  客户端承担（tests/test_sub_agent_approval、tests/test_dispatch_worker_approval 覆盖）；streamable-http
+  模板待到 DAG/@mention 阶段按需重建。
+- 主 agent 仍不 import sub_agent——进程边界靠 spawn，不靠包位置。
 
 ## 与现有模块的关系（改动面提示）
 

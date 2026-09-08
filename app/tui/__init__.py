@@ -12,8 +12,9 @@ worker_id 标记路由**（判定在 approval.py，broker 在 approval_inbox.py�
 - approval.py      判定面：渲染面板 + decide_approval + drain_approvals（pending 即服务）
 - driver.py        run_tui 事件循环 + drive_turn（turn 核心 park/resume）+ get_agent_db_path
 
-边界：agent 图在 app/agent（driver 懒加载，import 本包不触发 .env）；跨进程共享 schema 在
-app/schema/approval_schema.py（worker 侧 http_agent 也 import，故留在原处）。
+边界：agent 图在 app/agent（driver 懒加载，import 本包不触发 .env）；跨进程审批协议 schema 在
+app/schema/approval_schema.py——主侧 broker（app/tui/approval_inbox.py）消费它，worker 侧
+（mcp_service/sub_agent）按同构 payload 直 POST、不 import，故留在共享 app/schema。
 """
 from app.tui.driver import run_tui
 
