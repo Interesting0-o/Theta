@@ -1,4 +1,4 @@
-# CodingAgent 多 Agent 编排设计（草稿）
+# Theta $\theta$ 多 Agent 编排设计（草稿）
 
 > 本文档是**目标态设计**，尚未落地。状态标注：`[已落地]` = 已实现；`[待验]` = 需实验确认；未标注 = 目标态（设计方向，未实现）。
 > 相关：[[docs/CONTEXT_ENGINEERING]]（只流结论 / notes 复用）、[[docs/EXCEPTION_DESIGN]]。

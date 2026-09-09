@@ -1,13 +1,13 @@
-# CodingAgent 异常管理设计
+# Theta $\theta$ 异常管理设计
 
-> 本文档记录 CodingAgent 异常体系的设计讨论与结论，作为后续实现的参考。
+> 本文档记录 $\theta$ 异常体系的设计讨论与结论，作为后续实现的参考。
 > 核心主题：**异常的边界是语义过滤器——它决定什么信息能进入大模型的推理。**
 
 ---
 
 ## 1. 设计目标
 
-1. 让异常成为项目的"业务词汇表"：`WorkspaceViolationError` 这个词只有 CodingAgent 懂，它编码了"文件系统是有边界的工作区"。
+1. 让异常成为项目的"业务词汇表"：`WorkspaceViolationError` 这个词只有 $\theta$ 懂，它编码了"文件系统是有边界的工作区"。
 2. 区分"可预期的业务失败"与"真正的 bug"，**绝不让 bug 伪装成工具调用失败**喂给大模型。
 3. 异常类保持粗粒度（只表达"程序怎么应对"），细粒度信息放数据里（`error_type`、消息正文）。
 4. 分类点收敛到边界（guard / 入口），中间层不散落 `except`。
@@ -86,7 +86,7 @@ class AgentModuleError(AgentError): ...    # 错
 
 ```python
 class AgentError(Exception):
-    """CodingAgent 领域异常基类（全项目共享的语言层）。"""
+    """Theta 领域异常基类（全项目共享的语言层）。"""
 
 class ConfigError(AgentError):
     """配置缺失或非法。启动即停，引导用户修改。"""

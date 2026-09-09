@@ -51,7 +51,7 @@ EXAMPLE_TASKS: List[Task] = [
         prompt="请阅读工作区里的 README.md，用三句话总结它的内容。",
         setup={
             "README.md": (
-                "# 演示项目\n\n这是一个用于评估 CodingAgent 的示例项目。\n\n"
+                "# 演示项目\n\n这是一个用于评估 Theta 的示例项目。\n\n"
                 "核心能力：文件读写、目录管理、内容检索。\n\n"
                 "所有写操作都需要人工审批。\n"
             ),

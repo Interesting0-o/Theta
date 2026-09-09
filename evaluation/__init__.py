@@ -1,4 +1,4 @@
-"""CodingAgent 评估框架（骨架）。
+"""Theta 评估框架（骨架）。
 
 定位：与 tests/ 分工——tests/ 守"机制"（guard / 沙箱 / 路由等确定性单测，
 98 个用例已覆盖），本包守"模型行为"（prompt / 工具 docstring / tool.json 迭代时，

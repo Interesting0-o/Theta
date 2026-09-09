@@ -1,8 +1,8 @@
 <div align="center">
 
-# CodingAgent
+# Theta $\theta$
 
-一个基于 **LangGraph** 的编码助手智能体（Coding Agent）
+一个基于 **LangGraph** 的编码助手智能体（$\theta$）
 
 **写操作和命令执行永远需要你点头之后才动手。**
 
@@ -16,7 +16,7 @@
 
 ## 📌 这个项目解决什么问题
 
-大模型很擅长"想要"调用工具，但当你把**文件写入、目录删除、终端命令**这类能力交给它时，最怕的就是它自作主张。CodingAgent 在"模型想调工具"和"工具真正执行"之间插入了一道**人工审批闸门**：安全的读操作自动放行，有风险的操作必须先展示给你看，你确认后才执行。
+大模型很擅长"想要"调用工具，但当你把**文件写入、目录删除、终端命令**这类能力交给它时，最怕的就是它自作主张。$\theta$ 在"模型想调工具"和"工具真正执行"之间插入了一道**人工审批闸门**：安全的读操作自动放行，有风险的操作必须先展示给你看，你确认后才执行。
 
 简单说——**让你放心地把文件系统和终端交给你自己的 AI 助手。**
 
@@ -142,7 +142,7 @@ START ─► llm_node ──(有 tool_calls)──► queue_node ─► review_n
 ### 目录结构
 
 ```
-CodingAgent/
+theta/
 ├── app/                        # agent 本体（LangGraph 状态机；命名空间包）
 │   ├── main.py                 # 交互式 TUI：捕获 interrupt → 审批面板 → Command(resume)
 │   ├── config.py               # 环境配置（pydantic-settings，读 .env）
@@ -249,4 +249,4 @@ langgraph build        # 构建可部署镜像
 
 ---
 
-*如果你觉得 CodingAgent 对你有帮助，欢迎 ⭐ Star 支持！*
+*如果你觉得 $\theta$ 对你有帮助，欢迎 ⭐ Star 支持！*

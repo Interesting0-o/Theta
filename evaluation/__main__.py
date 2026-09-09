@@ -14,7 +14,7 @@ from .tasks import EXAMPLE_TASKS
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="CodingAgent 评估骨架")
+    parser = argparse.ArgumentParser(description="Theta 评估骨架")
     parser.add_argument("--task", help="只跑指定任务名（默认全跑 EXAMPLE_TASKS）")
     parser.add_argument("--workspace-root", type=Path, help="临时工作区根目录（默认系统 temp）")
     parser.add_argument("--keep-workspace", action="store_true", help="保留工作区供人工复查失败现场")

@@ -6,7 +6,7 @@
 - env 注入 WORKSPACE_PATH（mcp_service.file_io / mcp_service.git 在 import 时校验）
   与 PYTHONPATH=项目根；
 - 四个 server 的 cwd 都设为工作区根目录，使 terminal.run_command 不传 cwd 时默认
-  在工作区里执行（而非 CodingAgent 仓库根），降低误删自身源码的风险；
+  在工作区里执行（而非 Theta 仓库根），降低误删自身源码的风险；
 - web_search 额外注入 TAVILY_API_KEY（mcp_service/web_search 在 import 时校验）。
   密钥为空（.env 里留空）时跳过该 server 并告警——联网检索是可选能力，
   不阻塞主流程；文件/终端/git 能力不受影响。
@@ -53,7 +53,7 @@ def _build_servers(workspace_path: str) -> dict[str, Connection]:
     # 各 server 都以工作区为启动目录（而非项目根）：
     # - file_io / git 本身按 WORKSPACE_PATH 解析路径，cwd 与解析无关，切到工作区保持一致；
     # - terminal 的 run_command 不显式传 cwd 时就在该进程 cwd 里执行，
-    #   切到工作区可避免命令默认落在 CodingAgent 仓库根、误伤自身源码；
+    #   切到工作区可避免命令默认落在 Theta 仓库根、误伤自身源码；
     # - web_search 不碰文件系统，切到工作区仅保持约定一致。
     file_io_connection = StdioConnection(
         transport="stdio",

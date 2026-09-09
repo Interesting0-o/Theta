@@ -1,5 +1,5 @@
 class AgentError(Exception):
-    """CodingAgent 领域异常基类（全项目共享的语言层）。
+    """Theta 领域异常基类（全项目共享的语言层）。
 
     作为 guard 分类的边界：`AgentError` 及其子类 = 可预期的业务失败，
     会转成带 `error_type` 的 `ToolResult` 返回给大模型；其余异常 = 内部 bug。

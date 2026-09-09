@@ -532,7 +532,7 @@ wheels = [
 ]
 
 [[package]]
-name = "codingagent"
+name = "theta"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

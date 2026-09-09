@@ -1,5 +1,5 @@
 [project]
-name = "CodingAgent"
+name = "theta"
 version = "0.1.0"
 description = "基于 LangGraph 的编码助手智能体，核心是带人工审批的工具调用流程"
 readme = "README.md"

@@ -13,7 +13,7 @@ git 仓库——工作区可能是一个"项目集合"目录，仓库散落在�
 - git_fetch    从远程拉取对象到本地远程跟踪引用（不动工作树），免审批只读
 - git_add      把文件加入暂存区（写操作，需审批）
 - git_commit   提交（写操作，需审批；身份沿用设备 git 配置，提交信息末尾自动
-  追加 Co-authored-by: Coding Agent 合作者尾注）
+  追加 Co-authored-by: Theta 合作者尾注）
 - git_switch   切换当前分支（写操作，需审批）
 - git_pull     从远程拉取并合并到当前分支（写操作，需审批）
 
@@ -515,8 +515,8 @@ async def git_switch(repo_path: str, branch: str) -> ToolResult:
     return ToolResult(success=True, content=await asyncio.to_thread(_after))
 
 
-# git 提交的合作者尾注：提交信息末尾自动追加一行，标明本次提交由 CodingAgent 协助完成。
-CO_AUTHOR_TRAILER = "Co-authored-by: Coding Agent <codingagent@local>"
+# git 提交的合作者尾注：提交信息末尾自动追加一行，标明本次提交由 Theta 协助完成。
+CO_AUTHOR_TRAILER = "Co-authored-by: Theta <theta@local>"
 
 
 @mcp.tool()
@@ -525,7 +525,7 @@ async def git_commit(repo_path: str, message: str, all_changes: bool = False) ->
     """
     在指定仓库创建一次 git 提交（写操作，需人工审批）。
     提交身份沿用设备上的 git 配置（仓库级 → 全局 user.name/user.email）；
-    提交信息末尾会自动追加 Co-authored-by: Coding Agent 合作者尾注。
+    提交信息末尾会自动追加 Co-authored-by: Theta 合作者尾注。
     Args:
         repo_path: 仓库根目录路径；传 list_repos 给出的绝对路径或相对工作区根
             的相对路径均可。
