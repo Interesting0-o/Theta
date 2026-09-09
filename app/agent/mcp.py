@@ -1,6 +1,6 @@
 """MCP 工具加载：以 stdio 子进程拉起 file_io / terminal / git / web_search 四个 MCP server。
 
-工作区 WORKSPACE_PATH 由 get_main_agent_graph 解析后传入；这里在拉起子进程前先做前置校验
+工作区由 get_main_agent_graph 解析后以 workspace_path 实参传入；这里在拉起子进程前先做前置校验
 （未提供 / 目录不存在 → ConfigError），避免把坏配置传进子进程再等它 import 时失败。
 子进程约定：
 - env 注入 WORKSPACE_PATH（mcp_service.file_io / mcp_service.git 在 import 时校验）

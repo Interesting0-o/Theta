@@ -13,8 +13,8 @@ app/main.py 的循环是评估的原型——这里唯一的变化是把 `input(
 与 TUI 的差异：
 - 图用 InMemorySaver 编译（不落 resource/agent.db，评估不污染正式会话）；
 - thread_id 按任务名区分，checkpoint 互不串扰；
-- 每任务一个隔离临时工作区（setup 预置文件），经 get_main_agent_graph 的
-  configurable.workspace_path 注入，天然受 file_io 沙箱约束；
+- 每任务一个隔离临时工作区（setup 预置文件），作为 workspace_path 实参传给
+  get_main_agent_graph，天然受 file_io 沙箱约束；
 - 加 max_rounds 上限：拒绝路径若死循环，评估必须能报错收场而不是挂死。
 
 已知代价：每任务建图会各自拉起一次 MCP 子进程组（mcp.py 有按工作区的进程级
@@ -73,10 +73,10 @@ class EvalResult:
 async def build_eval_graph(workspace: Path):
     """按评估工作区编译图（InMemorySaver，不碰正式 agent.db）。
 
-    get_main_agent_graph 已支持 config.configurable.workspace_path：评估不用改核心代码，
-    工作区注入、MCP 子进程拉起、沙箱校验都走现有链路。
+    工作区作为 workspace_path 实参传给 get_main_agent_graph：工作区注入、MCP 子进程
+    拉起（子进程 env 由父进程据此注入）、沙箱校验都走现有链路。
     """
-    graph = await get_main_agent_graph({"configurable": {"workspace_path": str(workspace)}})
+    graph = await get_main_agent_graph(str(workspace))
     return graph.compile(checkpointer=InMemorySaver())
 
 

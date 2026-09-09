@@ -7,7 +7,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.tui.approval import format_tool_approval, truncate
-from app.tui.driver import get_agent_db_path
+from app.tui.driver import get_agent_db_path, resolve_tui_workspace
+
+
+def test_resolve_tui_workspace_is_cwd(tmp_path, monkeypatch):
+    """TUI 工作区 = 启动目录（cwd），作为 workspace_path 参量传给 graph。"""
+    monkeypatch.chdir(tmp_path)
+    assert resolve_tui_workspace() == str(tmp_path)
 
 
 def test_agent_db_path_resolves_under_resource_dir():

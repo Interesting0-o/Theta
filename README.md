@@ -65,6 +65,8 @@ TAVILY_API_KEY=tvly-...              # 网页搜索 Key；留空则联网工具�
 uv run python -m app.main
 ```
 
+> 💡 工作区沙箱默认指向**启动目录**（运行 `python -m app.main` 所在的项目，agent 直接对它动手）；想操作别的项目就 `cd` 过去再启动。`langgraph dev` 与无参调用 `get_main_agent_graph()` 则默认 `<项目根>/tmp`（不指向仓库自身）。
+
 输入任意问题即可开始对话。当模型请求调用 `write_file`、`run_command` 等敏感工具时，会看到类似这样的审批提示——终端命令会强制模型附带一句 `解释`（它在干什么、预期什么），与命令本身同屏展示，让你先看意图再核对命令：
 
 ```

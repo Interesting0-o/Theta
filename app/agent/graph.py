@@ -1,11 +1,9 @@
 import asyncio
-import os
 from pathlib import Path
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.messages import AIMessage
-from langchain_core.runnables import RunnableConfig
 from app.agent.state import AgentState
 from app.agent.nodes import *
 from app.agent.model import get_main_chat_model
@@ -20,19 +18,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_WORKSPACE = PROJECT_ROOT / "tmp"
 
 
-def _resolve_workspace(config: RunnableConfig | None = None) -> str:
-    """解析工作区路径：config.configurable.workspace_path → 环境变量 WORKSPACE_PATH → 默认 tmp。
+def _resolve_workspace(workspace_path: str | None = None) -> str:
+    """解析工作区：显式参量 workspace_path → 默认 <项目根>/tmp。
 
-    LangGraph 平台/CLI 会把工厂函数的唯一参数当 Config 传入（见 langgraph_api
-    _classify_factory），因此工作区不从函数参数取，而按上面优先级解析；都不提供时
-    退回 <项目根>/tmp（__file__ 推导、非阻塞），便于 `uv run langgraph dev` 直接可用
-    （可用 env/config 覆盖）。返回前 resolve() 成绝对路径，与 mcp_service/file_io 里
-    import 时对 WORKSPACE_PATH 的 resolve 保持一致，也作为给 LLM 显示的工作区根目录。
+    工作区是图的一个**构造期参量**（不读 env/config）：TUI 由 run_tui 传入启动目录、
+    evaluation/runner 传入各任务临时工作区；get_main_agent_graph_langgraph（langgraph dev）
+    零参 → 默认 <项目根>/tmp（不指向仓库自身）。返回前 resolve() 成绝对路径，与传给 MCP
+    子进程的 WORKSPACE_PATH 保持一致，也作为给 LLM 显示的工作区根目录。
     """
-    cfg = (config or {}).get("configurable") or {}
-    workspace = cfg.get("workspace_path") or os.environ.get("WORKSPACE_PATH")
-    if workspace:
-        return str(Path(workspace).expanduser().resolve())
+    if workspace_path:
+        return str(Path(workspace_path).expanduser().resolve())
     return str(DEFAULT_WORKSPACE)
 
 
@@ -52,14 +47,15 @@ def should_continue_after_orchestrate(state: AgentState):
     return "tool_node" if state.get("approved_tool_calls") else "llm_node"
 
 
-async def get_main_agent_graph(config: RunnableConfig | None = None):
+async def get_main_agent_graph(workspace_path: str | None = None):
     """
     返回未编译的 StateGraph（compile 由调用方完成，以支持挂 checkpointer 的 interrupt 审批）。
 
-    LangGraph dev/Platform 会以 Config 为参调用本工厂（0 参时给默认 config）；
-    TUI(app.main)则直接无参调用。工作区见 _resolve_workspace。
+    工作区是显式参量（见 _resolve_workspace）：TUI 由 run_tui 传入启动目录、
+    evaluation/runner 传入各任务临时工作区；langgraph dev/Platform 经
+    get_main_agent_graph_langgraph 零参调用 → 默认 <项目根>/tmp。
     """
-    workspace_path = _resolve_workspace(config)
+    workspace_path = _resolve_workspace(workspace_path)
     # 默认 tmp 工作区需存在：os.makedirs 属阻塞调用，放到线程执行（blockbuster 不拦）
     if workspace_path == str(DEFAULT_WORKSPACE):
         await asyncio.to_thread(DEFAULT_WORKSPACE.mkdir, parents=True, exist_ok=True)
@@ -122,6 +118,15 @@ async def get_main_agent_graph(config: RunnableConfig | None = None):
     graph.add_edge("tool_node", "llm_node")
 
     return graph
+
+
+async def get_main_agent_graph_langgraph():
+    """langgraph dev/Platform 注册入口：零参 → 默认工作区 <项目根>/tmp。
+
+    langgraph.json 的 my_agent 指向本函数（而不是 get_main_agent_graph——后者带
+    workspace_path 参量，框架按签名调用不可靠）。零参调用保证框架不把 config 当参量塞进来。
+    """
+    return await get_main_agent_graph()
 
 
 def get_sub_agent_graph(read_tools=None, workspace_path: str | None = None, model=None, review_log: bool = False):

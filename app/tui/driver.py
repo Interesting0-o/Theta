@@ -12,6 +12,8 @@ wait(id)` 挂起（run 停、进程自由），审核方 `complete(id, approved)
 `app.agent.*`（graph/model）在 run_tui 内懒加载——保持 `import app.tui` 无 .env、无副作用。
 
 - `get_agent_db_path`：checkpoint 的 SQLite 路径（resource/agent.db）。
+- `resolve_tui_workspace`：TUI 工作区沙箱 = 进程启动目录（cwd），作为 `workspace_path`
+  参量传给 `get_main_agent_graph`（langgraph dev 经零参入口默认 <项目根>/tmp）。
 - `drive_turn(step, initial, queue)`：agent turn 核心（step 可注入便于测试）；中断即入
   broker park，返回终态。
 - `run_tui`：事件循环——drain 待批（pending 即服务）→ 无批且 turn 在跑则等
@@ -49,6 +51,15 @@ def get_agent_db_path() -> Path:
     db_dir = Path(__file__).resolve().parent.parent.parent / "resource"
     db_dir.mkdir(parents=True, exist_ok=True)
     return db_dir / "agent.db"
+
+
+def resolve_tui_workspace() -> str:
+    """TUI 工作区沙箱 = 进程启动目录（cwd）。
+
+    以 workspace_path 参量传给 get_main_agent_graph——TUI 交互时 agent 操作的就是
+    你启动它的那个项目目录；需要它操作别的目录就 cd 过去再启动。
+    """
+    return str(Path.cwd())
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +195,7 @@ async def run_tui() -> None:
     checkpointer = AsyncSqliteSaver(connection)
     await checkpointer.setup()
 
-    graph = await get_main_agent_graph()
+    graph = await get_main_agent_graph(resolve_tui_workspace())
     compiled = graph.compile(checkpointer=checkpointer)
     config: dict = {"configurable": {"thread_id": THREAD_ID}}
     step = lambda inputs: compiled.ainvoke(inputs, config)  # noqa: E731

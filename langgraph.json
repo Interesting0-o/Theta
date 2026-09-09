@@ -1,6 +1,6 @@
 {
   "graphs": {
-    "my_agent": "./app/agent/graph.py:get_main_agent_graph"
+    "my_agent": "./app/agent/graph.py:get_main_agent_graph_langgraph"
   },
   "dependencies": ["."]
 }
