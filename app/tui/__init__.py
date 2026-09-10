@@ -1,22 +1,21 @@
-"""app/tui —— 事件驱动的 TUI 壳（main 重构的家）。
+"""app/tui —— **终端前端**：只做"取输入 + 渲染事件"，不含调度。
 
-设计（docs/MULTI_AGENT.md §6/§9/§10，2026-09-07）：**agent 图是 TUI 的一个模块而不是
-全部**；main 收敛为**事件驱动壳**——run 可 park（interrupt 阻塞图、不阻塞进程），主 agent
-自身 interrupt 与子 agent 审批对齐为同一种 ApprovalPending，审核收敛为**同一 decide() +
-worker_id 标记路由**（判定在 approval.py，broker 在 approval_inbox.py）。
-`app/main.py` **保留为程序入口**（`python -m app.main`），只调本包导出的 `run_tui`。
+设计的家（docs/ARCHITECTURE.md §2.7/§3/§4 + docs/MULTI_AGENT.md §6 统一审批视图）：
+主程序 = **事件基座**（`app/platform`：run 生命周期 / 审批 broker / runtime），前端只实现
+基座的 `UI` 协议（emit 渲染 / read_line 取输入 / decide 就待审请求问人）。2026-09-10 起
+基座与前端分家——**基座不 print、不读 stdin**；本包只显示与取输入，不碰调度与 park/resume。
 
 模块（各自单一职责，无跨包循环）：
-- input.py         stdin 单 reader 线程 + pump + 一问一答原语
-- approval_inbox.py 统一审批 broker：ApprovalInbox（纯队列）+ ApprovalInboxServer（HTTP 收件箱）
-- approval.py      判定面：渲染面板 + decide_approval + drain_approvals（pending 即服务）
-- driver.py        run_tui 事件循环 + drive_turn（turn 核心 park/resume）；checkpoint 落点经
-                   app/resource.py::session_db_path(workspace, session)（按工作区/会话定位）
+- input.py    stdin 单 reader 线程 + pump + 一问一答原语
+- panels.py   终端渲染素材：审批面板 / 标题框 / 截断（纯函数）
+- ui.py       TerminalUI：实现 `app/platform/ui.py::UI` 协议
+- runner.py   run_tui()：解析启动工作区 → 组 UI + AgentPlatform → 跑基座循环
 
-边界：agent 图在 app/agent（driver 懒加载，import 本包不触发 .env）；跨进程审批协议 schema 在
-app/schema/approval_schema.py——主侧 broker（app/tui/approval_inbox.py）消费它，worker 侧
-（mcp_service/sub_agent）按同构 payload 直 POST、不 import，故留在共享 app/schema。
+`app/main.py` **保留为程序入口**（`python -m app.main`），只调本包导出的 `run_tui`。
+将来的 web 前端 = 另一个 UI 协议实现（在 app/platform 之外另起包），复用同一基座。
+基座侧 `app/platform` 不 import 本包；`app.agent` 只在基座 runtime 内懒加载 → import 本包
+不触发 .env。
 """
-from app.tui.driver import run_tui
+from app.tui.runner import run_tui
 
 __all__ = ["run_tui"]

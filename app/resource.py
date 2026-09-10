@@ -10,7 +10,7 @@ r"""resource 落盘路径单点：所有"按 (工作区, 会话) 定位"的数�
 
 注意：本模块只依赖 stdlib/pathlib——**不 import app.agent**（其 `__init__` re-export graph→model→
 模块顶层 `get_settings()`，import 即要 .env）。放 `app/` 根（命名空间包、无 `__init__`）使
-`app.tui`(driver) 与测试能顶层 import 本模块而不触发 .env。
+`app.platform`（基座）与测试能顶层 import 本模块而不触发 .env。
 """
 from __future__ import annotations
 

@@ -1,13 +1,14 @@
-"""app/tui 的 TUI 辅助函数测试：truncate / format_tool_approval / resolve_tui_workspace。
+"""app/tui 的终端辅助函数测试：truncate / format_tool_approval / resolve_tui_workspace。
 
-辅助随 TUI 重构从 app/main.py 迁入 app/tui：truncate/format_tool_approval 在 approval.py，
-resolve_tui_workspace 在 driver.py。checkpoint 落点路径已单点到 app/resource.py（见
-tests/test_resource.py）。app.tui 模块 import 期不触发 app.agent → 本文件无需 .env。
+truncate / format_tool_approval 在 app/tui/panels.py（终端渲染纯函数），resolve_tui_workspace
+在 app/tui/runner.py（**前端策略**：工作区=启动目录）。checkpoint 落点路径已单点到
+app/resource.py（见 tests/test_resource.py）。app.tui 模块 import 期不触发 app.agent →
+本文件无需 .env。
 """
 from types import SimpleNamespace
 
-from app.tui.approval import format_tool_approval, truncate
-from app.tui.driver import resolve_tui_workspace
+from app.tui.panels import format_tool_approval, truncate
+from app.tui.runner import resolve_tui_workspace
 
 
 def test_resolve_tui_workspace_is_cwd(tmp_path, monkeypatch):

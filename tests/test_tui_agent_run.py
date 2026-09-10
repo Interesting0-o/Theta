@@ -1,4 +1,4 @@
-"""app/tui/driver.py::drive_turn 的 hermetic 单测（统一 broker park/resume）。
+"""app/platform/turn.py::drive_turn 的 hermetic 单测（统一 broker park/resume）。
 
 drive_turn 是 agent turn 核心：step 可注入（默认 compiled.ainvoke 的闭包），故这里用假
 step——先返回若干 __interrupt__（模拟 ReviewNode 中断），由假 decider 对统一 broker
@@ -14,8 +14,8 @@ import asyncio
 
 from langgraph.types import Command
 
-from app.tui.approval_inbox import ApprovalInbox
-from app.tui.driver import _race, drive_turn
+from app.platform.approvals import ApprovalInbox
+from app.platform.turn import _race, drive_turn
 
 FINAL = {"messages": ["done"]}
 

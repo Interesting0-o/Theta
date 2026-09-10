@@ -15,7 +15,7 @@ import asyncio
 from langchain_core.messages import AIMessage, ToolMessage
 
 from app.schema.agent_schema import ToolResult
-from app.tui.approval_inbox import ApprovalInboxServer
+from app.platform.approvals import ApprovalInboxServer
 from mcp_service.sub_agent import run_subtask_impl
 
 FINAL = "结论：联网调研完成"

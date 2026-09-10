@@ -1,4 +1,4 @@
-"""app/tui/approval_inbox.py：待审请求队列（ApprovalInbox）+ 薄 HTTP 收件箱的测试。
+"""app/platform/approvals.py：待审请求队列（ApprovalInbox）+ 薄 HTTP 收件箱的测试。
 
 本模块不 import app.agent → 无需 .env、无需 WORKSPACE_PATH。
 HTTP 用 ApprovalInboxServer(start(port=0)) 在测试自己的事件循环里拉起，测试后 stop。
@@ -8,7 +8,7 @@ import asyncio
 import httpx
 import pytest
 
-from app.tui.approval_inbox import ApprovalInbox, ApprovalInboxServer
+from app.platform.approvals import ApprovalInbox, ApprovalInboxServer
 
 PAYLOAD = {
     "worker_id": "worker-1",

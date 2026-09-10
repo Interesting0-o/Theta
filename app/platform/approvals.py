@@ -1,6 +1,7 @@
 """待审请求的队列 + 送达（统一审批 broker）；**本模块不做审批判定**。
 
-位置：`app/tui/approval_inbox.py`（从 app/approval_inbox.py 迁入；与 TUI 壳同住）。
+位置：`app/platform/approvals.py`（从 app/tui/approval_inbox.py 平移；2026-09-10 基座/前端
+分家后归基座——审批队列与送达是 run 生命周期的事，与终端显示无关）。
 
 职责边界（对齐 docs/MULTI_AGENT.md §6）：判定"要不要放行某动作"单点在**图的审核节点**
 （ReviewNode + interrupt）——人答 y/n 只发生在图的审核节点，经 interrupt→Command(resume)
@@ -14,6 +15,9 @@ HTTP 审批请求**同入这一个队列**——差异只在 payload 的 `worker
   `Command(resume={approved})` 续跑；
 - 远端 worker：HTTP POST /requests 入队 → 审核方 complete → worker 长轮询
   GET /requests/{id}?block=1 取回决定。
+
+"谁来问人"由前端定：`drain_approvals` 把每条待审交 `UI.decide`（终端 = 面板 + y/n），
+本模块只负责排队、回填与唤醒。
 
 - `ApprovalInbox`：纯异步、无网络/UI 的请求队列。enqueue 登记待审 → 等待者 wait 阻塞到
   审核方 complete(id, approved) 回填决定才返回。complete 只做记录 + 唤醒，不产生决定。
@@ -40,7 +44,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from app.platform.ui import UI
 from app.schema.approval_schema import ApprovalRecord, ApprovalRequest, ApprovalStatus
+
+# 本地主 agent 中断入 broker 时用的 worker_id 标记（远端 worker 用真实 id）
+LOCAL_WORKER_ID = "main"
 
 
 @dataclass
@@ -57,8 +65,8 @@ class _Pending:
 class ApprovalInbox:
     """本地待审请求队列：登记 / 查询 / 回填 / 等待回填，全异步无网络。
 
-    本类不产生审批决定——approved 由审核方（图的审核节点，或现阶段 driver.py 的人审
-    入口）给出后经 complete 回填，这里只负责排队 + 唤醒等待者。
+    本类不产生审批决定——approved 由审核方（图的审核节点，或人审入口）给出后经 complete
+    回填，这里只负责排队 + 唤醒等待者。
     """
 
     def __init__(self) -> None:
@@ -250,3 +258,45 @@ class ApprovalInboxServer:
             except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
+
+
+# ------------------------- 判定面的基座部分（渲染归前端） -------------------------
+
+
+def _record_to_value(record: ApprovalRecord) -> dict:
+    """把 broker 里一条待审记录归一成 interrupt 同构的 value，交前端渲染。
+
+    value 与 ReviewNode interrupt payload 对齐：{tool_name, current_step, tool_args,
+    description?, tool_call_id?}。
+    - 步骤：本地主 agent 中断带 driver 塞的 ReviewNode current_step（如 "1/1"，保持旧面板
+      样式）；远端 worker 无该字段时回退为来源标记（主 agent / worker:<id>）。
+    - tool_call_id：仅本地中断携带（纯展示）。
+    description 在 payload 层（ApprovalRequest 语义），前端主要展示 tool_args.description。
+    """
+    payload = record.get("payload") or {}
+    worker_id = payload.get("worker_id", "")
+    step = payload.get("current_step") or (
+        "主 agent" if worker_id == LOCAL_WORKER_ID else f"worker:{worker_id}"
+    )
+    value: dict = {
+        "tool_name": payload.get("tool_name", "?"),
+        "tool_args": payload.get("tool_args") or {},
+        "description": payload.get("description"),
+    }
+    if step:
+        value["current_step"] = step
+    if payload.get("tool_call_id"):
+        value["tool_call_id"] = payload["tool_call_id"]
+    return value
+
+
+async def drain_approvals(inbox: ApprovalInbox, ui: UI) -> None:
+    """排空 broker 里全部 pending（本地主 agent interrupt + worker HTTP 请求）。
+
+    逐条交前端问人（`ui.decide`）→ `inbox.complete` 回填（唤醒 park 的本地 run / 长轮询的
+    worker）。判定权威在人；一条面板只服务一个请求，判定互不阻塞进程。
+    """
+    for entry in inbox.pending():
+        approved = await ui.decide(_record_to_value(entry))
+        inbox.complete(entry["approval_id"], approved)
+    inbox.clear_new()

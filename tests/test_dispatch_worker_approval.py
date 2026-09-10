@@ -17,7 +17,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 from app.agent.nodes import OrchestrateNode
 from app.schema.agent_schema import ToolResult
-from app.tui.approval_inbox import ApprovalInboxServer
+from app.platform.approvals import ApprovalInboxServer
 
 import app.agent.tools as tools_mod
 from mcp_service.sub_agent import run_subtask_impl
