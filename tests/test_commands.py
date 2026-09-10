@@ -91,6 +91,22 @@ def test_fast_readme_prompt_carries_open_source_structure():
     assert "只写 README.md 这一个文件" in prompt
 
 
+def test_fast_readme_prompt_bounds_exploration_and_execution():
+    """止血补丁：探索有预算、不靠"跑一遍"验证、不翻 .git、允许先写粗版。
+
+    起因（2026-09-10 实测）：在真实仓库里跑 `/fast readme` 读了几十次文件、跑了 240s 的模型
+    推理去"验证示例"、还翻了 `.git/config`，token 远超预期——这几条纪律就是防它再来一次。
+    """
+    prompt = parse_command("/fast readme").prompt
+
+    assert "5–8 次读取" in prompt  # 探索预算
+    assert "不要为了验证而执行命令" in prompt and "不要跑训练" in prompt  # 验证 = 读，不是跑
+    assert ".git/" in prompt and "git remote -v" in prompt  # 别翻仓库内部
+    assert "先写粗版" in prompt  # 信息够就落一版，别无限收集
+    # 与"命令必须当前有效"配套：来源仍是真实配置，而不是执行结果
+    assert "从仓库的真实配置/脚本里摘" in prompt
+
+
 def test_both_prompts_share_the_landing_discipline():
     """两条提示词的"落盘纪律"共用一处（`_landing_and_report`）——别各改各的慢慢走散。"""
     init_prompt = parse_command("/init").prompt
