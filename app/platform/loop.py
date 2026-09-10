@@ -8,16 +8,31 @@
 - 空闲 → `emit(ReadyForInput())`，等一行输入起下一条 turn（新 worker 审批可插队服务）。
 
 本模块**不 print、不读 stdin**，也不 import app.tui（docs/ARCHITECTURE.md §2.7/§4）。
-将来用户命令（`/init`、`/session`）在"起 turn 之前"介入这一循环，即基座的控制面事件。
+用户命令（`/init`，见 commands.py）在"起 turn 之前"介入这一循环——即基座的控制面事件：
+提示词型把预设 prompt 当本轮输入（继续起 turn），基座动作型直接执行完就回顶部（不起 turn，
+结果经 `Notice` 回话），未识别的 `/` 输入提示而不喂给模型。
 """
 import asyncio
 
 from app.platform.approvals import ApprovalInbox, ApprovalInboxServer, drain_approvals
+from app.platform.commands import (
+    UNKNOWN_COMMAND_HINT,
+    ActionCommand,
+    PromptCommand,
+    is_command,
+    parse_command,
+)
 from app.platform.runtime import build_session_runtime
 from app.platform.turn import _race, build_turn_state, drive_turn
 from app.platform.ui import UI
 from app.resource import remove_legacy_single_db
-from app.schema.ui_schema import ReadyForInput, SessionStarted, TurnFailed, TurnFinished
+from app.schema.ui_schema import (
+    Notice,
+    ReadyForInput,
+    SessionStarted,
+    TurnFailed,
+    TurnFinished,
+)
 
 # 退出词（终端习惯；命令层落地后与 /quit 之类一并归一）
 EXIT_WORDS = ("quit", "q", "exit")
@@ -71,6 +86,19 @@ class AgentPlatform:
                     continue
                 if line is None or line in EXIT_WORDS:
                     break  # EOF / 退出
+
+                # 控制面命令（图之外，见 commands.py）：提示词型把预设 prompt 当本轮输入、
+                # 继续走下面的起 turn；基座动作型由基座直接执行完 continue；
+                # 未识别的 `/` 输入不喂给模型，直接提示、不起 turn。
+                command = parse_command(line)
+                if isinstance(command, PromptCommand):
+                    line = command.prompt
+                elif isinstance(command, ActionCommand):
+                    await command.handler(self)
+                    continue
+                elif is_command(line):
+                    self.ui.emit(Notice(text=UNKNOWN_COMMAND_HINT))
+                    continue
 
                 # 首次交互才建库/checkpoint/图（之后各轮复用同一 runtime）
                 if self._step is None:

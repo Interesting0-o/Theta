@@ -16,9 +16,11 @@ import pytest
 from langchain_core.messages import AIMessage
 from langgraph.types import Command
 
+import app.platform.commands as commands_mod
 import app.resource as resource
+from app.platform.commands import PROMPT_COMMANDS
 from app.platform.loop import AgentPlatform
-from app.schema.ui_schema import ReadyForInput, SessionStarted, TurnFailed, TurnFinished
+from app.schema.ui_schema import Notice, ReadyForInput, SessionStarted, TurnFailed, TurnFinished
 
 REPLY = "答复正文"
 
@@ -59,12 +61,15 @@ class FakeStep:
         self.interrupt_values = list(interrupt_values)
         self.raise_exc = raise_exc
         self.resumes: list = []
+        self.inputs: list[dict] = []  # 本轮初始 state（含 HumanMessage）
         self.calls = 0
 
     async def __call__(self, inputs):
         self.calls += 1
         if isinstance(inputs, Command):
             self.resumes.append(inputs.resume)
+        else:
+            self.inputs.append(inputs)
         if self.interrupt_values:
             value = self.interrupt_values.pop(0)
             return {"__interrupt__": [type("_It", (), {"value": value})()]}
@@ -128,6 +133,74 @@ def test_loop_parks_and_resumes_on_approval(tmp_path, monkeypatch, approved):
     assert step.resumes == [{"approved": approved}]  # 决定透传给图
     assert step.calls == 2  # 中断 + 终态
     assert [type(e) for e in ui.events].count(TurnFinished) == 1
+
+
+def test_init_command_starts_turn_with_preset_prompt(tmp_path, monkeypatch):
+    """`/init` = 基座把预设提示词当本轮输入投出去：起的 turn 首条消息正是那段 prompt。
+
+    （假 step 断言，不花钱——真实跑一次会调模型 + 触发写文件审批。）
+    """
+    ui = FakeUI(["/init", None])
+    step = FakeStep()
+
+    asyncio.run(_platform(tmp_path, monkeypatch, ui, step).run())
+
+    expected = PROMPT_COMMANDS["/init"]["prompt"]
+    assert [m.content for m in step.inputs[0]["messages"]] == [expected]
+    assert [type(e) for e in ui.events].count(TurnFinished) == 1
+    assert ui.decisions == []  # 命令本身不触发审批
+
+
+def test_action_command_slot_runs_handler_without_turn(tmp_path, monkeypatch):
+    """基座动作型命令（`/session`、`/content` 之类的位置）：handler 被调用、不起 turn。
+
+    本轮没有真实动作命令，故注册一个假的来钉住这条通路——否则将来加 `/session` 才发现槽没接。
+    """
+    seen: list = []
+
+    async def fake_handler(platform):
+        seen.append(platform)
+        platform.ui.emit(Notice(text="动作命令已执行"))
+
+    monkeypatch.setitem(
+        commands_mod.ACTION_COMMANDS, "/fake", {"usage": "/fake 测试", "handler": fake_handler}
+    )
+    ui = FakeUI(["/fake", None])
+    step = FakeStep()
+
+    asyncio.run(_platform(tmp_path, monkeypatch, ui, step).run())
+
+    assert len(seen) == 1  # handler 拿到的是基座本身
+    assert step.inputs == []  # 没起 turn、也没喂模型
+    assert any(isinstance(e, Notice) and "已执行" in e.text for e in ui.events)
+
+
+def test_help_command_shows_all_commands_without_turn(tmp_path, monkeypatch):
+    """`/help`：回一条列全命令的 Notice，不起 turn、不喂模型。"""
+    ui = FakeUI(["/help", None])
+    step = FakeStep()
+
+    asyncio.run(_platform(tmp_path, monkeypatch, ui, step).run())
+
+    notices = [e for e in ui.events if isinstance(e, Notice)]
+    assert len(notices) == 1
+    assert "/help" in notices[0].text and "/init" in notices[0].text
+    assert "显示所有可用命令与说明" in notices[0].text  # 描述也在
+    assert step.inputs == []  # 没起 turn
+    assert [type(e) for e in ui.events].count(ReadyForInput) == 2  # 提示完回到可输入
+
+
+def test_unknown_command_only_notifies(tmp_path, monkeypatch):
+    """未识别的 `/xxx` 不喂给模型：只 emit Notice，随后那条普通消息照常起 turn。"""
+    ui = FakeUI(["/nope", "正常消息", None])
+    step = FakeStep()
+
+    asyncio.run(_platform(tmp_path, monkeypatch, ui, step).run())
+
+    notices = [e for e in ui.events if isinstance(e, Notice)]
+    assert len(notices) == 1 and "/init" in notices[0].text  # 提示里列出可用命令
+    assert [m.content for m in step.inputs[0]["messages"]] == ["正常消息"]  # 只起了这一轮
+    assert len(step.inputs) == 1
 
 
 def test_loop_reports_turn_failure_without_swallowing(tmp_path, monkeypatch):

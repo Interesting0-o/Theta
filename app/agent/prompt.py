@@ -12,7 +12,8 @@ file_io/terminal/git/web_search MCP（见 app/agent/graph.py::get_main_agent_gra
 接入方式：LLMNode 每次生成前，把以下 SystemMessage 依次拼在对话历史前：
 `SYSTEM_PROMPT`（本文件静态常量）+ 会话相关的工作区上下文
 `workspace_context_block(workspace_path)` + （若有计划时）# 当前任务 计划回显 +
-（若该工作区有长期记忆时）# 长期记忆 正文（worker 不注入，见 inject_memory 开关）。
+（若有项目画像时）# 项目画像（工作区根 AGENT.md，会话首启读入）+
+（若有长期记忆时）# 长期记忆 正文。worker 两样都不注入（见 inject_session_context 开关）。
 见 app/agent/nodes.py::LLMNode.__call__。
 """
 

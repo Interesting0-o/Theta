@@ -155,7 +155,7 @@ def get_sub_agent_graph(read_tools=None, workspace_path: str | None = None, mode
             model=chat,
             workspace_path=workspace_path,
             system_prompt=WORKER_SYSTEM_PROMPT,
-            inject_memory=False,  # worker 不注入长期记忆（只读资料收集，§4 隔离）
+            inject_session_context=False,  # worker 不注入项目画像/长期记忆（只读资料收集，§4）
         ),
     )
     graph.add_node("queue_node", QueueNode())

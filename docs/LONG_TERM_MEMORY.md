@@ -126,6 +126,8 @@ resource/
 
 实现注记：AGENT.md 在会话建立时被程序检测/读入，作为该会话的常驻项目画像与 SYSTEM_PROMPT/workspace 同源拼装；memory.md 每轮实时读盘。AGENT.md 的生成不归 `write_memory`（那是 resource 私有记忆），归 `/init` 命令（写进工作区、随仓库走）。
 
+**读取侧已落地（2026-09-10）**：`app/agent/profile.py::agent_md_block()` 读工作区根的 AGENT.md（加一行 `# 项目画像` 块标题；缺文件/空白 → 空串；超 cap 8000 截断），`LLMNode` 在 `inject_session_context` 打开时注入——顺序 `SYSTEM_PROMPT → 工作区上下文 → 计划 → 项目画像 → 长期记忆`，画像**实例内 memo**（会话首启读入，不每轮重读；改画像重开会话即生效），worker 与记忆一起关掉。独立成模块而非并入 `memory.py`：两通道不混一个文件（本表的分工）。
+
 ---
 
 ## 5. 记忆工具（写入 / 读取）`[已落地 2026-09-10]`
@@ -171,10 +173,15 @@ resource/
 4. **旧数据**：`resource/agent.db` 是 dev 运行产物（gitignore）。Phase A 切换路径后它不再被读；是否清理（删旧单库）由你决定，文档记录即可，代码不自动删。
 5. **测试**：`tests/test_main_tui.py::test_agent_db_path_resolves_under_resource_dir` 断言要随新布局更新（`resource/<ws_key>/sessions/<sid>/agent.db`）；新增 resource 解析 / reviewed.json 读写 / md 读写 / cap / 工具注入 / 会话命令的单测。
 
-**TUI 命令层（/init · /session，2026-09-08 引入）**：新开程序 = 新会话，续旧会话与沉淀项目约定走命令：
-- `/session`：列出 `resource/<ws>/sessions/` 下历史会话（id + 最近时间/一句话摘要），选号切换——先落定当前会话 checkpoint，再以目标 id 重开 AsyncSqliteSaver + thread_id，续其消息栈；
-- `/init`：在工作区**根目录**生成（或刷新）`AGENT.md`——按"项目整体画像"模板起一份（项目是干什么的、目录/技术栈/怎么跑测试），供后续会话第一次启动注入；生成源 = 模板 + 当前对工作区的观察 + 用户确认。注意 AGENT.md 是项目画像、随仓库走，不是把 resource 私有 memory 原样搬进去（memory 属于约束/偏好层）。
+**TUI 命令层（/init · /session，2026-09-08 引入；2026-09-10 起落 `app/platform/commands.py`）**：新开程序 = 新会话，续旧会话与沉淀项目约定走命令。命令是**基座的控制面事件（图之外）**——基座解析并处理，前端只渲染其输出（未识别命令走 `Notice` 事件，不喂给模型）；`q/quit/exit` 的退出词仍在 `loop.py`，未纳入命令表。
+- `/init` `[已落地 2026-09-10]`：**投一段预设提示词**（`INIT_PROMPT`，随命令一起放在 commands.py——它是这条命令的载荷，不是每轮行为契约），随后走一条**正常 turn**：模型用已有只读工具通读工作区 → 在工作区**根目录**生成或刷新 `AGENT.md`（已存在则先读再 `edit_file` 刷新）。不加工具、不加节点、不加线程；写文件照常**撞审批**，用户过目内容再落盘。AGENT.md 是项目画像、随仓库走，不是把 resource 私有 memory 搬进去（memory 属约束/偏好层）。
+- `/session`：列出 `resource/<ws>/sessions/` 下历史会话（id + 最近时间/一句话摘要），选号切换——先落定当前会话 checkpoint，再以目标 id 重开 AsyncSqliteSaver + thread_id，续其消息栈。**未做**（要动 runtime 生命周期：关旧连接、换 session_id、重置 step）。
 - 输入层识别 `/` 前缀命令（现有 `q/quit/exit` 已同类处理）。
+
+**命令分两类（2026-09-10 定型）**：命令不只是"投提示词"，基座侧还有要动/读运行时状态的：
+- **提示词型**（`PROMPT_COMMANDS`）：把预设提示词当本轮用户输入投出去，走正常 turn —— `/init` 即此类（`/compact`「要求模型压缩上下文」将来也走这一路）。
+- **基座动作型**（`ACTION_COMMANDS`）：基座自己执行、不起 turn，结果经 `Notice` 事件回话 —— **`/help` 已落地**（列出全部命令与说明）；规划中（位置已留）：`/session`（换 checkpoint/thread_id）、`/content`（显示当前上下文占用量）、`/compact`。
+- 两表都只存**名字 + desc + 载荷/handler**，帮助文案由 `help_text()` 从表生成（对齐靠格式串，不手打空格）——加一条命令即出现在 `/help` 与"未识别命令"提示里，不必改 `loop.py`（`parse_command` 认表、`loop` 按类型分派，已有测试分别钉住这两条通路）。
 
 ---
 
@@ -182,7 +189,7 @@ resource/
 
 - **Phase A · resource + 会话目录重构**：路径解析收敛 + workspace_key + `sessions/<sid>/agent.db` 落位 + run_tui 用新 session_id + **`/session` 列表/切换骨架** + 旧库不读 + 测试更新。此阶段无记忆，纯地基。
 - **Phase B · 最简单长期记忆闭环 + 项目画像**：memory.md 格式 + 写入/读取工具 + tool.json/source + LLMNode SystemMessage 注入 + SYSTEM_PROMPT 纪律 + **AGENT.md 检测/会话首启注入 + `/init` 生成骨架** + 单测 + 手工冒烟（两段会话：第二段能看到第一段写的 memory；重开会话能看到 AGENT.md 画像）。`reviewed.json` 的加入交互/接线不在 A/B。
-  - **进度（2026-09-10）**：memory.md 格式 + `write_memory`/`read_memory` 工具 + tool.json/source + **LLMNode 每轮注入（§4）** + 单测 `[已落地]`（§3/§4/§5）——记忆闭环已通（写入 → 落盘 → 下轮注入），worker 侧不注入、工具也被 `worker_tools` 挡住。**尚未做**：SYSTEM_PROMPT 的"长期记忆"纪律小节（§6）、AGENT.md 检测/首启注入与 `/init`。
+  - **进度（2026-09-10）**：memory.md 格式 + `write_memory`/`read_memory` 工具 + tool.json/source + **LLMNode 每轮注入（§4）** + 单测 `[已落地]`（§3/§4/§5）——记忆闭环已通（写入 → 落盘 → 下轮注入），worker 侧不注入、工具也被 `worker_tools` 挡住。**同日续做**：AGENT.md 读取侧（`app/agent/profile.py` + LLMNode 注入）与 `/init` 命令（`app/platform/commands.py`，投预设提示词）`[已落地]`（§4/§7）——画像闭环亦通（`/init` 生成 → 下个会话注入）。**尚未做**：SYSTEM_PROMPT 的"长期记忆/项目画像"纪律小节（§6）、`/session`。
 - **Phase C · 明确不做（后续再议）**：记忆压缩/分层摘要、记忆全文检索、跨工作区共享记忆、多会话选择 UI、reviewed.json 交互接线、把记忆 promote 进 repo（与 CONTEXT_ENGINEERING 的 promote 复用/分合另议）。
 
 ---

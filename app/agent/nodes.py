@@ -12,6 +12,7 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 from app.agent.memory import memory_block
+from app.agent.profile import agent_md_block
 from app.agent.state import AgentState
 from app.agent.utils import coerce_tool_result, format_tool_result
 from app.agent.prompt import SYSTEM_PROMPT, workspace_context_block
@@ -45,14 +46,16 @@ class LLMNode:
         model: Runnable,
         workspace_path: str | None = None,
         system_prompt: str = SYSTEM_PROMPT,
-        inject_memory: bool = True,
+        inject_session_context: bool = True,
     ) -> None:
         self.model: Runnable = model
         self.workspace_path: str | None = workspace_path
         self.system_prompt: str = system_prompt
-        # worker（子 agent）传 False：它是临时资料收集器，不读写记忆、保持只读隔离
-        # （docs/LONG_TERM_MEMORY.md §4）。
-        self.inject_memory: bool = inject_memory
+        # 会话级上下文 = 项目画像（AGENT.md）+ 长期记忆：都是"主 agent 认得这个项目/用户"所需；
+        # worker（子 agent）传 False——它是临时资料收集器，两样都不注入（§4 隔离）。
+        self.inject_session_context: bool = inject_session_context
+        # 项目画像实例内 memo：会话第一次启动时读入，之后复用（§4；画像慢变）
+        self._profile_block: str | None = None
 
     @staticmethod
     def format_plan_status(step: PlanStep) -> str:
@@ -82,13 +85,13 @@ class LLMNode:
 
         每次生成都在头部拼接系统提示词，顺序：行为契约 SYSTEM_PROMPT（见 prompt.py）+
         本次会话的具体工作区上下文 workspace_context_block（若有，含工作区根目录与
-        终端 cwd 差异提醒）+ 当前计划的状态回显（若有）+ **长期记忆**（若有条目，
-        `# 长期记忆（工作区 …）` 正文，见 docs/LONG_TERM_MEMORY.md §4）。只构造成临时列表
-        传给模型，不改动 state["messages"]（LangGraph state 应不可变更新；系统消息也不应
-        渗入历史被持久化）。
+        终端 cwd 差异提醒）+ 当前计划的状态回显（若有）+ **项目画像**（工作区根的 AGENT.md，
+        会话首启读入、实例内 memo）+ **长期记忆**（若有条目，`# 长期记忆（工作区 …）` 正文）。
+        后两环见 docs/LONG_TERM_MEMORY.md §4。只构造成临时列表传给模型，不改动
+        state["messages"]（LangGraph state 应不可变更新；系统消息也不应渗入历史被持久化）。
 
-        记忆**每轮实时读盘**（记忆文件即真值，不做缓存）；读盘是阻塞调用，走 to_thread 以
-        避开 langgraph dev 的 blockbuster。
+        记忆**每轮实时读盘**（记忆文件即真值）；画像**只读一次**（画像慢变）。两处读盘都是
+        阻塞调用，走 to_thread 以避开 langgraph dev 的 blockbuster。
         """
         system_messages = [SystemMessage(content=self.system_prompt)]
         if self.workspace_path:
@@ -103,7 +106,10 @@ class LLMNode:
                     + "\n".join(self.format_plan_status(plan) for plan in plans)
                 )
             )
-        if self.inject_memory and self.workspace_path:
+        if self.inject_session_context and self.workspace_path:
+            profile = await self._read_profile()
+            if profile:
+                system_messages.append(SystemMessage(content=profile))
             block = await asyncio.to_thread(memory_block, self.workspace_path)
             if block:
                 system_messages.append(SystemMessage(content=block))
@@ -111,6 +117,15 @@ class LLMNode:
         messages = [*system_messages, *state["messages"]]
         res = await self.model.ainvoke(messages)
         return {"messages": [res]}
+
+    async def _read_profile(self) -> str:
+        """项目画像只读一次（会话首启读入，§4）：实例内 memo——画像默认慢变。
+
+        后续若用户改了 AGENT.md，重开会话即生效（新会话 = 新建图/新 LLMNode 实例）。
+        """
+        if self._profile_block is None:
+            self._profile_block = await asyncio.to_thread(agent_md_block, self.workspace_path)
+        return self._profile_block
 
 #-------------------工具调用节点-----------------------
 class ToolNode:

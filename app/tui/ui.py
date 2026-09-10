@@ -11,7 +11,13 @@ from __future__ import annotations
 import asyncio
 import queue
 
-from app.schema.ui_schema import ReadyForInput, SessionStarted, TurnFailed, TurnFinished
+from app.schema.ui_schema import (
+    Notice,
+    ReadyForInput,
+    SessionStarted,
+    TurnFailed,
+    TurnFinished,
+)
 from app.tui.input import _ask_yes_no, _pump_stdin, _start_stdin_reader
 from app.tui.panels import AGENT_TITLE, COMMAND_TITLE, USER_TITLE, format_tool_approval
 
@@ -54,6 +60,8 @@ class TerminalUI:
             print(event.text)
         elif isinstance(event, TurnFailed):
             print(f"\n[agent 运行出错] {event.message}")
+        elif isinstance(event, Notice):
+            print(f"\n[提示] {event.text}")
 
     async def read_line(self) -> str | None:
         """取一行用户输入；None = EOF。可被基座 cancel 而不丢输入（队列内容仍在）。"""
