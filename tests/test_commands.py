@@ -72,6 +72,36 @@ def test_fast_readme_prompt_keeps_write_discipline():
     assert "不要编造" in prompt  # 不许编造不存在的功能
 
 
+def test_fast_readme_prompt_carries_open_source_structure():
+    """按开源 README 的通行结构写：标识/简介/特性/快速开始/更多文档/贡献/许可 + 写作原则。
+
+    这些关键词钉住的是"载荷别被改瘦"——结构与优先级是这条命令的主要价值。
+    """
+    prompt = parse_command("/fast readme zh").prompt
+
+    for section in ("项目标识", "简介", "功能特性", "快速开始", "贡献指南", "许可证"):
+        assert section in prompt
+    # 徽章只放能核实的（编造下载量/star 是常见退化）
+    assert "徽章" in prompt and "不要编造" in prompt
+    # 写作原则：先讲价值、信息分层、命令必须当前有效
+    assert "先写给人看" in prompt and "信息分层" in prompt and "过时的安装命令" in prompt
+    # 文档不塞进 README、示例要能跑
+    assert "不要把文档都塞进 README" in prompt and "复制粘贴就能跑" in prompt
+    # 默名单文件（多写一个文件就多一次审批）
+    assert "只写 README.md 这一个文件" in prompt
+
+
+def test_both_prompts_share_the_landing_discipline():
+    """两条提示词的"落盘纪律"共用一处（`_landing_and_report`）——别各改各的慢慢走散。"""
+    init_prompt = parse_command("/init").prompt
+    readme_prompt = parse_command("/fast readme en").prompt
+
+    shared = "改动面覆盖大半才用"
+    assert shared in init_prompt and shared in readme_prompt
+    assert '写入工作区根目录的 "AGENT.md"' in init_prompt
+    assert '写入工作区根目录的 "README.md"' in readme_prompt
+
+
 def test_readme_language_mapping_directly():
     from app.platform.commands.prompts import readme_language
 

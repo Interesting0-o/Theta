@@ -80,7 +80,7 @@ PROMPT_COMMANDS: dict[str, dict] = {
         "prompt": INIT_PROMPT,
     },
     "/fast readme": {
-        "desc": "快速为项目写一份 README.md；可给语言（zh/cn/de/jp…），默认英语",
+        "desc": "快速生成一个开源项目的 README；可给语言（zh/cn/de/jp…），默认英语",
         "prompt": fast_readme_prompt,
     },
 }
