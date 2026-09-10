@@ -85,6 +85,22 @@ uv run python -m app.main
 
 > 敏感工具按 `app/agent/tool.json` 逐个 `interrupt()` 挂起——一个回合里模型同时调用多个敏感工具会**连续多次**向你确认；读操作与计划编排自动放行、不打扰你。
 
+#### 斜杠命令
+
+以 `/` 开头的输入是命令，**不会当成提问发给模型**（未识别的 `/xxx` 也只给一行提示）：
+
+| 命令 | 作用 |
+| --- | --- |
+| `/help` | 列出全部可用命令与说明 |
+| `/init` | 让 agent 通读工作区，在工作区根**生成或更新** `AGENT.md`（项目画像）——写文件照常走审批，你先过目内容 |
+| `/list session` | 列出本工作区的所有会话（短 id · 最后活动时间 · 消息条数 · 末条回复摘要） |
+| `/new session` | 新建一个会话并切过去 |
+| `/session <短 id>` | 切换到指定会话，接着它原来的消息栈继续聊 |
+
+`/init` 属"提示词型"命令：它把一段预设提示词**当作你的输入**投给模型，由模型自己用现有只读工具读代码、再写画像——不加新工具、也不另起一条 run。
+
+> **数据落在哪**：`resource/<工作区键>/`——每个会话一个 checkpoint 库（`sessions/<id>/agent.db`），长期记忆在 `memory/memory.md`（见[跨会话记忆](#跨会话记忆让模型记住你这个项目和你的偏好)）。换个工作区（`cd` 过去再启动）就是另一套会话与记忆。
+
 ### 最小可运行示例（代码方式）
 
 ```python
@@ -93,8 +109,10 @@ from langchain_core.messages import HumanMessage
 from app.agent.graph import get_main_agent_graph
 
 async def main():
+    # 工作区是构造期参量：不传则默认 <项目根>/tmp（TUI 传的是启动目录）
     graph = await get_main_agent_graph()
-    app = graph.compile()  # 传入 SqliteSaver 可持久化会话
+    app = graph.compile()  # 传 checkpointer 才持久化会话；TUI/基座用的是
+                           # AsyncSqliteSaver + resource/<ws>/sessions/<sid>/agent.db
 
     result = await app.ainvoke({
         "session_id": "demo",
@@ -111,37 +129,68 @@ asyncio.run(main())
 
 ## 🧩 进阶内容
 
-### 架构：一次请求怎么走完
+### 架构：主程序是事件基座，图只是它的一个模块
+
+`app/platform`（基座）管"一条 run 之外的事"：起/续/取消 run、把 `interrupt` 当事件端口、统一审批队列、按 (工作区, 会话) 装配 db 与图；`app/tui`（终端前端）只做两件事——**取输入、渲染事件**，它实现的正是基座要求的 `UI` 协议（`emit` 渲染 / `read_line` 取输入 / `decide` 就待审请求问人），**不碰调度**。将来的 web UI 就是同一协议的另一个实现，复用整个基座（详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)）。
+
+这带来一个可感知的行为差异：**审批会 park 图而不是占死进程**——主 agent 等你按 `y/n` 时，子 agent（worker）的审批照样能被服务。
+
+### 一次请求怎么走完
 
 ```
-START ─► llm_node ──(有 tool_calls)──► queue_node ─► review_node ──► tool_node ──► llm_node ...
-              ▲  (无 tool_calls → END)                   │  ▲
-              │                       (编排调用) ─► orchestrate_node ─┘
-              └────────────────────────────────────────────────────────────────┘
+START ─► llm_node ──(有 tool_calls)──► queue_node ─► review_node ──(逐条审批)──┬─► orchestrate_node ─┐
+            ▲                                                                 └─► tool_node ────────┤
+            └─────────────────────────────────────────────────────────────────────────────────────┘
+
+  收尾：llm_node ──(无 tool_calls)──► 历史超预算 ? compact_node ─► END : END
 ```
 
 | 节点 | 职责 |
 | --- | --- |
-| `llm_node` | 聊天模型判断本轮要不要调工具（可调 = 编排工具 + 四个 MCP server 的全部工具） |
+| `llm_node` | 聊天模型判断本轮要不要调工具（可调 = 编排/笔记/派发/记忆工具 + 四个 MCP server 的全部工具）；拼系统消息时注入 行为契约 + 工作区上下文 + 当前计划 + 项目画像 + 长期记忆 |
 | `queue_node` | 把模型输出的 `tool_calls` 移入待审队列，清空上一轮审批结果 |
-| `review_node` | 按 `tool.json` 逐个判定：`need_review: true` 则 `interrupt()` 挂起等 `y/n`；通过的调用按 `source` 分流（编排类 → orchestrate_node，其余 → tool_node） |
-| `orchestrate_node` | 执行编排工具（`create_plan` / `update_plan_step` / `clear_plan`）——只读写会话内跨轮持久化的 `current_plan`，不碰普通工具队列 |
+| `review_node` | 按 `tool.json` 逐个判定：`need_review: true` 则 `interrupt()` 挂起等 `y/n`；通过的调用按 `source` 分流（state 工具 → orchestrate_node，其余 → tool_node）；**被拒**的调用回灌一条带 `[approval_denied]` 的回执（不让模型以为它执行了） |
+| `orchestrate_node` | 执行 agent 侧 state 工具：计划编排（`create_plan` / `update_plan_step` / `clear_plan`）、`read_note`、`dispatch_subtasks`、`write_memory` / `read_memory`——只动会话内 state，不产生真实副作用 |
 | `tool_node` | `ainvoke` 执行已批准的工具（MCP 工具是 async-only），结果作为 `ToolMessage` 回传 |
+| `compact_node` | **轮末折叠**：历史超预算（默认 60000 字符）时，把更早轮次**已消费的完整工具块**折成一条摘要系统消息（联网正文归档进 `notes`，需要时用 `read_note` 取回）；只在收尾跑，不碰当前轮 |
 
 几个关键点：
 
 - **审批用 interrupt 而非条件分支**：每个需审的 `tool_call` 各自 `interrupt()` 一次，所以一次请求可能挂起多次；基座（`app/platform`）把中断入统一 broker 并 park 住 run，前端（终端 TUI）只负责画面板、收 `y/n`，基座再以 `Command(resume={"approved": ...})` 续跑——**阻塞图、不阻塞进程**，因此主 agent 等审批时 worker 的审批照样能被服务。
-- **编排工具无真实副作用**：只更新会话内、跨轮持久化的 `current_plan`（create_plan 拆步 → 按步 update_plan_step 推进 → clear_plan），因此天然免审。
+- **为什么这几类免审**：计划编排只动会话内、跨轮持久化的 `current_plan`；`read_note` 只读会话内的笔记；`write_memory` 写的是 agent 自己的私有记忆目录（`resource/` 下，不在你的仓库里，可随时改）；`dispatch_subtasks` 派出的 worker **只持有只读工具**（它要联网时仍会来问你）。真正有副作用的（写文件 / 删目录 / 跑命令 / git 写 / 联网检索）一律要审批。
 - **审批策略与工具归属集中在 `app/agent/tool.json`**（`need_review` + `source`）：
 
 | 类别 | 工具 | 审批 |
 | --- | --- | --- |
 | 计划编排 | `create_plan` / `update_plan_step` / `clear_plan` | 免审（无真实副作用） |
+| 会话笔记 | `read_note`（读被折叠归档的联网正文） | 免审 |
+| 并发资料收集 | `dispatch_subtasks`（派发只读 worker 并行调研） | 免审（worker 自己发起的联网调用另需审批） |
+| 长期记忆 | `write_memory` / `read_memory` | 免审（写在 resource 私有目录，可随时改） |
 | 读 / 查询 | file_io：`read_file` / `list_dir` / `get_directory_tree` / `search_content` / `glob`；git 只读：`list_repos` / `git_status` / `git_branches` / `git_diff` / `git_log` / `git_fetch`；terminal 只读：`process_wait` / `process_read` / `process_list` | 免审 |
 | 文件写 | `create_file` / `create_dir` / `write_file` / `edit_file` / `delete_file` / `delete_dir` / `copy_path` | 需审批 |
 | git 写 | `git_add` / `git_commit` / `git_switch` / `git_pull` | 需审批 |
 | 终端执行 | `run_command` / `start_process` / `process_kill` | 需审批 + 必填「解释」 |
 | 联网检索 | `web_search` / `extract_urls` / `crawl_website` / `deep_research` | 需审批 |
+
+### 跨会话记忆：让模型记住你这个项目和你的偏好
+
+两套东西分工明确（设计见 [`docs/LONG_TERM_MEMORY.md`](docs/LONG_TERM_MEMORY.md)）：
+
+| | 长期记忆 `memory.md` | 项目画像 `AGENT.md` |
+| --- | --- | --- |
+| 位置 | `resource/<工作区键>/memory/`（agent 私有，不进仓库） | **工作区根**（随仓库走，建议提交） |
+| 内容 | 你的偏好与约束、敲定的决策、这个项目的既有约定 | 这个项目是什么、目录与技术栈、主流程、怎么构建与跑测试 |
+| 谁写 | agent 自己（`write_memory` 免审；省略 key 追加、给 key 覆写） | 你用 `/init` 让 agent 通读工作区生成，或自己维护 |
+| 何时被读到 | **每轮**注入系统提示 | **会话启动时**读入一次（改了它要重开会话才生效） |
+| 给 worker 吗 | 不给（worker 是只读资料收集器，两样都不注入） | 不给 |
+
+两边都**只放跨会话仍然成立的东西**：临时过程、随时能从工作区 / git 重取的内容不记——记忆里存的是"下次做这个项目时还成立"的偏好、决策与约定。
+
+### 并发资料收集：一次派发多个只读 worker
+
+需要"先并行查一堆互不相关的资料"时，模型可以调 `dispatch_subtasks`：每个独立问题派给一个**独立 worker 进程**（`mcp_service/sub_agent.py`，stdio spawn、干完即回收）并发执行，拿回各自的结论正文，由主 agent 汇总核对后再落地改动。
+
+worker 的边界是硬的：**只读**当前工作区（文件检索 + git 只读）并可联网检索；**不能**改文件、执行命令、推进计划或做决策——它返回的结论只是素材。worker 的联网调用会以"子任务审批"的形式出现在同一个审批面板里（worker 进程经 HTTP 把待审请求回传给主侧队列）。
 
 ### 目录结构
 
