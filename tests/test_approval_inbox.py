@@ -4,11 +4,14 @@
 HTTP 用 ApprovalInboxServer(start(port=0)) 在测试自己的事件循环里拉起，测试后 stop。
 """
 import asyncio
+import socket
 
 import httpx
 import pytest
 
+from app.exception import ConfigError
 from app.platform.approvals import ApprovalInbox, ApprovalInboxServer
+from app.schema.approval_schema import DEFAULT_INBOX_HOST, DEFAULT_INBOX_PORT
 
 PAYLOAD = {
     "worker_id": "worker-1",
@@ -16,6 +19,46 @@ PAYLOAD = {
     "tool_args": {"command": "rm -rf dist", "description": "清理构建产物"},
     "description": "清理 dist",
 }
+
+
+def test_default_inbox_port_is_shared_constant(monkeypatch):
+    """默认端口是主侧/worker **共用的一份常量**（两边各写字面量迟早会漂），且 env 仍可覆盖。"""
+    monkeypatch.delenv("AGENT_INBOX_PORT", raising=False)
+    assert ApprovalInboxServer().port == DEFAULT_INBOX_PORT
+
+    monkeypatch.setenv("AGENT_INBOX_PORT", "12345")
+    assert ApprovalInboxServer().port == 12345
+
+
+def test_worker_side_default_url_uses_same_constant():
+    """worker 回传地址的默认值也来自那份常量——主侧换端口时才只有一处要改。"""
+    from mcp_service.sub_agent import _INBOX_DEFAULT_URL
+
+    assert _INBOX_DEFAULT_URL == f"http://{DEFAULT_INBOX_HOST}:{DEFAULT_INBOX_PORT}"
+
+
+def test_start_reports_busy_port_as_config_error():
+    """端口被占 → 带地址与解法提示的 ConfigError（**而不是 `SystemExit: 1` 把进程带走**）。
+
+    用真占住的端口来测：预检在起 uvicorn 之前就拦住，所以既确定、也不会有 SystemExit 逃出循环。
+    """
+
+    async def go():
+        blocker = socket.socket()
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        port = blocker.getsockname()[1]
+        try:
+            server = ApprovalInboxServer(port=port)
+            with pytest.raises(ConfigError) as err:
+                await server.start()
+            message = str(err.value)
+            assert str(port) in message and "AGENT_INBOX_PORT" in message
+            await server.stop()  # 没起成也要能安全收尾（清理路径不抛）
+        finally:
+            blocker.close()
+
+    asyncio.run(go())
 
 
 def test_queue_enqueue_pending_complete_wait():

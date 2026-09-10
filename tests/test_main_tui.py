@@ -7,8 +7,46 @@ app/resource.py（见 tests/test_resource.py）。app.tui 模块 import 期不�
 """
 from types import SimpleNamespace
 
+import asyncio
+
 from app.tui.panels import format_tool_approval, truncate
 from app.tui.runner import resolve_tui_workspace
+from app.tui.ui import TerminalUI
+
+
+def test_terminal_ui_eof_makes_reads_return_immediately():
+    """EOF（stdin 关闭 / 管道耗尽）后 `read_line` 与 `decide` **立即返回**，不再干等。
+
+    EOF 之后 pump 就结束了、队列不会再有内容：若还照旧 `await queue.get()`，一旦此时有 turn
+    要审批，就是永久阻塞（只能 Ctrl+C）。用 wait_for 兜住——真卡住会变成测试失败而不是挂死。
+    """
+
+    async def go():
+        ui = TerminalUI()
+        ui._out_q = asyncio.Queue()  # 白盒注入：不真起 stdin reader 线程
+        ui._out_q.put_nowait(None)  # pump 在 EOF 时放的哨兵
+
+        assert await ui.read_line() is None
+        assert await ui.read_line() is None  # 第二次也不再阻塞
+        assert await ui.decide({"tool_name": "write_file"}) is False  # 无人确认 → 按未批准
+
+    asyncio.run(asyncio.wait_for(go(), timeout=2))
+
+
+def test_terminal_ui_aclose_finishes_pump_task():
+    """`aclose` 要 **await 掉**被取消的 pump：只 cancel 不 await 会留下 pending 任务噪声。"""
+
+    async def go():
+        ui = TerminalUI()
+        pump = asyncio.create_task(asyncio.sleep(3600))
+        ui._pump = pump
+
+        await ui.aclose()
+
+        assert ui._pump is None
+        assert pump.done() and pump.cancelled()  # 已收尾，不是悬着的 pending 任务
+
+    asyncio.run(go())
 
 
 def test_resolve_tui_workspace_is_cwd(tmp_path, monkeypatch):

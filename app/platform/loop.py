@@ -58,13 +58,15 @@ class AgentPlatform:
     async def run(self) -> None:
         """跑到退出（EOF / 退出词）：收尾 inbox、取消在跑的 turn、关会话连接。"""
         remove_legacy_single_db()  # 旧 resource/agent.db 单库一次性清理（用户已确认删除）
-        self.ui.emit(SessionStarted(session_id=self.session_id, workspace=self.workspace))
 
         inbox = ApprovalInboxServer()
         turn: asyncio.Task | None = None
         turn_done = asyncio.Event()
         try:
-            await inbox.start()  # worker 待审请求收件箱（HTTP，静默监听 127.0.0.1:8010）
+            # 先起收件箱再宣告会话就绪：收件箱起不来（端口被占等）会抛 ConfigError，
+            # 那时不该先打一句"会话 session_id=…"让用户以为已经跑起来了。
+            await inbox.start()
+            self.ui.emit(SessionStarted(session_id=self.session_id, workspace=self.workspace))
 
             while True:
                 # 1) 审批 pending 即服务（本地 park + worker HTTP 一视同仁）

@@ -6,7 +6,7 @@
 基座与前端分家——**基座不 print、不读 stdin**；本包只显示与取输入，不碰调度与 park/resume。
 
 模块（各自单一职责，无跨包循环）：
-- input.py    stdin 单 reader 线程 + pump + 一问一答原语
+- input.py    stdin 单 reader 线程 + pump（只搬运行；y/n 交互在 ui.py 统一处理 EOF）
 - panels.py   终端渲染素材：审批面板 / 标题框 / 截断（纯函数）
 - ui.py       TerminalUI：实现 `app/platform/ui.py::UI` 协议
 - runner.py   run_tui()：解析启动工作区 → 组 UI + AgentPlatform → 跑基座循环

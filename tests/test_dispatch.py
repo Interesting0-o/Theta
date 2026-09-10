@@ -30,6 +30,24 @@ def test_source_registered():
     assert dispatch_tool[0].name == "dispatch_subtasks"
 
 
+def test_worker_child_env_forwards_inbox_url(monkeypatch):
+    """worker 子进程 env 要带上主侧审批收件箱的**实际**地址（子进程 env 是替换制、不继承）。
+
+    否则主侧一换端口（AGENT_INBOX_PORT），worker 还在往默认端口回传审批，链路静默断掉。
+    """
+    monkeypatch.setenv("AGENT_INBOX_URL", "http://127.0.0.1:25011")
+    env = tools_mod._worker_child_env("/tmp/ws")
+    assert env["AGENT_INBOX_URL"] == "http://127.0.0.1:25011"
+    assert env["WORKSPACE_PATH"] == "/tmp/ws" and "PYTHONPATH" in env
+
+    # 主侧没给地址时**不带该键**（带个空串会被 worker 当成地址用，而不是回退到默认）
+    monkeypatch.delenv("AGENT_INBOX_URL", raising=False)
+    assert "AGENT_INBOX_URL" not in tools_mod._worker_child_env("/tmp/ws")
+
+    monkeypatch.setenv("AGENT_INBOX_URL", "   ")
+    assert "AGENT_INBOX_URL" not in tools_mod._worker_child_env("/tmp/ws")
+
+
 def test_dispatch_subtasks_concurrent_summary(monkeypatch):
     """每个子任务调一次 worker runner、并发执行、结果按输入顺序汇总成一条 ToolMessage。"""
     calls: list[tuple] = []

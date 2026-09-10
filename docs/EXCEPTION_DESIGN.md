@@ -253,7 +253,7 @@ async def __call__(self, state: AgentState) -> dict | AgentState:
 `ConfigError` 的价值不是"发明异常"（pydantic 已经在抛 `ValidationError`），而是**在入口边界做翻译**：把机器语言（"5 个必填字段缺失"）翻译成人话（"请配置 CHAT_MODEL_API_KEY"）。
 
 ```python
-# app/main.py —— 入口边界翻译
+# app/main.py —— 入口边界翻译（设想的完整形态）
 from pydantic import ValidationError
 from app.config import get_settings
 
@@ -266,7 +266,23 @@ except ValidationError as exc:
     sys.exit(1)
 ```
 
-> ⚠️ 前提：`get_settings()` 必须**懒加载**。当前 `app/agent/model.py` 在模块顶层调用 `get_settings()`（`tools.py` 已无该调用），会让异常在 import 时就崩、根本走不进入口的 try。需要把模块顶层的调用挪进函数内。**这项仍未做**（入口翻译 `ValidationError → ConfigError` 也未落地）。
+**现状（`[已落地]` 的一半）**：入口已经在翻译 `ConfigError` ——`app/main.py` 捕获它、打一句
+`❌ 启动失败（配置问题）：…` 并以退出码 1 收场。这样"审批收件箱端口被占""工作区不存在"这类
+**说得清**的失败不再裹在 traceback 里像个崩溃：
+
+```python
+# app/main.py —— 现在的样子
+try:
+    asyncio.run(run_tui())
+except ConfigError as exc:
+    print(f"\n❌ 启动失败（配置问题）：{exc}")
+    sys.exit(1)
+```
+
+> ⚠️ 仍未做的那一半：`get_settings()` **懒加载**。当前 `app/agent/model.py` 在模块顶层调用它
+> （`tools.py` 已无该调用），于是"`.env` 缺键"会在 **import 阶段**抛 `ValidationError` 崩掉，
+> 根本走不进入口的 try——所以 `ValidationError → ConfigError` 的翻译也就无从谈起。要补的是
+> 把模块顶层的调用挪进函数内。
 
 ---
 
@@ -302,7 +318,7 @@ except ValidationError as exc:
 - [x] 各文件工具：`resolve` 移出 try，操作失败保留 `except OSError → ToolResult(io_error)`
 - [x] `app/agent/utils.py`：`format_tool_result` 提取正文（`ToolNode` 调它）；`ToolNode` 的 `except Exception` 仅作传输层兜底（正文 `工具执行失败: …`、`error_type="tool_error"`）
 - [x] MCP 子进程 env 注入工作区：**`WORKSPACE_PATH`**（不是 `WORKSPACE_ROOT`），由 `app/agent/mcp.py::_build_servers` 注入；`app/config.py` 不参与（工作区已是图的构造期参量）
-- [ ] `get_settings()` 懒加载（现在 `app/agent/model.py` 顶层调用），入口翻译 `ValidationError → ConfigError` 引导
+- [~] 入口翻译：**已落地一半**——`app/main.py` 捕获 `ConfigError` 打一句人话 + 退出码 1（不再让它裹在 traceback 里）；**未做**：`get_settings()` 懒加载（现在 `app/agent/model.py` 顶层调用）与 `ValidationError → ConfigError` 的翻译
 - [x] 测试：越界拒绝（绝对路径/`../`/符号链接）、工作区内放行、`internal_error` 不冒充工具失败（`tests/test_guard.py`、`tests/test_file_io_sandbox.py`）
 
 ---

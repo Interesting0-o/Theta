@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import os
+import socket
 import time
 from dataclasses import dataclass, field
 
@@ -44,8 +45,15 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from app.exception import ConfigError
 from app.platform.ui import UI
-from app.schema.approval_schema import ApprovalRecord, ApprovalRequest, ApprovalStatus
+from app.schema.approval_schema import (
+    DEFAULT_INBOX_HOST,
+    DEFAULT_INBOX_PORT,
+    ApprovalRecord,
+    ApprovalRequest,
+    ApprovalStatus,
+)
 
 # 本地主 agent 中断入 broker 时用的 worker_id 标记（远端 worker 用真实 id）
 LOCAL_WORKER_ID = "main"
@@ -206,12 +214,23 @@ def build_app(queue: ApprovalInbox) -> Starlette:
     )
 
 
+def _task_failure(task: asyncio.Task) -> str:
+    """描述一个已结束任务的失败原因（只取不抛，供报错带上下文）。"""
+    try:
+        exc = task.exception()
+    except BaseException as graceful:  # 被取消 / 任务里冒出 SystemExit 等
+        return type(graceful).__name__
+    return f"{type(exc).__name__}: {exc}" if exc is not None else "任务已结束"
+
+
 class ApprovalInboxServer:
     """待审请求队列 + 薄 HTTP 面：在**已运行的事件循环**里以任务方式跑 uvicorn。"""
 
-    def __init__(self, host: str = "127.0.0.1", port: int | None = None) -> None:
+    def __init__(self, host: str = DEFAULT_INBOX_HOST, port: int | None = None) -> None:
         self.host = host
-        self.port = port if port is not None else int(os.environ.get("AGENT_INBOX_PORT", "8010"))
+        self.port = (
+            port if port is not None else int(os.environ.get("AGENT_INBOX_PORT", DEFAULT_INBOX_PORT))
+        )
         self.queue = ApprovalInbox()
         self._app = build_app(self.queue)
         self._uvicorn = None
@@ -222,8 +241,20 @@ class ApprovalInboxServer:
         return f"http://{self.host}:{self.port}"
 
     async def start(self) -> int:
-        """在当前事件循环里拉起 uvicorn，阻塞到已监听；port=0 时返回实际端口。"""
+        """在当前事件循环里拉起 uvicorn，阻塞到已监听；port=0 时返回实际端口。
+
+        **先自己试绑一次端口**（`_precheck_port`）再起 uvicorn：uvicorn 绑不上时会在自己的
+        serve 任务里 `sys.exit(1)`，而 SystemExit 会被 asyncio 从事件循环里再抛出去、**整个进程
+        随之退出**——那时再做"事后翻译"已经来不及（只收得到一个 CancelledError）。预检把
+        "端口被占"变成一条带解决办法的 `ConfigError`，且压根不会起 uvicorn。
+
+        启动成功后把**实际**地址写进 `AGENT_INBOX_URL`：worker 子进程的 env 是整体替换、不继承
+        父进程，spawn 时按这个 env 转发（`app/agent/tools.py::_spawn_subagent_worker`），
+        这样"主侧换了端口"与"worker 往哪回传"才不会各说各话。
+        """
         import uvicorn
+
+        await self._precheck_port(self.host, self.port)
 
         config = uvicorn.Config(
             self._app,
@@ -238,24 +269,61 @@ class ApprovalInboxServer:
         for _ in range(500):
             if server.started:
                 break
+            if self._task.done():  # 已经结束却没 started：多半是端口被占，别干等 5 秒
+                raise ConfigError(
+                    f"审批收件箱无法监听 {self.host}:{self.port}（端口可能已被占用）。"
+                    f"设 AGENT_INBOX_PORT 换个端口再启动即可；底层错误：{_task_failure(self._task)}"
+                )
             await asyncio.sleep(0.01)
         else:
-            raise RuntimeError("approval server 启动超时")
+            raise ConfigError(
+                f"审批收件箱启动超时（{self.host}:{self.port}）；设 AGENT_INBOX_PORT 换端口再试。"
+            )
         if self.port == 0:
             try:
                 self.port = server.servers[0].sockets[0].getsockname()[1]
             except (IndexError, OSError):
                 pass
+        os.environ["AGENT_INBOX_URL"] = self.url  # 供 spawn worker 时转发（见 docstring）
         return self.port
 
+    @staticmethod
+    async def _precheck_port(host: str, port: int) -> None:
+        """起 uvicorn 前先自己试绑一次端口；绑不上就抛可读的 `ConfigError`。
+
+        端口 0（让 OS 挑）无需预检。试绑放在线程里（阻塞调用）；拔掉即关，不留监听。
+        与真正 bind 之间有极窄的竞态（这一瞬被别人抢走），那时仍会走 uvicorn 的失败路径——
+        但绝大多数"端口被占"都在这里被拦住，用户看到的是原因与解法，不是 `SystemExit: 1`。
+        """
+        if port == 0:
+            return
+
+        def _try_bind() -> str | None:
+            sock = socket.socket()
+            try:
+                sock.bind((host, port))
+                return None
+            except OSError as exc:  # EADDRINUSE / WSAEADDRINUSE 等
+                return f"{type(exc).__name__}: {exc}"
+            finally:
+                sock.close()
+
+        failure = await asyncio.to_thread(_try_bind)
+        if failure:
+            raise ConfigError(
+                f"审批收件箱无法监听 {host}:{port}（端口可能已被占用）：{failure}。"
+                f"设 AGENT_INBOX_PORT 换个端口再启动即可。"
+            )
+
     async def stop(self) -> None:
+        """停掉收件箱——**清理路径绝不抛**：否则会盖掉真正的失败原因（如端口被占的启动失败）。"""
         if self._uvicorn is not None:
             self._uvicorn.should_exit = True
         if self._task is not None:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):
+            except BaseException:  # noqa: BLE001 —— CancelledError 与 SystemExit（uvicorn 起不来）都在内
                 pass
             self._task = None
 

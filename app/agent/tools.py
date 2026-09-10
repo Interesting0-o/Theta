@@ -20,6 +20,7 @@
 """
 import asyncio
 import json
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -283,6 +284,22 @@ class InjectedWorkspace(InjectedToolArg):
     """
 
 
+def _worker_child_env(workspace: str) -> dict[str, str]:
+    """worker 子进程的 env。
+
+    子进程 env 是**整体替换**（不继承父进程），所以该带的都得显式带上：
+    - `WORKSPACE_PATH`：worker 只读干活的工作区；
+    - `PYTHONPATH`：cwd 已切到项目根，靠它保证 `python -m mcp_service.*` 能 import 到包；
+    - `AGENT_INBOX_URL`：**主侧审批收件箱的实际地址**——由主侧启动收件箱时写进本进程 env。
+      只在确实给了地址时才带（空值不传：worker 那边把空串当"未设置"处理，但传个空变量本身就是噪声）。
+    """
+    env = {"WORKSPACE_PATH": str(workspace), "PYTHONPATH": str(_PROJECT_ROOT)}
+    inbox_url = os.environ.get("AGENT_INBOX_URL", "").strip()
+    if inbox_url:
+        env["AGENT_INBOX_URL"] = inbox_url
+    return env
+
+
 async def _spawn_subagent_worker(task: str, workspace: str) -> str:
     """默认 worker 执行器：现场 spawn 一个 sub_agent stdio 子进程跑 run_subtask。
 
@@ -290,6 +307,9 @@ async def _spawn_subagent_worker(task: str, workspace: str) -> str:
     一个 `python -m mcp_service.sub_agent` 子进程、调用 run_subtask、结束后回收，因此
     N 次并发 = N 个独立 worker 进程，无预启动、无常驻泄漏。cwd=项目根使 worker 进程能
     读到项目 .env 的 CHAT_*；WORKSPACE_PATH 指向本 agent 工作区（worker 在其上只读干活）。
+
+    子进程的 env 由 `_worker_child_env` 组装（含把主侧的审批收件箱地址转发进去——子进程 env 是
+    整体替换、不继承，不转发的话主侧一换端口 worker 就还在往默认端口发）。
     """
     from langchain_mcp_adapters.client import MultiServerMCPClient  # noqa: PLC0415
 
@@ -300,10 +320,7 @@ async def _spawn_subagent_worker(task: str, workspace: str) -> str:
                 "command": sys.executable,
                 "args": ["-m", "mcp_service.sub_agent"],
                 "cwd": str(_PROJECT_ROOT),
-                "env": {
-                    "WORKSPACE_PATH": str(workspace),
-                    "PYTHONPATH": str(_PROJECT_ROOT),
-                },
+                "env": _worker_child_env(workspace),
             }
         }
     )

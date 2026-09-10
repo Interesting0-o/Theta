@@ -27,6 +27,7 @@ from mcp.server.fastmcp import FastMCP
 
 from app.exception import ConfigError, InvalidArgumentError
 from app.schema.agent_schema import ToolResult
+from app.schema.approval_schema import DEFAULT_INBOX_HOST, DEFAULT_INBOX_PORT
 from mcp_service.utils import guard
 
 mcp = FastMCP("SubAgent")
@@ -34,8 +35,10 @@ mcp = FastMCP("SubAgent")
 # worker 子任务图的递归上限（superstep 数）；只读/审批循环靠它兜底
 _MAX_STEPS = 100
 
-# 主侧统一审批收件箱（ApprovalInboxServer）默认地址；env AGENT_INBOX_URL 可覆盖
-_INBOX_DEFAULT_URL = "http://127.0.0.1:8010"
+# 主侧统一审批收件箱（ApprovalInboxServer）默认地址：与主侧**共用同一份常量**
+# （app/schema/approval_schema.py），两边各写一个字面量迟早会漂。env AGENT_INBOX_URL 可覆盖，
+# 且主侧启动收件箱后会把**实际**地址写进该 env、由 spawn 时转发进来（子进程 env 是替换制、不继承）。
+_INBOX_DEFAULT_URL = f"http://{DEFAULT_INBOX_HOST}:{DEFAULT_INBOX_PORT}"
 # 单条审批决定等待的总上限（秒）；server 单次 block 最多等 120s，driver 外层循环重试到该上限
 _APPROVAL_TIMEOUT_S = 300.0
 
@@ -57,8 +60,11 @@ def _worker_id() -> str:
 
 
 def _inbox_base_url() -> str:
-    """主侧审批收件箱（ApprovalInboxServer）基地址；每次现取以便运行时覆盖。"""
-    return os.environ.get("AGENT_INBOX_URL", _INBOX_DEFAULT_URL)
+    """主侧审批收件箱（ApprovalInboxServer）基地址；每次现取以便运行时覆盖。
+
+    空值按"未设置"处理（与本仓 `.env` 的惯例一致）——否则空串会被当成一个地址用。
+    """
+    return os.environ.get("AGENT_INBOX_URL") or _INBOX_DEFAULT_URL
 
 
 # ---------------------------------------------------------------------------
