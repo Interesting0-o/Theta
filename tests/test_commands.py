@@ -1,4 +1,4 @@
-"""app/platform/commands.py 的单测：命令解析（提示词型 / 基座动作型 / 普通文本 / 未识别）。
+"""app/platform/commands/ 的单测：命令解析（提示词型 / 基座动作型 / 普通文本 / 未识别）。
 
 命令是基座的控制面事件（图之外），解析不依赖 app.agent → 本文件无需 .env。
 """
@@ -28,9 +28,9 @@ def test_init_parses_to_prompt_command():
 
 
 def test_action_command_slot_parses(monkeypatch):
-    """基座动作型：表里加项即被 parse 成 ActionCommand（/help 之外的成员尚未实现）。"""
+    """基座动作型：表里加项即被 parse 成 ActionCommand（handler 收 platform + args）。"""
 
-    async def handler(platform):  # pragma: no cover —— 只验解析，不执行
+    async def handler(platform, args):  # pragma: no cover —— 只验解析，不执行
         ...
 
     monkeypatch.setitem(ACTION_COMMANDS, "/fake", {"desc": "测试用", "handler": handler})
@@ -38,7 +38,7 @@ def test_action_command_slot_parses(monkeypatch):
     cmd = parse_command("/fake")
 
     assert isinstance(cmd, ActionCommand)
-    assert cmd.name == "/fake" and cmd.handler is handler
+    assert cmd.name == "/fake" and cmd.handler is handler and cmd.args == ""
 
 
 def test_help_is_action_command():
@@ -46,6 +46,32 @@ def test_help_is_action_command():
 
     assert isinstance(cmd, ActionCommand)
     assert cmd.name == "/help"
+
+
+def test_session_commands_parse_with_multiword_names_and_args():
+    """名字可含空格（`/list session`），解析取最长匹配、余下部分作 args。"""
+    listing = parse_command("/list session")
+    assert isinstance(listing, ActionCommand)
+    assert listing.name == "/list session" and listing.args == ""
+
+    fresh = parse_command("/new session")
+    assert fresh is not None and fresh.name == "/new session" and fresh.args == ""
+
+    switching = parse_command("/session   aaaa1111")  # 多余空白折叠
+    assert isinstance(switching, ActionCommand)
+    assert switching.name == "/session" and switching.args == "aaaa1111"
+
+    # 无参数也命中（handler 会给用法提示），不是"未识别"
+    bare = parse_command("/session")
+    assert bare is not None and bare.args == ""
+
+    # 多给一段也归到 args（不新增命令）
+    extra = parse_command("/new session now")
+    assert extra is not None and extra.name == "/new session" and extra.args == "now"
+
+    # "/list" 本身不是命令（表里只有 "/list session"）→ 交给"未识别"提示
+    assert parse_command("/list") is None
+    assert is_command("/list")
 
 
 def test_help_text_lists_every_command_with_desc():

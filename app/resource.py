@@ -64,6 +64,22 @@ def memory_root(workspace_path: str) -> Path:
     return workspace_dir(workspace_path) / "memory"
 
 
+def sessions_dir(workspace_path: str) -> Path:
+    """某工作区的会话目录（`resource/<ws_key>/sessions/`，其下每个 `<session_id>/` 一个库）。"""
+    return workspace_dir(workspace_path) / "sessions"
+
+
+def iter_session_dbs(workspace_path: str) -> list[Path]:
+    """枚举该工作区**已有**的会话 checkpoint 库（按路径排序；目录不存在 → 空表）。
+
+    只做路径枚举、不读库内容——读会话状态在 `app/platform/commands/session.py`。
+    """
+    root = sessions_dir(workspace_path)
+    if not root.is_dir():
+        return []
+    return sorted(p / "agent.db" for p in root.iterdir() if (p / "agent.db").is_file())
+
+
 def remove_legacy_single_db() -> None:
     """删除旧单库 resource/agent.db（含 -wal / -shm）；不存在即 no-op。
 

@@ -8,7 +8,7 @@
 - 空闲 → `emit(ReadyForInput())`，等一行输入起下一条 turn（新 worker 审批可插队服务）。
 
 本模块**不 print、不读 stdin**，也不 import app.tui（docs/ARCHITECTURE.md §2.7/§4）。
-用户命令（`/init`，见 commands.py）在"起 turn 之前"介入这一循环——即基座的控制面事件：
+用户命令（`/init` 等，见 commands/ 包）在"起 turn 之前"介入这一循环——即基座的控制面事件：
 提示词型把预设 prompt 当本轮输入（继续起 turn），基座动作型直接执行完就回顶部（不起 turn，
 结果经 `Notice` 回话），未识别的 `/` 输入提示而不喂给模型。
 """
@@ -87,14 +87,14 @@ class AgentPlatform:
                 if line is None or line in EXIT_WORDS:
                     break  # EOF / 退出
 
-                # 控制面命令（图之外，见 commands.py）：提示词型把预设 prompt 当本轮输入、
+                # 控制面命令（图之外，见 commands/ 包）：提示词型把预设 prompt 当本轮输入、
                 # 继续走下面的起 turn；基座动作型由基座直接执行完 continue；
                 # 未识别的 `/` 输入不喂给模型，直接提示、不起 turn。
                 command = parse_command(line)
                 if isinstance(command, PromptCommand):
                     line = command.prompt
                 elif isinstance(command, ActionCommand):
-                    await command.handler(self)
+                    await command.handler(self, command.args)
                     continue
                 elif is_command(line):
                     self.ui.emit(Notice(text=UNKNOWN_COMMAND_HINT))
@@ -116,6 +116,19 @@ class AgentPlatform:
             await inbox.stop()
             if self._connection is not None:
                 await self._connection.close()
+
+    async def switch_session(self, session_id: str) -> None:
+        """切到另一个会话（`/session <id>`、`/new session` 命令用）。
+
+        当前会话的 checkpoint 是**逐步落盘**的，不需要额外"落定"动作，关掉连接即可；
+        `step` 的闭包捕获了本会话的 thread_id，所以必须丢弃、由下一条消息懒重建
+        （走 `_step_factory`，测试注入的假 step 照常生效）。
+        """
+        if self._connection is not None:
+            await self._connection.close()
+            self._connection = None
+        self.session_id = session_id
+        self._step = None
 
     async def _read_user_line(self, inbox: ApprovalInbox) -> tuple[int, str | None]:
         """等一行**有效**输入；空行保持同一提示继续等，审批先到则返回 (1, None) 让上层回顶。

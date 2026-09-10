@@ -18,6 +18,8 @@ app/resource / app/schema；本包**不 import app.tui**。
 - turn.py       一次 run 的驱动原语：drive_turn（park/resume）+ _race
 - runtime.py    按 (工作区, 会话) 装配运行时：db / checkpointer / 编译图 / 记忆播种
 - loop.py       AgentPlatform：主事件循环（drain 待批 → 等 turn → 等输入）
+- commands/     控制面命令（图之外）：机制与唯一一张表在 `__init__.py`，提示词载荷在
+                `prompts.py`，各命令在 `session.py` 等子模块
 
 `app.agent.*`（graph/model，import 即需 .env）只在 runtime.py 内懒加载——`import app.platform`
 不触发 .env。

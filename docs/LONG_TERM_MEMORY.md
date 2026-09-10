@@ -110,7 +110,7 @@ resource/
 
 - `LLMNode.__call__` 在计划块之后追加 `SystemMessage(memory_block(workspace_path))`——**没有**引入 §7 设想的 `memory_provider` 构造参数：LLMNode 本来就收着 `workspace_path`，直接每轮经 `asyncio.to_thread` 读盘（避开 langgraph dev 的 blockbuster）比再造一层提供器更直。若日后要换来源（如多文件/远端记忆）再抽 provider。
 - `memory.py::memory_block(workspace_path, cap=MEMORY_INJECT_CAP)`：注入**剥掉 HTML 注释**的可见文本（模板的格式示例不给模型）；无条目返回空串、调用方跳过该条系统消息；超 `cap`（**8000 字符**，§3 暂定 6–8k 内取上限）**从最新往前装**，被挤掉的旧条目退化成一行"未注入 + 编号清单"，模型据此用 `read_memory` 取回。不做压缩/归档（Phase C）。
-- **worker 隔离**：`LLMNode` 加 `inject_memory` 开关，`get_sub_agent_graph` 传 `False`——worker 与主 agent 共用 LLMNode，不给这个开关就会顺带把记忆注进 worker。
+- **worker 隔离**：`LLMNode` 加注入开关（2026-09-10 更名为 `inject_session_context`：画像与记忆同属"会话级上下文"），`get_sub_agent_graph` 传 `False`——worker 与主 agent 共用 LLMNode，不给这个开关就会顺带把记忆注进 worker。
 
 ### AGENT.md（项目画像）≠ memory（约束/偏好/策略）——2026-09-08 定
 
@@ -173,9 +173,12 @@ resource/
 4. **旧数据**：`resource/agent.db` 是 dev 运行产物（gitignore）。Phase A 切换路径后它不再被读；是否清理（删旧单库）由你决定，文档记录即可，代码不自动删。
 5. **测试**：`tests/test_main_tui.py::test_agent_db_path_resolves_under_resource_dir` 断言要随新布局更新（`resource/<ws_key>/sessions/<sid>/agent.db`）；新增 resource 解析 / reviewed.json 读写 / md 读写 / cap / 工具注入 / 会话命令的单测。
 
-**TUI 命令层（/init · /session，2026-09-08 引入；2026-09-10 起落 `app/platform/commands.py`）**：新开程序 = 新会话，续旧会话与沉淀项目约定走命令。命令是**基座的控制面事件（图之外）**——基座解析并处理，前端只渲染其输出（未识别命令走 `Notice` 事件，不喂给模型）；`q/quit/exit` 的退出词仍在 `loop.py`，未纳入命令表。
-- `/init` `[已落地 2026-09-10]`：**投一段预设提示词**（`INIT_PROMPT`，随命令一起放在 commands.py——它是这条命令的载荷，不是每轮行为契约），随后走一条**正常 turn**：模型用已有只读工具通读工作区 → 在工作区**根目录**生成或刷新 `AGENT.md`（已存在则先读再 `edit_file` 刷新）。不加工具、不加节点、不加线程；写文件照常**撞审批**，用户过目内容再落盘。AGENT.md 是项目画像、随仓库走，不是把 resource 私有 memory 搬进去（memory 属约束/偏好层）。
-- `/session`：列出 `resource/<ws>/sessions/` 下历史会话（id + 最近时间/一句话摘要），选号切换——先落定当前会话 checkpoint，再以目标 id 重开 AsyncSqliteSaver + thread_id，续其消息栈。**未做**（要动 runtime 生命周期：关旧连接、换 session_id、重置 step）。
+**TUI 命令层（/init · /session，2026-09-08 引入；2026-09-10 起落 `app/platform/commands/` 包）**：新开程序 = 新会话，续旧会话与沉淀项目约定走命令。命令是**基座的控制面事件（图之外）**——基座解析并处理，前端只渲染其输出（未识别命令走 `Notice` 事件，不喂给模型）；`q/quit/exit` 的退出词仍在 `loop.py`，未纳入命令表。
+- `/init` `[已落地 2026-09-10]`：**投一段预设提示词**（`INIT_PROMPT`，放在 `commands/prompts.py`——它是这条命令的载荷，不是每轮行为契约），随后走一条**正常 turn**：模型用已有只读工具通读工作区 → 在工作区**根目录**生成或刷新 `AGENT.md`（已存在则先读再 `edit_file` 刷新）。不加工具、不加节点、不加线程；写文件照常**撞审批**，用户过目内容再落盘。AGENT.md 是项目画像、随仓库走，不是把 resource 私有 memory 搬进去（memory 属约束/偏好层）。
+- 会话三条命令 `[已落地 2026-09-10]`（原设计的"列出并选号切换"落地时**拆成三条**，不做"列完就地等选号"的半途状态）：
+  - `/list session`：列出当前工作区沙箱的全部会话（`*` 标当前；短 id · 最后活动时间 · 消息条数 · 末条 AI 正文摘要），按最后活动倒序，只给最近 10 个读 checkpoint；
+  - `/new session`：`uuid4().hex` 新建并切过去（库在下次输入时才建）；
+  - `/session <短 id 或完整 id>`：切到已存在的会话（唯一前缀即可；歧义/未命中只提示、不动当前会话）。切换 = 关旧连接 → 换 `session_id` → 丢弃 step（下一条消息按新 thread_id 懒重建），当前会话的 checkpoint 本就逐步落盘、无需额外"落定"。
 - 输入层识别 `/` 前缀命令（现有 `q/quit/exit` 已同类处理）。
 
 **命令分两类（2026-09-10 定型）**：命令不只是"投提示词"，基座侧还有要动/读运行时状态的：
@@ -189,7 +192,7 @@ resource/
 
 - **Phase A · resource + 会话目录重构**：路径解析收敛 + workspace_key + `sessions/<sid>/agent.db` 落位 + run_tui 用新 session_id + **`/session` 列表/切换骨架** + 旧库不读 + 测试更新。此阶段无记忆，纯地基。
 - **Phase B · 最简单长期记忆闭环 + 项目画像**：memory.md 格式 + 写入/读取工具 + tool.json/source + LLMNode SystemMessage 注入 + SYSTEM_PROMPT 纪律 + **AGENT.md 检测/会话首启注入 + `/init` 生成骨架** + 单测 + 手工冒烟（两段会话：第二段能看到第一段写的 memory；重开会话能看到 AGENT.md 画像）。`reviewed.json` 的加入交互/接线不在 A/B。
-  - **进度（2026-09-10）**：memory.md 格式 + `write_memory`/`read_memory` 工具 + tool.json/source + **LLMNode 每轮注入（§4）** + 单测 `[已落地]`（§3/§4/§5）——记忆闭环已通（写入 → 落盘 → 下轮注入），worker 侧不注入、工具也被 `worker_tools` 挡住。**同日续做**：AGENT.md 读取侧（`app/agent/profile.py` + LLMNode 注入）与 `/init` 命令（`app/platform/commands.py`，投预设提示词）`[已落地]`（§4/§7）——画像闭环亦通（`/init` 生成 → 下个会话注入）。**尚未做**：SYSTEM_PROMPT 的"长期记忆/项目画像"纪律小节（§6）、`/session`。
+  - **进度（2026-09-10）**：memory.md 格式 + `write_memory`/`read_memory` 工具 + tool.json/source + **LLMNode 每轮注入（§4）** + 单测 `[已落地]`（§3/§4/§5）——记忆闭环已通（写入 → 落盘 → 下轮注入），worker 侧不注入、工具也被 `worker_tools` 挡住。**同日续做**：AGENT.md 读取侧（`app/agent/profile.py` + LLMNode 注入）与 `/init` 命令（`app/platform/commands/`，投预设提示词）`[已落地]`（§4/§7）——画像闭环亦通（`/init` 生成 → 下个会话注入）。**尚未做**：SYSTEM_PROMPT 的"长期记忆/项目画像"纪律小节（§6）、`/session`。
 - **Phase C · 明确不做（后续再议）**：记忆压缩/分层摘要、记忆全文检索、跨工作区共享记忆、多会话选择 UI、reviewed.json 交互接线、把记忆 promote 进 repo（与 CONTEXT_ENGINEERING 的 promote 复用/分合另议）。
 
 ---
@@ -204,6 +207,6 @@ resource/
 
 **待确认 / 后置**：
 - [ ] memory.md 条目上限与注入 cap 的具体阈值（暂定整份 cap ~6–8k 字符）。
-- [ ] `/session` 切换细节：切走时未提交审批/当前行的落定、列表里的一句话摘要从哪来（消息栈末条 AI 正文截断）。
+- [x] `/session` 切换细节（2026-09-10 定）：**只在空闲时**处理命令（`loop` 的空闲分支），故不存在"切到一半的 run"；当前会话 checkpoint 逐步落盘、无需额外落定；列表摘要 = 该会话 checkpoint 里**末条有正文的 AI 消息**首行（停在工具链中间时往前找），只读一个 tuple、不编译图。
 - [ ] reviewed.json 的加入交互与 ReviewNode 接线（已排本轮外，Phase A/B 不含）。
 - [ ] memory 是否给 worker/子 agent 只读入口（并行收集器要不要带记忆？当前倾向**不带**，隔离最简单）。

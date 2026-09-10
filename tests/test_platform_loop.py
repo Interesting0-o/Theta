@@ -158,19 +158,20 @@ def test_action_command_slot_runs_handler_without_turn(tmp_path, monkeypatch):
     """
     seen: list = []
 
-    async def fake_handler(platform):
-        seen.append(platform)
-        platform.ui.emit(Notice(text="动作命令已执行"))
+    async def fake_handler(platform, args):
+        seen.append((platform, args))
+        platform.ui.emit(Notice(text=f"动作命令已执行（args={args!r}）"))
 
     monkeypatch.setitem(
-        commands_mod.ACTION_COMMANDS, "/fake", {"usage": "/fake 测试", "handler": fake_handler}
+        commands_mod.ACTION_COMMANDS, "/fake", {"desc": "测试用", "handler": fake_handler}
     )
-    ui = FakeUI(["/fake", None])
+    ui = FakeUI(["/fake 带个参数", None])
     step = FakeStep()
 
     asyncio.run(_platform(tmp_path, monkeypatch, ui, step).run())
 
-    assert len(seen) == 1  # handler 拿到的是基座本身
+    assert len(seen) == 1 and seen[0][0].workspace  # handler 拿到的是基座本身
+    assert seen[0][1] == "带个参数"  # 命令名之后的部分原样交给 handler
     assert step.inputs == []  # 没起 turn、也没喂模型
     assert any(isinstance(e, Notice) and "已执行" in e.text for e in ui.events)
 
@@ -188,6 +189,65 @@ def test_help_command_shows_all_commands_without_turn(tmp_path, monkeypatch):
     assert "显示所有可用命令与说明" in notices[0].text  # 描述也在
     assert step.inputs == []  # 没起 turn
     assert [type(e) for e in ui.events].count(ReadyForInput) == 2  # 提示完回到可输入
+
+
+def _touch_session(tmp_path, session_id: str) -> None:
+    """在工作区里放一个"已存在"的会话库（空文件即可——解析只看路径，不读库内容）。"""
+    db = resource.session_db_path(str(tmp_path / "ws"), session_id)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    db.write_bytes(b"")
+
+
+def test_list_session_command_notifies_without_turn(tmp_path, monkeypatch):
+    ui = FakeUI(["/list session", None])
+    step = FakeStep()
+
+    asyncio.run(_platform(tmp_path, monkeypatch, ui, step).run())
+
+    notices = [e for e in ui.events if isinstance(e, Notice)]
+    assert len(notices) == 1 and "还没有会话" in notices[0].text
+    assert step.inputs == []
+
+
+def test_switch_session_command_takes_effect_on_next_turn(tmp_path, monkeypatch):
+    """/session <id> 切过去之后，**下一条消息**真的在新会话里跑（thread_id 已换）。"""
+    ui = FakeUI(["/session aaaa1111", "接着聊", None])
+    step = FakeStep()
+    platform = _platform(tmp_path, monkeypatch, ui, step)
+    _touch_session(tmp_path, "aaaa1111bbbb2222")
+
+    asyncio.run(platform.run())
+
+    assert platform.session_id == "aaaa1111bbbb2222"
+    assert len(step.inputs) == 1  # 命令本身不起 turn，只有后面那条消息起了
+    assert step.inputs[0]["session_id"] == "aaaa1111bbbb2222"  # 新会话的 thread_id
+    assert any(isinstance(e, Notice) and "已切到会话 aaaa1111" in e.text for e in ui.events)
+
+
+def test_new_session_command_switches_to_fresh_id(tmp_path, monkeypatch):
+    ui = FakeUI(["/new session", None])
+    step = FakeStep()
+    platform = _platform(tmp_path, monkeypatch, ui, step)
+
+    asyncio.run(platform.run())
+
+    assert platform.session_id != "s1" and len(platform.session_id) == 32  # uuid4().hex
+    assert step.inputs == []
+    assert any(isinstance(e, Notice) and "已新建并切到会话" in e.text for e in ui.events)
+
+
+def test_switch_to_unknown_session_keeps_current(tmp_path, monkeypatch):
+    ui = FakeUI(["/session nope", "/session", None])
+    step = FakeStep()
+    platform = _platform(tmp_path, monkeypatch, ui, step)
+
+    asyncio.run(platform.run())
+
+    assert platform.session_id == "s1"  # 未命中就不动
+    texts = [e.text for e in ui.events if isinstance(e, Notice)]
+    assert any("没有找到会话 nope" in t for t in texts)
+    assert any("用法：/session" in t for t in texts)  # 无参数 → 用法提示
+    assert step.inputs == []
 
 
 def test_unknown_command_only_notifies(tmp_path, monkeypatch):

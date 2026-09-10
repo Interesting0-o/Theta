@@ -28,7 +28,7 @@ LangGraph 擅长的：把"一条 agent run"描述成带状态机、可中断、�
 5. **跨 run / 跨进程复用同一协议**：worker→主的审批回传已是 HTTP（收件箱 + 长轮询）；将来主→worker / @mention 复用同一套"事件 + resume"语义，只是换个送达方。
 6. **最小基座，先收敛命名、后引框架**：先把现有事件壳命名成清晰的"事件类型 + dispatch"，不急着上通用消息总线；仓库还小，够用再泛化。
 7. **基座不与前端耦合**：基座只经 `app/platform/ui.py::UI` 协议（三个方法：`emit` 渲染事件 / `read_line` 取一行输入 / `decide` 就一条待审请求问人）与外界说话，事件形状在 `app/schema/ui_schema.py`。基座**不 print、不读 stdin**；前端（`app/tui` 终端 / 将来的 web）只实现协议、不碰调度。**这层缝是为第二个前端而设**：换前端不该重写 run 生命周期与 park/resume 调度。`[已落地 · 终端一个前端]`
-   - 推论：**用户命令（`/init`…）是基座的控制面事件**（`app/platform/commands.py`），在"起 turn 之前"介入 `loop`——前端只负责把输入交上来、把 `Notice`/事件渲染出去，不解析命令。
+   - 推论：**用户命令（`/init`…）是基座的控制面事件**（`app/platform/commands/` 包：机制与命令表在 `__init__.py`，载荷在 `prompts.py`，各命令在 `session.py` 等），在"起 turn 之前"介入 `loop`——前端只负责把输入交上来、把 `Notice`/事件渲染出去，不解析命令。
 
 ## 3. 分层（放在上面的东西）
 
