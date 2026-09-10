@@ -10,8 +10,8 @@
 
 ## 1. 背景与问题
 
-- `AgentState.messages` 用 `add_messages` 无限累加（`app/agent/state.py`），仓库里**没有任何裁剪/摘要机制**（`grep RemoveMessage|summar|trim 零命中`）。
-- 跨轮靠 checkpoint（`app/main.py` 现为 `AsyncSqliteSaver`）持久化，所以每轮喂给模型的都是"全量历史 + 每轮重拼的系统消息"。
+- `AgentState.messages` 用 `add_messages` 累加（`app/agent/state.py`）；**已有轮末折叠**（`app/agent/nodes.py::CompactNode`，用 `RemoveMessage` 原位替换，见 §8），但没有**行内滚动折叠**（单轮超长编排内部仍会无限涨）。
+- 跨轮靠 checkpoint 持久化（现为 `AsyncSqliteSaver`，装配在 `app/platform/runtime.py`），所以每轮喂给模型的都是"当前历史 + 每轮重拼的系统消息"。
 - Token 大头几乎全在 `ToolMessage`：整文件读取、目录树、检索命中、命令输出、网页正文。而这些内容大多**时效极强**——文件一旦被改，几轮前的整文件 dump 就是纯噪声。
 
 ## 2. 现状：messages 里到底有什么
@@ -20,14 +20,14 @@
 
 | # | 消息 | 来源 | 特征 / 体积 |
 |---|---|---|---|
-| 1 | `HumanMessage` | `app/main.py`、`evaluation/runner.py` | 小；任务源头，不可重取 |
+| 1 | `HumanMessage` | 前端（`app/tui`）起 turn、`evaluation/runner.py` | 小；任务源头，不可重取 |
 | 2 | `AIMessage`(带 tool_calls) | `LLMNode` 返回 | 正文多为填充语；tool_calls 块负责**协议配对** |
 | 3 | `AIMessage`(不带 tool_calls) | 同上 | 任务的成品答复 |
 | 4 | `ToolMessage` | `ToolNode` / `OrchestrateNode` 回执 | **体积大头** |
 
 两个结构性事实（折叠必须利用）：
 
-- **计划不靠历史回显**：`current_plan` 独立存 state，`LLMNode` 每轮把当前计划重注入为 `# 当前任务`（`nodes.py:46-53`）。于是 `create_plan`/`update_plan_step` 每次整份回显的 ToolMessage 快照对模型**双重冗余**。
+- **计划不靠历史回显**：`current_plan` 独立存 state，`LLMNode` 每轮把当前计划重注入为 `# 当前任务`（见 `LLMNode.__call__` 的系统消息拼装处——**不复述行号**，它会漂）。于是 `create_plan`/`update_plan_step` 每次整份回显的 ToolMessage 快照对模型**双重冗余**。
 - **系统消息不进历史**：`SYSTEM_PROMPT` + 工作区上下文 + 计划回显都是临时拼装。折叠只作用于消息历史，与它们无关。
 
 ## 3. 不变量（折叠的安全边界，违反了模型调用就会炸）
@@ -138,31 +138,33 @@
 
 ### 7.5 工具集与 promote
 
-- **工具**（agent 侧 `InjectedState`，仿 orchestrate 模式）：`read_note(ref)` / `search_notes(q)` / `notes_by_topic(topic)` / `list_topics()` / `update_note_tags(...)` / `drop_note(ref)`。全文经 `read_note` 取回的是**短命 ToolMessage，随折叠走**；每轮注入模型只有索引行 `[notes#r3] 光伏市场调研（research · 2.1k）`。
-- **tool.json 登记**：read/search/by_topic/list 免审（只读/整理 state）；`update_note_tags` 免审（state 内元数据）；`drop_note` **需审**——丢的是尚未 promote 的一次性研究产出。
+- **工具**（agent 侧 `InjectedState`，仿 orchestrate 模式）：`read_note(ref)` `[已落地]`；`search_notes(q)` / `notes_by_topic(topic)` / `list_topics()` / `update_note_tags(...)` / `drop_note(ref)` **均未实现**。全文经 `read_note` 取回的是**短命 ToolMessage，随折叠走**。
+- **索引注入尚不存在**：设计的"每轮注入一行 `[notes#r3] …（research · 2.1k）`"**没有实现**——`LLMNode` 只注入 系统提示词 / 工作区 / 计划 / 项目画像 / 长期记忆 五条；模型目前**只能从折叠摘要行尾的"详情见 notes#rN"**感知笔记存在。（`app/agent/tools.py` 里 `read_note` 的 docstring 声称"notes 本身只注入一行索引"，与实现不符，待随本节一并校准。）
+- **tool.json 登记**：现状只登记 `read_note`（免审）。（设计的 `drop_note` 需审等，随工具未实现而不存在。）
 - **promote 不是新机制，是收尾动作**：研究告一段落、结论值得留档时，agent 用现有 `create_file`/`edit_file` 把提炼结论写进 repo（如 `docs/决策记录-<topic>.md` 或代码注释），走正常审批；notes 正文/URL 作引用来源。prompt 把这条列为研究类工具后的收尾习惯。
 
 ## 8. `compact_node`：滚动块折叠
 
 ### 8.1 触发位置
 
-第一版只做**轮边界折叠**：
+第一版只做**轮边界折叠**。设计原写"挂在 START 之后"，**实现改挂在 END 之前**（`llm_node` 判无 `tool_calls` 且历史超预算 → `compact_node` → `END`）：
 
 ```
-START ─► compact_node ─► llm_node ─► …
+START ─► llm_node ──(无 tool_calls 且超预算)──► compact_node ─► END
+             └──────(否则/有 tool_calls)──────► …
 ```
 
-依据 §3.4：新用户消息从 START 进入、`Command(resume)` 不从 START 进入 → 该节点**每轮只跑一次、恰在上轮结束后**，是折叠的最安全时机。
+两者时机等效（都在"上一轮已收尾、下一条用户消息之前"），但挂在 END 前省掉每轮一次节点执行、也让"是否需要折"与"这轮是否结束"共用同一个判定（`needs_compact` 与路由同源，见 `app/agent/graph.py::route_after_llm`）。`[已落地]`
 
-二期（单个超长编排内部的滚动折叠）在 `tool_node → llm_node`、`orchestrate_node → llm_node` 回边加预算触发，靠 §8.3 的"保留区"保护刚返回、待模型反应的块。
+二期（单个超长编排内部的滚动折叠）仍在 `tool_node → llm_node`、`orchestrate_node → llm_node` 回边加预算触发，靠 §8.3 的"保留区"保护刚返回、待模型反应的块。`[未做]`
 
 ### 8.2 折叠算法
 
 预算超限才动手，否则原样直通（零成本、幂等）：
 
-1. 算消息总成本（字符或块数，见 §8.4）；未超预算 → 不变。
-2. **保留区** = 最近 `keep_blocks` 个块 + 最后一条消息起的尾部，原样保留（覆盖模型正在迭代/收尾的部分；最新一批工具结果必须留到 END 供模型总结）。
-3. **折叠区** = 保留区之前的消息。沿块边界整块剪除（见 §3.1）：从头部起，只允许把剪裁点定在"紧挨某 `AIMessage(tool_calls)` 之前"或历史起点；被剪块的可重取内容不重建为消息（省 token）。
+1. 算消息总成本（字符数，见 §8.4）；未超预算 → 不变。
+2. **保留区** = **最后一条 `HumanMessage` 及其后的全部内容**（= 当前轮），原样保留——最新一批工具结果必然留到本轮收尾供模型总结。**实现里没有 `keep_blocks` 计数**：锚点就是"当前轮从哪开始"，比按块数保留更贴语义。
+3. **折叠区** = 最后一条 `HumanMessage` 之前的消息。沿块边界整块剪除（见 §3.1）：只折**完整**的工具块（`AIMessage(tool_calls)` + 兑现它的全部 ToolMessage，缺一条就整块跳过）；被剪块的可重取内容不重建为消息（省 token）。
 4. 产出新 `messages` 写回 state（决定性地；对相同输入产生相同输出，便于无 LLM 单测固化）。
 
 一个前提：**别先污染再清理**——`OrchestrateNode`/`ToolNode` 仍按现状把回执写入历史（这是协议需要的），折叠在轮边界统一处理冗余，不在写入时做特判。
@@ -184,8 +186,8 @@ START ─► compact_node ─► llm_node ─► …
 
 ### 8.4 预算与触发阈值
 
-- 无 tiktoken 类本地分词：DeepSeek 走 OpenAI 兼容，token 数在 agent 侧不可精确算。用**字符数与块数双阈值**近似，留环境变量覆盖（如 `CONTEXT_BUDGET_CHARS`、`CONTEXT_KEEP_BLOCKS`），默认值按目标模型上下文保守取，实测再调。
-- **不走 `app/config.py` 的 Settings**：该文件字段全无默认值、须在 `.env` 出现（历史约定）。预算阈值属于可调内部参数，用模块常量 + `os.environ` 覆盖即可，避免每次加参都动 `.env`（与 `WORKSPACE_PATH` 走纯 env 的先例一致）。
+- 无 tiktoken 类本地分词：DeepSeek 走 OpenAI 兼容，token 数在 agent 侧不可精确算。**实现只用了字符数单阈值**（`_CONTEXT_BUDGET_DEFAULT = 60000`，`nodes.py`），**没有块数阈值、也没有 env 覆盖**——阈值经 `CompactNode(content_budget_chars=…)` 构造参数可调，`needs_compact(state, budget)` 与路由共用同一口径。
+- **不走 `app/config.py` 的 Settings**：该文件字段全无默认值、须在 `.env` 出现（历史约定）。预算阈值属于可调内部参数，用模块常量 + 构造参数即可，避免每次加参都动 `.env`。（原记的"与 `WORKSPACE_PATH` 走纯 env 的先例一致"**已失效**：工作区自 2026-09-10 起是图的构造期参量，不再是 env 输入。）
 
 ### 8.5 折叠前后示意
 
@@ -218,22 +220,23 @@ AIMessage(no tool_calls): 已实现并验证通过…
 
 ## 9. 落地清单（改动面）
 
-| 文件 | 改动 |
+| 文件 | 改动（`[x]` = 2026-09-10 已核对落地，`[ ]` = 未做） |
 |---|---|
-| `app/agent/state.py` | 新增 `work_log: list[WorkLogEntry]`、`notes: dict[str, NoteEntry]`（含 WorkLogEntry/NoteEntry 类型） |
-| `app/agent/nodes.py` | `ToolNode` 执行后追加"意图(content)+机器 verdict"日志；`ReviewNode` 被拒时并行补 `status=denied` 条目；新增 `compact_node`；`LLMNode` 注入 `# 会话工作日志` 与 notes 索引 |
-| `app/agent/tools.py` | 新增 agent 侧 note 工具（read/search/by_topic/list/update_tags/drop，`InjectedState`）；定义"state 消费"工具集及消费节点路由（仿 orchestrate 或收敛为一个 state-tool node） |
-| `app/agent/graph.py` | `START → compact_node → llm_node`；二期加 tool/orchestrate 回边预算触发 |
-| `app/agent/prompt.py` | tool 轮 content 写一句话工作日志（非最终答复）；notes 存在与 `read_note` 取回；promote 收尾习惯；折叠语义（"旧工具输出不会回来，需重取/读 notes"） |
-| `app/agent/tool.json` | note 工具审批登记（读类免审；`drop_note` 需审） |
-| `app/agent/mcp.py` 或常量模块 | 预算阈值常量 + env 覆盖 |
-| `tests/`（新增 `test_context_*`） | scripted AIMessage 驱动：折叠块不拆、保留区不动、幂等、预算触发、悬空不产生；work_log 双半行拼接；denied 条目 |
+| `app/agent/state.py` | `[x]` `notes: dict[str, NoteEntry]`（`NoteEntry` 在 `app/schema/agent_schema.py`）；`[ ]` `work_log: list[WorkLogEntry]` |
+| `app/agent/nodes.py` | `[x]` 新增 `CompactNode`（轮末折叠）；`[x]` `ReviewNode` 被拒时回灌带 `decision=denied` 戳的消息；`[ ]` ToolNode 的"意图 + verdict"日志条目；`[ ]` `LLMNode` 注入 `# 会话工作日志` 与 notes 索引（现只注入 提示词/工作区/计划/画像/记忆） |
+| `app/agent/tools.py` | `[x]` `read_note`（`InjectedState`，source=`notes`）；`[ ]` `search_notes` / `notes_by_topic` / `list_topics` / `update_note_tags` / `drop_note` |
+| `app/agent/graph.py` | `[x]` `compact_node` 已接线（位置：`llm_node` 无 tool_calls 且超预算 → compact → END，见 §8.1）；`[ ]` 二期回边预算触发 |
+| `app/agent/prompt.py` | `[x]` tool 轮 content 写一句话工作日志（"工作基调 8"）；`[x]` 折叠语义（"旧输出不会回来、需重取"）；`[ ]` notes/`read_note` 用法与 promote 收尾习惯 |
+| `app/agent/tool.json` | `[x]` `read_note` 免审登记；`[ ]` 其余 note 工具（`drop_note` 需审那条随未实现而缺席） |
+| 预算阈值 | `[x]` 常量 `_CONTEXT_BUDGET_DEFAULT = 60000` + `CompactNode(content_budget_chars=…)` 构造参数；`[ ]` env 覆盖与块数阈值（§8.4） |
+| `tests/` | `[x]` `tests/test_compact_node.py`（脚本化消息驱动：只折完整块、保留当前轮、幂等、预算门）与 `tests/test_review_routing.py`；`[ ]` work_log 双半行与 denied 条目的测试（随该机制未做） |
 
 > 折叠是**纯确定性逻辑**（不依赖 LLM），机制层单测即可固化——复用 `tests/test_review_routing.py` 的"假消息驱动节点"模式，无需真实模型/token。
 
 ## 10. 分期
 
-- **P0（首期）**：`work_log` 结构化双半行 + `denied` 条目；notes 会话级 state dict + `read_note/search` + 懒分类工具；START 轮边界 `compact_node`；promote 收尾引导。收益最大、风险最低（§3.4 保证只在轮界动手）。
+- **P0（首期）**：`work_log` 结构化双半行 + `denied` 条目；notes 会话级 state dict + `read_note/search` + 懒分类工具；轮边界 `compact_node`；promote 收尾引导。收益最大、风险最低（只在轮界动手）。
+  - **进度（2026-09-10 核对）**：`notes` 会话级 dict `[已落地]`、`read_note` `[已落地]`、轮边界 `compact_node` `[已落地]`（位置改在 END 前，见 §8.1）、审批被拒时回灌 `[approval_denied]` 消息 `[已落地]`（但**不是**设计里的 work_log `status=denied` 条目）。**未做**：`work_log`（含 verdict/意图双半行）、`search_notes`/懒分类工具、notes 索引注入、promote 收尾引导。
 - **P1**：同轮超长编排的滚动折叠（§8.1 回边触发），加 `keep_blocks` 保留区压力测试；notes 归档阈值/容量标定。
 - **P2（评估接线）**：evaluation 增加"上下文/轮数/token"断言，量化折叠前后达成率与成本；为 §8.4 阈值与"意图半行 token 增量/遵从率"提供实测依据。
 

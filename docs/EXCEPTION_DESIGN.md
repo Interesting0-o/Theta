@@ -2,6 +2,8 @@
 
 > 本文档记录 $\theta$ 异常体系的设计讨论与结论，作为后续实现的参考。
 > 核心主题：**异常的边界是语义过滤器——它决定什么信息能进入大模型的推理。**
+>
+> 状态标注：`[已落地]` = 已实现；未标注 = 目标态。**2026-09-10 校准过一次**：失效标识符（`WORKSPACE_ROOT`、`_workspace_root()`/`_resolve_within_workspace()`、`ToolExecutionError`）与已实现的落地清单已按代码现值更新；它仍是**设计文档**（保留目标态叙述），不是现状说明书。
 
 ---
 
@@ -50,7 +52,7 @@ class AgentModuleError(AgentError): ...    # 错
 
 | 层 | 载体 | 谁消费 | 粒度 | 职责 |
 | --- | --- | --- | --- | --- |
-| 异常类 | `ToolExecutionError` | 程序代码（`except`） | 粗 | "这是工具失败" |
+| 异常类 | `AgentError` 家族（如 `WorkspaceViolationError`） | 程序代码（`except`） | 粗 | "这是哪一类我们要识别的失败" |
 | 结果标记 | `ToolResult.error_type` | 边界数据 | 中 | "是哪一类失败"（`not_found`/`permission`/`io_error`） |
 | 消息正文 | `ToolMessage.content` | **大模型** | 细 | "为什么失败、哪个路径、errno 是什么" |
 
@@ -101,13 +103,15 @@ class InvalidArgumentError(AgentError):
     """工具参数非法（违反输入契约，调用方可修正重试）。guard 依类名归成 invalid_argument。"""
 ```
 
+> `[已落地]` 上面前四类都在 `app/exception.py`。**`ToolExecutionError` 未建**——§2.6 的结论是"操作失败就地 `return ToolResult`，不需要类"，故按下表 Q2 那一行（"代码层反应相同"）不成立为独立类；`ToolResult.error_type` 承担了它的角色。
+
 设计依据（Q1/Q2/Q3 逐条验证）：
 
 | 异常 | Q1 可预期 | Q2 反应不同 | Q3 跨模块 |
 | --- | --- | --- | --- |
 | `ConfigError` | ✅ 配置条件缺失，说得清 | ✅ 启动即停+引导，与"喂回模型继续"本质不同 | ✅ 抛在 config/file_io，接在 main/guard |
 | `WorkspaceViolationError` | ✅ 沙箱规则明确 | ✅ 安全事件：记日志、警告，不是普通失败 | ✅ write/terminal 跨工具共用 |
-| `ToolExecutionError` | ✅ 工具操作失败 | ⚠️ 代码层反应相同 → 与"内部 bug"区分即可 | ✅ 所有工具共用 |
+| ~~`ToolExecutionError`~~（**未建**） | ✅ 工具操作失败 | ⚠️ 代码层反应相同 → 与"内部 bug"区分即可 | ✅ 所有工具共用 |
 | `InvalidArgumentError` | ✅ 参数非法，说得清 | ✅ 输入错模型要修要重试，区别于"内部 bug 别管" | ✅ 各工具参数校验共用 |
 
 ---
@@ -117,33 +121,33 @@ class InvalidArgumentError(AgentError):
 分类只做一次，收敛到工具边界。`error_type` 是数据，能安全穿过 MCP 边界；异常类型不行。
 
 ```python
-# mcp_service —— guard：唯一的分类点
-import functools
-import logging
-
-from app.exception import AgentError
-from app.schema.agent_schema import ToolResult
-
-logger = logging.getLogger(__name__)
-
+# mcp_service/utils.py —— guard：唯一的分类点（[已落地]；同步/异步工具都支持）
 def guard(fn):
     @functools.wraps(fn)
-    def wrapped(*args, **kwargs):
+    def _sync_wrapped(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
-        except AgentError as e:
-            # ① 可预期业务失败 → 模型该分析、该调整
-            return ToolResult(success=False, error_type=type(e).__name__, content=str(e))
-        except Exception:
-            # ② 内部 bug → 模型别管，开发者来修
-            logger.exception("工具 %s 发生未预期异常", fn.__name__)   # traceback 全留
-            return ToolResult(
-                success=False,
-                error_type="internal_error",
-                content="工具内部错误（非输入问题），无需重试。",
-            )
-    return wrapped
+        except Exception as exc:            # 有意兜底全部异常：这是最后一层网
+            return _error_result(fn.__name__, exc)
+    # async 版同形（await fn(...)），靠 inspect.iscoroutinefunction 分派
+    return _sync_wrapped
+
+def _error_result(fn_name: str, exc: BaseException) -> ToolResult:
+    if isinstance(exc, AgentError):
+        # ① 可预期业务失败 → 模型该分析、该调整
+        return ToolResult(success=False, error_type=_type_token(type(exc)), content=str(exc))
+    # ② 内部 bug → 模型别管，开发者来修（必须在 except 块内调用才能取到 traceback）
+    logger.exception("工具 %s 发生未预期异常", fn_name)
+    return ToolResult(
+        success=False,
+        error_type="internal_error",
+        content="工具内部错误（非输入问题），无需重试。",
+    )
 ```
+
+> **`error_type` 不是类名**：`_type_token(type(exc))` 把 `WorkspaceViolationError` 转成
+> `workspace_violation`（去 `Error`/`Exception` 后缀 → 驼峰转小写下划线），与 §10 L3 的断言一致。
+> 早期伪码写的 `error_type=type(e).__name__` 会得到 `"WorkspaceViolationError"`，已按实现更正。
 
 工具函数遵循一个关键模式——**`resolve` 放 try 外面**，让越界异常冒泡给 guard，而不是被工具自己的 `except` 吞掉：
 
@@ -151,7 +155,7 @@ def guard(fn):
 @mcp.tool()
 @guard
 def write_file(path: str, content: str) -> ToolResult:
-    file_path = _resolve_within_workspace(path)   # 越界 → WorkspaceViolationError 冒泡给 guard
+    file_path = _resolve_path(path)       # 越界 → WorkspaceViolationError 冒泡给 guard
     try:
         file_path.write_text(content)
     except OSError as e:
@@ -161,26 +165,38 @@ def write_file(path: str, content: str) -> ToolResult:
 
 ### 工作区守卫
 
+`[已落地]` 在 `mcp_service/file_io.py`（`git.py` 同款）。**环境变量是 `WORKSPACE_PATH`**（早期伪码写的 `WORKSPACE_ROOT` 从未存在）；工作区在 **import 时**读取并校验，**不存在即 `ConfigError`**：
+
 ```python
 import os
 from pathlib import Path
 
 from app.exception import ConfigError, WorkspaceViolationError
 
-def _workspace_root() -> Path:
-    root = os.environ.get("WORKSPACE_ROOT")
-    if not root:
-        raise ConfigError("未配置 WORKSPACE_ROOT 环境变量")   # 没配则 fail-fast，不放行
-    return Path(root).expanduser().resolve()
+_workspace_path = os.environ.get("WORKSPACE_PATH")
+if not _workspace_path:
+    raise ConfigError("WORKSPACE_PATH 未设置")            # 没配则 fail-fast，不放行
+WORKSPACE_PATH = Path(_workspace_path).resolve()
+if not WORKSPACE_PATH.exists():
+    raise ConfigError(f"agent工作区路径{WORKSPACE_PATH} 不存在")
 
-def _resolve_within_workspace(path: str) -> Path:
-    """解析真实路径并校验在工作区内，越界抛 WorkspaceViolationError。"""
-    resolved = Path(path).expanduser().resolve()      # 干掉 ../ 和符号链接
-    ws = _workspace_root()
-    if not resolved.is_relative_to(ws):
-        raise WorkspaceViolationError(str(resolved), str(ws))
-    return resolved
+def _resolve_path(path: str) -> Path:
+    """相对路径以工作区为基准解析成绝对路径；resolve() 干掉 ../ 与符号链接。"""
+    raw = Path(path).expanduser()
+    if not raw.is_absolute():
+        raw = WORKSPACE_PATH / raw        # 关键：**不**基于 cwd（子进程 cwd 是项目根）
+    return raw.resolve()
+
+def _is_in_workspace(path: Path) -> None:
+    """越界即抛 WorkspaceViolationError（调用方放在 try 之外，让它冒泡给 guard）。"""
+    if not path.is_relative_to(WORKSPACE_PATH):
+        raise WorkspaceViolationError(str(path), str(WORKSPACE_PATH))
 ```
+
+> 与早期伪码的三处差异：① 函数叫 `_resolve_path` + `_is_in_workspace`（不是 `_resolve_within_workspace`）；
+> ② 根是模块级常量 `WORKSPACE_PATH`（不是每次调用再读 env 的 `_workspace_root()`）——"以哪个目录为界"
+> 进进程就定死，工具调用期不会被环境变动挪动边界；③ 相对路径**以工作区为基准**（不是 cwd——MCP 子进程
+> 的 cwd 是项目根，按 cwd 解析会让相对路径落到工作区外被误判越界）。
 
 ---
 
@@ -189,7 +205,7 @@ def _resolve_within_workspace(path: str) -> Path:
 分类已在 guard 完成，`ToolNode` 收到的全是已分类的 ToolResult，只需提取正文。`except Exception` 在 ToolNode 仅剩一个职责：**MCP 传输层本身挂了**（机制故障，非工具逻辑）。
 
 ```python
-# app/agent/nodes.py —— ToolNode
+# app/agent/utils.py —— format_tool_result（[已落地]；ToolNode 与编排节点共用）
 from app.schema.agent_schema import ToolResult
 
 def format_tool_result(result) -> str:
@@ -199,6 +215,10 @@ def format_tool_result(result) -> str:
     if isinstance(result, dict):
         return result.get("content", str(result))
     return str(result)
+```
+
+> 位置注意：它在 **`app/agent/utils.py`**（早期本节写作"写在 nodes.py"，已按现值更正）；还额外支持
+> MCP adapter 的 content-block 列表形态（逐块取 `text`、`json.loads` 还原 `ToolResult` 后走前缀分支）。
 
 async def __call__(self, state: AgentState) -> dict | AgentState:
     tool_calls = list(state.get("approved_tool_calls", []))
@@ -217,8 +237,9 @@ async def __call__(self, state: AgentState) -> dict | AgentState:
             result = await tool_obj.ainvoke(tool_call.get("args", {}))
             content = format_tool_result(result)      # "[workspace_violation] 路径越界: ..."
         except Exception as exc:
-            logger.exception("工具调用机制失败: %s", tool_name)   # 传输层故障，留 traceback
-            content = "[内部错误] 工具调用失败（非输入问题），请检查服务状态。"
+            # 传输层故障（MCP 子进程挂了/协议错）——留 traceback，正文给事实
+            result_content = f"工具执行失败: {exc}"
+            extra = {"error_type": "tool_error"}
         results.append(ToolMessage(content=content,
                                     tool_call_id=tool_call.get("id", "unknown"),
                                     name=tool_name))
@@ -245,7 +266,7 @@ except ValidationError as exc:
     sys.exit(1)
 ```
 
-> ⚠️ 前提：`get_settings()` 必须**懒加载**。当前 `model.py` / `tools.py` 在模块顶层调用 `get_settings()`，会让异常在 import 时就崩、根本走不进入口的 try。需要把模块顶层的调用挪进函数内。
+> ⚠️ 前提：`get_settings()` 必须**懒加载**。当前 `app/agent/model.py` 在模块顶层调用 `get_settings()`（`tools.py` 已无该调用），会让异常在 import 时就崩、根本走不进入口的 try。需要把模块顶层的调用挪进函数内。**这项仍未做**（入口翻译 `ValidationError → ConfigError` 也未落地）。
 
 ---
 
@@ -275,14 +296,14 @@ except ValidationError as exc:
 
 ## 9. 落地清单
 
-- [ ] `app/exception.py`：`AgentError` + `ConfigError` + `WorkspaceViolationError` + `ToolExecutionError` + `InvalidArgumentError`
-- [ ] `app/schema/agent_schema.py`：`ToolResult` 增加 `error_type` 字段
-- [ ] `mcp_service/`：`guard` 装饰器（含 internal_error 桶）+ `_resolve_within_workspace` + `_workspace_root`
-- [ ] 各文件工具：`resolve` 移出 try，操作失败保留 `except OSError → ToolResult`
-- [ ] `app/agent/nodes.py`：`ToolNode` 用 `format_tool_result` 提取正文，`except Exception` 仅留作传输层兜底
-- [ ] `app/config.py` / `app/agent/mcp.py`：`WORKSPACE_ROOT` 配置 + 注入 MCP 子进程 env
-- [ ] `get_settings()` 懒加载，入口翻译 ValidationError → ConfigError 引导
-- [ ] 测试：越界拒绝（绝对路径/`../`/符号链接）、工作区内放行、`internal_error` 不冒充工具失败
+- [x] `app/exception.py`：`AgentError` + `ConfigError` + `WorkspaceViolationError` + `InvalidArgumentError`（**`ToolExecutionError` 未建**，见 §2.6/§3）
+- [x] `app/schema/agent_schema.py`：`ToolResult` 增加 `error_type` 字段
+- [x] `mcp_service/utils.py`：`guard` 装饰器（含 `internal_error` 桶，同步/异步都支持）+ 分类用 `_type_token`；`mcp_service/file_io.py`：`_resolve_path` + `_is_in_workspace`（原拟名 `_resolve_within_workspace`/`_workspace_root`）
+- [x] 各文件工具：`resolve` 移出 try，操作失败保留 `except OSError → ToolResult(io_error)`
+- [x] `app/agent/utils.py`：`format_tool_result` 提取正文（`ToolNode` 调它）；`ToolNode` 的 `except Exception` 仅作传输层兜底（正文 `工具执行失败: …`、`error_type="tool_error"`）
+- [x] MCP 子进程 env 注入工作区：**`WORKSPACE_PATH`**（不是 `WORKSPACE_ROOT`），由 `app/agent/mcp.py::_build_servers` 注入；`app/config.py` 不参与（工作区已是图的构造期参量）
+- [ ] `get_settings()` 懒加载（现在 `app/agent/model.py` 顶层调用），入口翻译 `ValidationError → ConfigError` 引导
+- [x] 测试：越界拒绝（绝对路径/`../`/符号链接）、工作区内放行、`internal_error` 不冒充工具失败（`tests/test_guard.py`、`tests/test_file_io_sandbox.py`）
 
 ---
 
@@ -304,10 +325,12 @@ except ValidationError as exc:
 ### L1 异常体系
 
 ```python
-from app.exception import AgentError, ConfigError, WorkspaceViolationError, ToolExecutionError
+from app.exception import (
+    AgentError, ConfigError, InvalidArgumentError, WorkspaceViolationError,
+)
 
 def test_all_domain_exceptions_share_root():          # 验证 Q3 决策
-    for cls in (ConfigError, WorkspaceViolationError, ToolExecutionError):
+    for cls in (ConfigError, WorkspaceViolationError, InvalidArgumentError):
         assert issubclass(cls, AgentError)
 
 def test_workspace_violation_carries_structured_fields():
@@ -323,17 +346,19 @@ def test_workspace_violation_carries_structured_fields():
 ```python
 @pytest.fixture
 def ws(tmp_path, monkeypatch):
-    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))   # 环境隔离，防测试互相污染
+    # 工作区在 import 期就定死，所以隔离靠 monkeypatch 模块全局（不是改 env）
+    monkeypatch.setattr(file_io, "WORKSPACE_PATH", tmp_path)
     return tmp_path
 
 def test_outside_path_rejected(ws):
     with pytest.raises(WorkspaceViolationError):
-        _resolve_within_workspace("/etc/passwd")          # 绝对路径逃逸
+        file_io._is_in_workspace(file_io._resolve_path("/etc/passwd"))   # 绝对路径逃逸
     with pytest.raises(WorkspaceViolationError):
-        _resolve_within_workspace("../outside.txt")        # 相对路径逃逸
+        file_io._is_in_workspace(file_io._resolve_path("../outside.txt"))  # 相对路径逃逸
 
 def test_inside_path_allowed(ws):
-    assert _resolve_within_workspace("demo.txt") == ws / "demo.txt"
+    assert file_io._resolve_path("demo.txt") == ws / "demo.txt"   # 相对路径以工作区为基准
+
 ```
 
 ### L3 边界分类（最重要的测试）
@@ -379,5 +404,7 @@ def test_format_tool_result_prefixes_error_type():
 运行：
 
 ```bash
-uv run pytest
+WORKSPACE_PATH=/tmp python -m pytest        # 需 `python -m`（包未安装）+ 导出 WORKSPACE_PATH
 ```
+
+> （`.venv/Scripts/python.exe` 或 `uv run python -m pytest` 均可；关键是 `-m pytest` 与 `WORKSPACE_PATH` 两条前提。）

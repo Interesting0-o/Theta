@@ -29,7 +29,9 @@
 - 🔍 **检索基建**：`read_file` 行号分段读、`glob` 按路径定位、`search_content` 内容检索（大小写 / 正则可配），大仓库不整段读
 - 🌐 **联网检索四件套**：`web_search` / `extract_urls` / `crawl_website` / `deep_research`（内置 Tavily）
 - 🖥️ **终端进程管理器**：一次性 `run_command`（到点不杀、转入受管句柄）+ 常驻 `start_process` + `process_*` 生命周期管理
-- 💾 **会话持久化**：SQLite（`SqliteSaver`）保存对话、审批队列与计划，重启后接着聊
+- 💾 **会话持久化**：SQLite（`AsyncSqliteSaver`）保存对话、审批队列与计划——**每个会话一个库**（`resource/<工作区>/sessions/<id>/agent.db`），重启后可与历史会话切换续聊（`/list session`、`/session <id>`）
+- 🧠 **跨会话记忆 + 项目画像**：工作区私有长期记忆（`write_memory`/`read_memory`，每轮注入）+ 工作区根的项目画像 `AGENT.md`（`/init` 生成，会话首启注入）
+- 🧩 **斜杠命令**：`/help` 看全集；`/list session` 列会话、`/new session` 新建、`/session <id>` 切换；`/init` 让 agent 通读工作区生成项目画像
 - ☁️ **部署友好**：直接对接 LangGraph CLI / Platform
 
 ## 🚀 快速开始（60 秒上手）
@@ -128,7 +130,7 @@ START ─► llm_node ──(有 tool_calls)──► queue_node ─► review_n
 
 几个关键点：
 
-- **审批用 interrupt 而非条件分支**：每个需审的 `tool_call` 各自 `interrupt()` 一次，所以一次请求可能挂起多次；TUI 捕获 `__interrupt__` 后格式化成面板，收到 `y/n` 后用 `Command(resume={"approved": ...})` 恢复执行。
+- **审批用 interrupt 而非条件分支**：每个需审的 `tool_call` 各自 `interrupt()` 一次，所以一次请求可能挂起多次；基座（`app/platform`）把中断入统一 broker 并 park 住 run，前端（终端 TUI）只负责画面板、收 `y/n`，基座再以 `Command(resume={"approved": ...})` 续跑——**阻塞图、不阻塞进程**，因此主 agent 等审批时 worker 的审批照样能被服务。
 - **编排工具无真实副作用**：只更新会话内、跨轮持久化的 `current_plan`（create_plan 拆步 → 按步 update_plan_step 推进 → clear_plan），因此天然免审。
 - **审批策略与工具归属集中在 `app/agent/tool.json`**（`need_review` + `source`）：
 
@@ -145,33 +147,48 @@ START ─► llm_node ──(有 tool_calls)──► queue_node ─► review_n
 
 ```
 theta/
-├── app/                        # agent 本体（LangGraph 状态机；命名空间包）
-│   ├── main.py                 # 交互式 TUI：捕获 interrupt → 审批面板 → Command(resume)
+├── app/                        # agent 本体 + 主程序壳（命名空间包）
+│   ├── main.py                 # 程序入口（薄壳）：调 app.tui.run_tui()
 │   ├── config.py               # 环境配置（pydantic-settings，读 .env）
-│   ├── exception.py            # AgentError 异常体系（Config / WorkspaceViolation / InvalidArgument）
-│   ├── agent/
-│   │   ├── graph.py            # 状态图构建与条件路由（langgraph.json 注册为 my_agent）
-│   │   ├── state.py            # AgentState：消息 / 审批队列 / current_plan
-│   │   ├── nodes.py            # LLM / Queue / Review / Orchestrate / Tool 节点
+│   ├── exception.py            # AgentError 体系（ConfigError / WorkspaceViolationError / InvalidArgumentError）
+│   ├── resource.py             # 落盘路径单点：workspace_key / session_db_path / memory_root
+│   ├── platform/               # 事件基座（"图外面那层"；不 print、不读 stdin）
+│   │   ├── loop.py             # AgentPlatform：主事件循环（drain 待批 → 等 turn → 等输入）
+│   │   ├── approvals.py        # 统一审批 broker：队列 + 薄 HTTP 收件箱 + 排空/回填
+│   │   ├── turn.py             # 一次 run 的驱动原语：drive_turn（park/resume）+ _race
+│   │   ├── runtime.py          # 按 (工作区, 会话) 装配 db / checkpointer / 图
+│   │   ├── ui.py               # UI 协议（emit / read_line / decide）
+│   │   └── commands/           # 控制面命令：/init /help /list session /new session /session
+│   ├── tui/                    # 终端前端（只取输入 + 渲染事件，不碰调度）
+│   │   ├── input.py            # stdin 单 reader 线程 + pump（一问一答）
+│   │   ├── panels.py           # 审批面板 / 标题框 / 截断（纯渲染）
+│   │   ├── ui.py               # TerminalUI：实现 UI 协议
+│   │   └── runner.py           # run_tui()：解析启动工作区 → 组 UI + 基座 → 跑
+│   ├── agent/                  # 图本体
+│   │   ├── graph.py            # 状态图构建与条件路由（langgraph.json 的注册入口在此文件）
+│   │   ├── state.py            # AgentState：消息 / 审批队列 / current_plan / notes
+│   │   ├── nodes.py            # LLM / Queue / Review / Orchestrate / Tool / Compact 节点
 │   │   ├── prompt.py           # 系统提示词：行为契约 + 工作区上下文
 │   │   ├── model.py            # 聊天模型初始化（OpenAI 兼容）
 │   │   ├── mcp.py              # 以 stdio 子进程拉起四个 MCP server 并收集工具
-│   │   ├── tools.py            # 编排工具 create_plan / update_plan_step / clear_plan
+│   │   ├── tools.py            # agent 侧工具：编排 / read_note / dispatch / 记忆读写
+│   │   ├── memory.py           # 长期记忆 memory.md 的读写与注入渲染
+│   │   ├── profile.py          # 项目画像 AGENT.md 的读取
+│   │   ├── utils.py            # format_tool_result / coerce_tool_result（工具结果归一化）
 │   │   └── tool.json           # 审批策略集中登记（need_review / source）
-│   └── schema/agent_schema.py  # ToolResult / PlanStep 数据模型
-├── mcp_service/                # MCP 服务器（各自独立子进程，import 时校验 WORKSPACE_PATH）
-│   ├── file_io.py              # 文件读写 + WORKSPACE_PATH 沙箱（相对路径解析 / 符号链接消解）
+│   └── schema/                 # 数据形状（agent / approval / ui / session 四个域）
+├── mcp_service/                # MCP 服务器（各自独立子进程）
+│   ├── file_io.py              # 文件操作 + WORKSPACE_PATH 沙箱（import 时校验该 env）
 │   ├── terminal.py             # 终端进程管理器（任意命令 + 进程组托管 + sudo 硬拒绝）
 │   ├── git.py                  # git 仓库操作（向下查找仓库；读免审、写需审）
 │   ├── web_search.py           # Tavily 联网检索四件套 + 上游失败翻译
+│   ├── sub_agent.py            # worker（子 agent）MCP server：run_subtask（spawn 即走，只读）
 │   └── utils.py                # guard 异常收口装饰器（只 return 不 raise）
 ├── evaluation/                 # 模型行为评估框架（真实 LLM + 自动审批策略）
-├── tests/                      # 机制层 pytest 单测（沙箱 / guard / 审批路由 / 计划）
-├── docs/                       # 设计文档（索引见 docs/README.md）
-│   ├── EXCEPTION_DESIGN.md     # 异常体系设计
-│   └── CONTEXT_ENGINEERING.md  # 上下文工程（消息留存 / 折叠）
-├── resource/                   # 运行时数据（SQLite agent.db，gitignore）
-├── langgraph.json              # LangGraph CLI/Platform 注册（my_agent → app/agent/graph.py）
+├── tests/                      # 机制层 pytest 单测（沙箱 / guard / 审批路由 / 计划 / 会话命令）
+├── docs/                       # 设计文档（六篇 + 索引，见 docs/README.md）
+├── resource/                   # 运行时数据（gitignore）：<ws_key>/{sessions/<sid>/agent.db, memory/}
+├── langgraph.json              # LangGraph CLI/Platform 注册（my_agent → get_main_agent_graph_langgraph）
 └── pyproject.toml              # 项目与依赖定义
 ```
 
@@ -185,6 +202,8 @@ WORKSPACE_PATH=/tmp uv run python -m pytest tests/test_file_io.py # 单文件
 WORKSPACE_PATH=/tmp uv run python -m pytest tests/test_guard.py   # 异常/guard 层
 WORKSPACE_PATH=/tmp uv run python -m pytest tests/test_terminal.py  # 终端进程管理器
 ```
+
+> Windows（PowerShell）：`$env:WORKSPACE_PATH="$env:TEMP"` 后再跑 `python -m pytest`——该 env 指向的目录必须**包住** pytest 的 tmp。
 
 > `app/config.py` 在 import 阶段就读 `.env`，跑测试/启动前 `.env` 必须存在（键全、值可空）。`tests/test_file_io_sandbox.py` 的符号链接逃逸用例在 Windows（无符号链接权限）会 skip。
 
@@ -227,7 +246,7 @@ langgraph build        # 构建可部署镜像
 
 单 agent 闭环（执行 / 审批 / 计划）已通，以下为纵深方向（2026-09 规划）：
 
-- [ ] **多 Agent 编排**：通过 MCP 服务拉起多个子 agent。**子 agent 的敏感操作仍统一走人工审批闸门**；编排模式按**子任务耦合度**选择——相互独立（如"逐季分析 2024–2026 财报"）→ 各干各的并行分发；依赖清晰（如"做一个含前后端 + 数据库的购物网站"）→ **DAG 拓扑**编排（下游消费上游产出，把 create_plan 的线性步骤推广为带依赖的图 + 就绪调度）。待定：子 agent 审批回流机制、DAG 调度器、结果归并。**设计草稿见 [`docs/MULTI_AGENT.md`](docs/MULTI_AGENT.md)**
+- [x] **多 Agent 编排（并行分发已落地）**：通过 MCP 服务拉起多个子 agent——`dispatch_subtasks` 一次派发多个**相互独立**的调研子任务，各自 spawn 独立 worker 进程并发执行；worker 只读工作区 + 可联网检索，敏感动作（联网四件套）经 **HTTP 回传进主侧统一审批闸门**；结论回主 agent 归并。**未做的是 DAG 拓扑编排与依赖调度**（下游消费上游产出 + 就绪调度）、以及子 agent 写权限下放。**设计草稿见 [`docs/MULTI_AGENT.md`](docs/MULTI_AGENT.md)**
 - [ ] **反思节点（reflect-before-act）**：在 llm_node 拟调用 tool_calls 之后、进入人工审核之前，用**另一模型**审计一次拟执行操作（不同模型常有不同视角，容易揪出主模型盲点）；被否决则把**理由回灌主模型重想**。反思次数必须有**上限**——按实测，**单次反思收益已足够大，可先只做一次**，再做"多次 vs 收益"的评估对比
 - [ ] **Web UI**：FastAPI（web 依赖组已预留）暴露 SSE + 审批端点，把人工审批与计划可视化搬到浏览器
 - [ ] Web API 服务层（FastAPI）暴露 REST / SSE 接口

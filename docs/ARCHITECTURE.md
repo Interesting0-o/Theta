@@ -50,8 +50,9 @@ LangGraph 擅长的：把"一条 agent run"描述成带状态机、可中断、�
 │  · 关键点 interrupt 作为事件输入端口          [已落地]       │
 ├─────────────────────────────────────────────────────────┤
 │  状态 / 记忆 / 项目画像（会话、workspace）                  │
-│  · 会话 checkpoint（按 workspace/session 分目录）[设计]      │
-│  · AGENT.md（项目画像）/ memory（执行约束）    [设计]        │
+│  · 会话 checkpoint（按 workspace/session 分目录）[已落地]    │
+│  · AGENT.md（项目画像）/ memory（执行约束）    [已落地]      │
+│  · 会话命令（/list session、/new session、/session）[已落地] │
 └─────────────────────────────────────────────────────────┘
 ```
 

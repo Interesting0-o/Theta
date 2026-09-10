@@ -8,7 +8,7 @@
 
 ## 0. 背景与目标
 
-**现状**：`resource/agent.db` 是**单一 sqlite 库**（~105MB，含 wal/shm，`app/tui/driver.py::get_agent_db_path`），所有会话共用一个库、thread 硬编码 `conversation_456`；没有**跨会话**的长期记忆——重启后模型不认识用户偏好 / 项目的稳定结论 / 之前敲定的约定。
+**现状（改动前的样子，2026-09-10 前）**：`resource/agent.db` 是**单一 sqlite 库**（~105MB，含 wal/shm；当时路径由 `app/tui/driver.py::get_agent_db_path` 算出，该模块已拆），所有会话共用一个库、thread 硬编码 `conversation_456`；没有**跨会话**的长期记忆——重启后模型不认识用户偏好 / 项目的稳定结论 / 之前敲定的约定。
 
 **目标（本设计）**：
 1. **resource 目录重构**：按「工作区沙箱」分区；每个工作区下再分 `memory/`（长期记忆 md）与 `sessions/<session_id>/`（该会话的 sqlite checkpoint）。
@@ -62,12 +62,12 @@ resource/
   一并不可达，同一工作区也等于开新会话。是否手工清理整个 `resource/` 由使用者自行决定。
 
 **session_id 规则（新开程序 = 新开对话，2026-09-08 定）**：
-- **默认每个程序启动 = 一个新会话**：session_id 解析顺序 `config.configurable.session_id` → env `AGENT_SESSION_ID` → 否则**自动生成 uuid**（新对话、新 db）；
+- **默认每个程序启动 = 一个新会话**：**当前实现只有 `uuid4().hex`**（`app/tui/runner.py`）；设计里 `config.configurable.session_id` → env `AGENT_SESSION_ID` → uuid 的**三级解析尚未实现**（2026-09-10 核对：`AGENT_SESSION_ID` 全仓只出现在本文档），接多前端 / LangGraph Platform 时再补；
 - LangGraph `thread_id` 沿用 `session_id`；
 - 想续旧对话 → 用 **`/session`**（见 §7）列出 `resource/<ws>/sessions/` 下的历史会话并切换（切到该 id 重开 checkpointer、接着它的消息栈/thread 走）；
 - 每个 session 一个独立 sqlite 文件 → 多会话 checkpoint 天然隔离，不再挤一个 105MB 单库。
 
-**装配点（重点改动）**：db 路径现在在 `app/tui/driver.py::get_agent_db_path()` 无参算出来（固定 resource/agent.db），而工作区在 `get_main_agent_graph` 内解析。要让 db 落到 `<ws>/sessions/<sid>/`，driver 必须在建 checkpointer 前就知道工作区 → 需要把"工作区 + session 解析"提成 driver / graph 共用的一处（见 §7）。
+**装配点（改动前 → 已落地）**：改动前 db 路径由 `app/tui/driver.py::get_agent_db_path()` 无参算出（固定 `resource/agent.db`），工作区在 `get_main_agent_graph` 内解析，两者的工作区来源不统一。**已落地**：路径统一到 `app/resource.py`（`session_db_path(workspace, session_id)` / `workspace_key`），基座 `app/platform/runtime.py::build_session_runtime` 在建 checkpointer 前就拿到工作区（由前端解析后**作参量传入**）；未另造"单一解析出口"函数——"前端定工作区 → 参量传 → resource 只算 key"已经够清楚（见 §7.1）。
 
 ---
 
@@ -100,11 +100,11 @@ resource/
 <memory.md 全文 / 截断到 cap>
 ```
 
-拼装顺序（`SYSTEM_PROMPT` → `workspace_context_block` → `# 当前任务`(计划) → **`# 长期记忆`**）。
+拼装顺序（`SYSTEM_PROMPT` → `workspace_context_block` → `# 当前任务`(计划) → **`# 项目画像`** → **`# 长期记忆`**）。
 - 记忆只在主 agent 每轮注入；worker（子 agent）是临时资料收集器，**不注入不写记忆**（隔离）。
 - 读取方 = 系统注入本身即"读取"；`read_memory` 工具用于注入被截断后取更早/更细条目（见 §5）。
 
-**memory 读取器**：由 memory 提供器（见 §7）读 `resource/<ws>/memory/memory.md`，经 LLMNode 构造参数传入（LLMNode 已收 `workspace_path`，扩展收一个可选的 `memory_provider`/内容注入）。主 agent 进程每轮实时读文件（记忆文件即真值，不做缓存）。
+**memory 读取器**（原始设想）：由 memory 提供器（见 §7）读 `resource/<ws>/memory/memory.md`，经 LLMNode 构造参数传入（`memory_provider`/内容注入）——**实现时未采用这条**：LLMNode 本就持有 `workspace_path`，直接每轮读盘更直（见本节的"已落地实现"）。
 
 **已落地实现（2026-09-10）**：
 
@@ -160,18 +160,18 @@ resource/
 
 ## 7. 装配与迁移（改动面）
 
-1. **路径解析收敛为一处**（Phase A）：
-   - 新增轻量 helper（建议 `app/agent/resource.py`，仅依赖 stdlib/pathlib，import 不触发 .env）暴露：
+1. **路径解析收敛为一处**（Phase A）`[已落地]`：
+   - 新增轻量 helper（实为 **`app/resource.py`**——放 app 根而非 `app/agent/`：只依赖 stdlib/pathlib，import 不触发 .env）暴露：
      `workspace_key(workspace_path) -> str`、`memory_root(workspace_path) -> Path`、
      `session_db_path(workspace_path, session_id) -> Path`；
-   - `get_agent_db_path` 迁用 `session_db_path`，并让 run_tui / `get_main_agent_graph` **共用同一工作区解析**（把 `_resolve_workspace` 提到可复用出口），保证"driver 算 db 的 workspace" 与 "graph 干活用的 workspace" 一致。
+   - `get_agent_db_path` 已删除，路径统一走 `session_db_path`；工作区一致性靠**参量传递**保证（前端解析 → 基座/图收同一个 `workspace` 字符串），未再抽"共用解析出口"函数——`_resolve_workspace`（`app/agent/graph.py`）仍只管"参量为空 → 默认 `<项目根>/tmp`"这一个分支。
 2. **memory 提供器 / 节点**（Phase B）：
    - `app/agent/memory.py`：读 md、格式化 SystemMessage、追加/覆盖条目、cap 截断（纯函数为主，便于单测）；
    - LLMNode 收 memory 注入（读一次文件 → SystemMessage）；
    - `write_memory`/`read_memory` 工具 + `source="memory"` 分流 + tool.json 登记。
-3. **session/thread**：run_tui 用解析出的 session_id 作 thread_id 与 db 目录（`config.configurable.session_id`），去掉硬编码 `conversation_456` 作 db 定位（thread_id 值可保留默认 `"default"`）。
-4. **旧数据**：`resource/agent.db` 是 dev 运行产物（gitignore）。Phase A 切换路径后它不再被读；是否清理（删旧单库）由你决定，文档记录即可，代码不自动删。
-5. **测试**：`tests/test_main_tui.py::test_agent_db_path_resolves_under_resource_dir` 断言要随新布局更新（`resource/<ws_key>/sessions/<sid>/agent.db`）；新增 resource 解析 / reviewed.json 读写 / md 读写 / cap / 工具注入 / 会话命令的单测。
+3. **session/thread** `[已落地]`：前端每次启动 = 新会话（`uuid4().hex`），同时作 `thread_id` 与 db 目录名；硬编码 `conversation_456` 已删除（三级解析见 §2 的说明）。
+4. **旧数据** `[已落地]`：`resource/agent.db` 是 dev 运行产物（gitignore）。Phase A 切换路径后它不再被读，且**启动时自动删除**（`app/platform/loop.py` 调 `app/resource.py::remove_legacy_single_db`，用户已确认）。
+5. **测试** `[已落地]`：`test_agent_db_path_resolves_under_resource_dir` 已随新布局删除，改由 `tests/test_resource.py`（路径布局）等覆盖；另已有 md 读写 / cap / 工具注入 / 会话命令（`tests/test_sessions.py`、`test_commands.py`）的单测。`reviewed.json` 因未实现，仍无对应测试。
 
 **TUI 命令层（/init · /session，2026-09-08 引入；2026-09-10 起落 `app/platform/commands/` 包）**：新开程序 = 新会话，续旧会话与沉淀项目约定走命令。命令是**基座的控制面事件（图之外）**——基座解析并处理，前端只渲染其输出（未识别命令走 `Notice` 事件，不喂给模型）；`q/quit/exit` 的退出词仍在 `loop.py`，未纳入命令表。
 - `/init` `[已落地 2026-09-10]`：**投一段预设提示词**（`INIT_PROMPT`，放在 `commands/prompts.py`——它是这条命令的载荷，不是每轮行为契约），随后走一条**正常 turn**：模型用已有只读工具通读工作区 → 在工作区**根目录**生成或刷新 `AGENT.md`（已存在则先读再 `edit_file` 刷新）。不加工具、不加节点、不加线程；写文件照常**撞审批**，用户过目内容再落盘。AGENT.md 是项目画像、随仓库走，不是把 resource 私有 memory 搬进去（memory 属约束/偏好层）。
@@ -179,20 +179,20 @@ resource/
   - `/list session`：列出当前工作区沙箱的全部会话（`*` 标当前；短 id · 最后活动时间 · 消息条数 · 末条 AI 正文摘要），按最后活动倒序，只给最近 10 个读 checkpoint；
   - `/new session`：`uuid4().hex` 新建并切过去（库在下次输入时才建）；
   - `/session <短 id 或完整 id>`：切到已存在的会话（唯一前缀即可；歧义/未命中只提示、不动当前会话）。切换 = 关旧连接 → 换 `session_id` → 丢弃 step（下一条消息按新 thread_id 懒重建），当前会话的 checkpoint 本就逐步落盘、无需额外"落定"。
-- 输入层识别 `/` 前缀命令（现有 `q/quit/exit` 已同类处理）。
+- 识别 `/` 前缀命令的位置**在基座**（`app/platform/loop.py` 拿到输入行后先问 `parse_command`），**不在输入层/前端**——前端只负责把一行输入交上来、把 `Notice` 渲染出去；`q/quit/exit` 的退出词仍留在 `loop.py` 的 `EXIT_WORDS`，未纳入命令表。
 
 **命令分两类（2026-09-10 定型）**：命令不只是"投提示词"，基座侧还有要动/读运行时状态的：
 - **提示词型**（`PROMPT_COMMANDS`）：把预设提示词当本轮用户输入投出去，走正常 turn —— `/init` 即此类（`/compact`「要求模型压缩上下文」将来也走这一路）。
-- **基座动作型**（`ACTION_COMMANDS`）：基座自己执行、不起 turn，结果经 `Notice` 事件回话 —— **`/help` 已落地**（列出全部命令与说明）；规划中（位置已留）：`/session`（换 checkpoint/thread_id）、`/content`（显示当前上下文占用量）、`/compact`。
+- **基座动作型**（`ACTION_COMMANDS`）：基座自己执行、不起 turn，结果经 `Notice` 事件回话 —— 已落地 `/help`（列全部命令）、`/list session`、`/new session`、`/session <id>`；规划中（**位置已留**）：`/content`（显示当前上下文占用量）、`/compact`（要求模型压缩上下文）。
 - 两表都只存**名字 + desc + 载荷/handler**，帮助文案由 `help_text()` 从表生成（对齐靠格式串，不手打空格）——加一条命令即出现在 `/help` 与"未识别命令"提示里，不必改 `loop.py`（`parse_command` 认表、`loop` 按类型分派，已有测试分别钉住这两条通路）。
 
 ---
 
 ## 8. 分期
 
-- **Phase A · resource + 会话目录重构**：路径解析收敛 + workspace_key + `sessions/<sid>/agent.db` 落位 + run_tui 用新 session_id + **`/session` 列表/切换骨架** + 旧库不读 + 测试更新。此阶段无记忆，纯地基。
+- **Phase A · resource + 会话目录重构** `[已落地 2026-09-10]`：路径解析收敛 + workspace_key + `sessions/<sid>/agent.db` 落位 + 每次启动用新 session_id + 旧库不读（并删除）+ 测试更新。会话的**列表/切换命令**随后在 Phase B 一并落地（§7 会话三条命令）。此阶段无记忆，纯地基。
 - **Phase B · 最简单长期记忆闭环 + 项目画像**：memory.md 格式 + 写入/读取工具 + tool.json/source + LLMNode SystemMessage 注入 + SYSTEM_PROMPT 纪律 + **AGENT.md 检测/会话首启注入 + `/init` 生成骨架** + 单测 + 手工冒烟（两段会话：第二段能看到第一段写的 memory；重开会话能看到 AGENT.md 画像）。`reviewed.json` 的加入交互/接线不在 A/B。
-  - **进度（2026-09-10）**：memory.md 格式 + `write_memory`/`read_memory` 工具 + tool.json/source + **LLMNode 每轮注入（§4）** + 单测 `[已落地]`（§3/§4/§5）——记忆闭环已通（写入 → 落盘 → 下轮注入），worker 侧不注入、工具也被 `worker_tools` 挡住。**同日续做**：AGENT.md 读取侧（`app/agent/profile.py` + LLMNode 注入）与 `/init` 命令（`app/platform/commands/`，投预设提示词）`[已落地]`（§4/§7）——画像闭环亦通（`/init` 生成 → 下个会话注入）。**尚未做**：SYSTEM_PROMPT 的"长期记忆/项目画像"纪律小节（§6）、`/session`。
+  - **进度（2026-09-10）**：memory.md 格式 + `write_memory`/`read_memory` 工具 + tool.json/source + **LLMNode 每轮注入（§4）** + 单测 `[已落地]`（§3/§4/§5）——记忆闭环已通（写入 → 落盘 → 下轮注入），worker 侧不注入、工具也被 `worker_tools` 挡住。**同日续做**：AGENT.md 读取侧（`app/agent/profile.py` + LLMNode 注入）与 `/init` 命令（`app/platform/commands/`，投预设提示词）`[已落地]`（§4/§7）——画像闭环亦通（`/init` 生成 → 下个会话注入）。**尚未做**：SYSTEM_PROMPT 的"长期记忆/项目画像"纪律小节（§6）。会话三条命令（`/list session`/`/new session`/`/session`）与 `/help` 亦已落地（§7）。
 - **Phase C · 明确不做（后续再议）**：记忆压缩/分层摘要、记忆全文检索、跨工作区共享记忆、多会话选择 UI、reviewed.json 交互接线、把记忆 promote 进 repo（与 CONTEXT_ENGINEERING 的 promote 复用/分合另议）。
 
 ---
