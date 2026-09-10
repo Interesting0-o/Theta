@@ -250,6 +250,18 @@ def test_switch_to_unknown_session_keeps_current(tmp_path, monkeypatch):
     assert step.inputs == []
 
 
+def test_fast_readme_command_starts_turn_with_language_prompt(tmp_path, monkeypatch):
+    """`/fast readme de` 起的 turn，首条消息是**按语言渲染过**的提示词（假 step 断言，不花钱）。"""
+    ui = FakeUI(["/fast readme de", None])
+    step = FakeStep()
+
+    asyncio.run(_platform(tmp_path, monkeypatch, ui, step).run())
+
+    sent = [m.content for m in step.inputs[0]["messages"]][0]
+    assert "Deutsch" in sent and "README.md" in sent
+    assert [type(e) for e in ui.events].count(TurnFinished) == 1
+
+
 def test_unknown_command_only_notifies(tmp_path, monkeypatch):
     """未识别的 `/xxx` 不喂给模型：只 emit Notice，随后那条普通消息照常起 turn。"""
     ui = FakeUI(["/nope", "正常消息", None])

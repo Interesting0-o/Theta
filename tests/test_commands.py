@@ -41,6 +41,47 @@ def test_action_command_slot_parses(monkeypatch):
     assert cmd.name == "/fake" and cmd.handler is handler and cmd.args == ""
 
 
+def test_fast_readme_defaults_to_english_and_honours_language_arg():
+    """`/fast readme [语言]`：不给语言默认英语；给 zh/cn/de/jp… 就换成对应语言。"""
+
+    def prompt_of(line: str) -> str:
+        cmd = parse_command(line)
+        assert isinstance(cmd, PromptCommand)
+        return cmd.prompt
+
+    # 不给语言 → 英语
+    assert "English" in prompt_of("/fast readme")
+    # 常见别名（大小写不敏感、也认中文说法）
+    assert "简体中文" in prompt_of("/fast readme zh")
+    assert "简体中文" in prompt_of("/fast readme CN")
+    assert "Deutsch" in prompt_of("/fast readme de")
+    assert "日本語" in prompt_of("/fast readme jp")
+    assert "日本語" in prompt_of("/fast readme 日语")
+    # 不认识的记号原样带上（多数模型认语言代码，别悄悄退回英语）
+    assert "pt-BR" in prompt_of("/fast readme pt-BR")
+    # 多给的词只取第一个作语言
+    assert "Français" in prompt_of("/fast readme fr 再给一段")
+
+
+def test_fast_readme_prompt_keeps_write_discipline():
+    """载荷要点：写入工作区根 README.md、先读再写、只写能核实的事实。"""
+    prompt = parse_command("/fast readme zh").prompt
+
+    assert "README.md" in prompt
+    assert "create_file" in prompt and "edit_file" in prompt  # 新建/更新两条路
+    assert "不要编造" in prompt  # 不许编造不存在的功能
+
+
+def test_readme_language_mapping_directly():
+    from app.platform.commands.prompts import readme_language
+
+    assert readme_language("") == "English"
+    assert readme_language("   ") == "English"
+    assert readme_language("ZH") == "简体中文"
+    assert readme_language("ko") == "한국어"
+    assert readme_language("vi") == "vi"  # 不认识的按原样
+
+
 def test_help_is_action_command():
     cmd = parse_command("/help")
 
