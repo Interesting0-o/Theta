@@ -1,4 +1,6 @@
+from dataclasses import dataclass
 from typing import Literal, NotRequired, TypedDict
+
 from pydantic import BaseModel
 
 
@@ -36,3 +38,25 @@ class NoteEntry(TypedDict):
     size: int
     topic: NotRequired[str]
     tags: NotRequired[list[str]]
+
+
+@dataclass(frozen=True)
+class MemoryEntry:
+    """长期记忆的一条（`resource/<ws_key>/memory/memory.md` 里的一段，跨会话长存）。
+
+    与 PlanStep / NoteEntry 的差别在**载体**：那两个是会话内的 state 切片、要经 checkpoint
+    序列化，所以用 TypedDict；MemoryEntry 是解析记忆文件得到的值对象，从不进 state，
+    因此用 frozen dataclass——不可变、按属性访问，四要素即文件里的一行标题 + 一段正文。
+
+    - key：单调递增编号（m1, m2, …），供 read_memory 取单条 / write_memory 按 key 覆写；
+    - type：user-preference / decision / convention / project-fact（见 §6）；
+    - date：**首次记入日** YYYY-MM-DD——覆写保留原日期，不重排、不重新编号；
+    - content：条目正文（不含标题行）。
+
+    设计见 docs/LONG_TERM_MEMORY.md §3；读写与解析在 app/agent/memory.py。
+    """
+
+    key: str
+    type: str
+    date: str
+    content: str

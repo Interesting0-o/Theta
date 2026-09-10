@@ -154,5 +154,13 @@
     "dispatch_subtasks":{
         "need_review":false,
         "source":"dispatch"
+    },
+    "write_memory":{
+        "need_review":false,
+        "source":"memory"
+    },
+    "read_memory":{
+        "need_review":false,
+        "source":"memory"
     }
 }

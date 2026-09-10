@@ -1,28 +1,19 @@
-"""app/tui 的 TUI 辅助函数测试：get_agent_db_path / truncate / format_tool_approval。
+"""app/tui 的 TUI 辅助函数测试：truncate / format_tool_approval / resolve_tui_workspace。
 
 辅助随 TUI 重构从 app/main.py 迁入 app/tui：truncate/format_tool_approval 在 approval.py，
-get_agent_db_path 在 driver.py。app.tui 模块 import 期不触发 app.agent → 本文件无需 .env。
+resolve_tui_workspace 在 driver.py。checkpoint 落点路径已单点到 app/resource.py（见
+tests/test_resource.py）。app.tui 模块 import 期不触发 app.agent → 本文件无需 .env。
 """
-from pathlib import Path
 from types import SimpleNamespace
 
 from app.tui.approval import format_tool_approval, truncate
-from app.tui.driver import get_agent_db_path, resolve_tui_workspace
+from app.tui.driver import resolve_tui_workspace
 
 
 def test_resolve_tui_workspace_is_cwd(tmp_path, monkeypatch):
     """TUI 工作区 = 启动目录（cwd），作为 workspace_path 参量传给 graph。"""
     monkeypatch.chdir(tmp_path)
     assert resolve_tui_workspace() == str(tmp_path)
-
-
-def test_agent_db_path_resolves_under_resource_dir():
-    db_path = get_agent_db_path()
-
-    assert db_path.is_absolute()
-    assert db_path.parent.name == "resource"
-    assert db_path.name == "agent.db"
-    assert db_path.parent.exists()
 
 
 def test_truncate_keeps_short_text():

@@ -9,7 +9,7 @@ from app.agent.nodes import *
 from app.agent.model import get_main_chat_model
 from app.agent.prompt import WORKER_SYSTEM_PROMPT
 from app.agent.mcp import load_mcp_tool
-from app.agent.tools import orchestrate_tool, note_tools, dispatch_tool
+from app.agent.tools import orchestrate_tool, note_tools, dispatch_tool, memory_tool
 
 # 项目根：模块导入期由 __file__ 算好，避免在运行时调用阻塞式 os.getcwd()
 # （langgraph dev 的 blockbuster 会拦截事件循环内的同步阻塞调用）
@@ -64,16 +64,17 @@ async def get_main_agent_graph(workspace_path: str | None = None):
     mcp_tools = await load_mcp_tool(workspace_path)
 
     # 模型能看到全部工具（含计划工具）；但只有"可执行工具"会进 review→tool_node
-    all_tools = orchestrate_tool + note_tools + dispatch_tool + mcp_tools
+    all_tools = orchestrate_tool + note_tools + dispatch_tool + memory_tool + mcp_tools
     model = get_main_chat_model().bind_tools(all_tools)
 
     graph.add_node("llm_node", LLMNode(model=model, workspace_path=workspace_path))
     graph.add_node("queue_node", QueueNode())
-    # dispatch_subtasks 需要工作区以 spawn worker（InjectedWorkspace 对模型隐藏），由 node 注入
+    # dispatch_subtasks（spawn worker）与 memory 读写（定位 memory.md）都需要工作区，
+    # 由 node 按签名注入（InjectedWorkspace 对模型隐藏）
     graph.add_node(
         "orchestrate_node",
         OrchestrateNode(
-            orchestrate_tool + note_tools + dispatch_tool,  # type: ignore[arg-type]
+            orchestrate_tool + note_tools + dispatch_tool + memory_tool,  # type: ignore[arg-type]
             workspace_path=workspace_path,
         ),
     )
@@ -150,7 +151,12 @@ def get_sub_agent_graph(read_tools=None, workspace_path: str | None = None, mode
     graph = StateGraph(AgentState)
     graph.add_node(
         "llm_node",
-        LLMNode(model=chat, workspace_path=workspace_path, system_prompt=WORKER_SYSTEM_PROMPT),
+        LLMNode(
+            model=chat,
+            workspace_path=workspace_path,
+            system_prompt=WORKER_SYSTEM_PROMPT,
+            inject_memory=False,  # worker 不注入长期记忆（只读资料收集，§4 隔离）
+        ),
     )
     graph.add_node("queue_node", QueueNode())
     graph.add_node("review_node", ReviewNode(log=review_log))

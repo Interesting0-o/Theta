@@ -10,7 +10,8 @@ worker_id 标记路由**（判定在 approval.py，broker 在 approval_inbox.py�
 - input.py         stdin 单 reader 线程 + pump + 一问一答原语
 - approval_inbox.py 统一审批 broker：ApprovalInbox（纯队列）+ ApprovalInboxServer（HTTP 收件箱）
 - approval.py      判定面：渲染面板 + decide_approval + drain_approvals（pending 即服务）
-- driver.py        run_tui 事件循环 + drive_turn（turn 核心 park/resume）+ get_agent_db_path
+- driver.py        run_tui 事件循环 + drive_turn（turn 核心 park/resume）；checkpoint 落点经
+                   app/resource.py::session_db_path(workspace, session)（按工作区/会话定位）
 
 边界：agent 图在 app/agent（driver 懒加载，import 本包不触发 .env）；跨进程审批协议 schema 在
 app/schema/approval_schema.py——主侧 broker（app/tui/approval_inbox.py）消费它，worker 侧

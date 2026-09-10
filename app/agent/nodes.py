@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 import json
 import time
@@ -10,6 +11,7 @@ from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, Syst
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
+from app.agent.memory import memory_block
 from app.agent.state import AgentState
 from app.agent.utils import coerce_tool_result, format_tool_result
 from app.agent.prompt import SYSTEM_PROMPT, workspace_context_block
@@ -43,10 +45,14 @@ class LLMNode:
         model: Runnable,
         workspace_path: str | None = None,
         system_prompt: str = SYSTEM_PROMPT,
+        inject_memory: bool = True,
     ) -> None:
         self.model: Runnable = model
         self.workspace_path: str | None = workspace_path
         self.system_prompt: str = system_prompt
+        # worker（子 agent）传 False：它是临时资料收集器，不读写记忆、保持只读隔离
+        # （docs/LONG_TERM_MEMORY.md §4）。
+        self.inject_memory: bool = inject_memory
 
     @staticmethod
     def format_plan_status(step: PlanStep) -> str:
@@ -74,11 +80,15 @@ class LLMNode:
     async def __call__(self, state: AgentState) -> dict | AgentState:
         """大模型处理节点。
 
-        每次生成都在头部拼接系统提示词：行为契约 SYSTEM_PROMPT（见 prompt.py）+
+        每次生成都在头部拼接系统提示词，顺序：行为契约 SYSTEM_PROMPT（见 prompt.py）+
         本次会话的具体工作区上下文 workspace_context_block（若有，含工作区根目录与
-        终端 cwd 差异提醒）+ 当前计划的状态回显（若有）。只构造成临时列表传给模型，
-        不改动 state["messages"]（LangGraph state 应不可变更新；系统消息也不应渗入
-        历史被持久化）。
+        终端 cwd 差异提醒）+ 当前计划的状态回显（若有）+ **长期记忆**（若有条目，
+        `# 长期记忆（工作区 …）` 正文，见 docs/LONG_TERM_MEMORY.md §4）。只构造成临时列表
+        传给模型，不改动 state["messages"]（LangGraph state 应不可变更新；系统消息也不应
+        渗入历史被持久化）。
+
+        记忆**每轮实时读盘**（记忆文件即真值，不做缓存）；读盘是阻塞调用，走 to_thread 以
+        避开 langgraph dev 的 blockbuster。
         """
         system_messages = [SystemMessage(content=self.system_prompt)]
         if self.workspace_path:
@@ -93,6 +103,10 @@ class LLMNode:
                     + "\n".join(self.format_plan_status(plan) for plan in plans)
                 )
             )
+        if self.inject_memory and self.workspace_path:
+            block = await asyncio.to_thread(memory_block, self.workspace_path)
+            if block:
+                system_messages.append(SystemMessage(content=block))
 
         messages = [*system_messages, *state["messages"]]
         res = await self.model.ainvoke(messages)
@@ -173,8 +187,9 @@ class ReviewNode:
 
     # "state 工具"在 tool.json 的 source 取值集合：命中即分流进 approved_orchestrate_calls，
     # 交 OrchestrateNode（通用 state 工具执行器）处理。plan=编排；notes=笔记读回；
-    # dispatch=并发资料收集派发（app/agent/tools.py::dispatch_subtasks）。
-    ORCHESTRATE_SOURCES: frozenset[str] = frozenset({"plan", "notes", "dispatch"})
+    # dispatch=并发资料收集派发（app/agent/tools.py::dispatch_subtasks）；
+    # memory=长期记忆读写（同文件 write_memory/read_memory，靠注入的 workspace 定位记忆文件）。
+    ORCHESTRATE_SOURCES: frozenset[str] = frozenset({"plan", "notes", "dispatch", "memory"})
 
     @classmethod
     @lru_cache(maxsize=1)

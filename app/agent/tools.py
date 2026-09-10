@@ -21,12 +21,14 @@
 import asyncio
 import json
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Annotated, List
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, InjectedToolArg, InjectedToolCallId, tool
 from langgraph.prebuilt import InjectedState
+from app.agent import memory
 from app.agent.state import AgentState
 from app.agent.utils import format_tool_result
 from app.schema.agent_schema import PlanStatus, PlanStep
@@ -56,7 +58,8 @@ def worker_tools(tools, cfg: dict | None = None):
     - cfg：tool.json 解析结果 {tool_name: {need_review, source}}；默认读 app/agent/tool.json。
     - 保留：name 命中 cfg 且（`need_review:false` 且 source∈{file_io,git}）——免审的只读检索；
       或 source∈{web_search}——联网四件套（need_review:true，会触发主侧审批）。
-    - 剔除：写/删/命令/git 写/plan/notes/dispatch 等（或改状态、或需更高权限、或会再派生子任务）。
+    - 剔除：写/删/命令/git 写/plan/notes/dispatch/memory 等（或改状态、或需更高权限、
+      或会再派生子任务；memory 被剔除 = worker 不读写长期记忆，保持只读调查隔离）。
     - 纯函数：不依赖 MCP 加载，便于单测注入假 cfg 验证过滤语义。
     """
     if cfg is None:
@@ -272,7 +275,12 @@ note_tools: List[BaseTool] = [
 
 
 class InjectedWorkspace(InjectedToolArg):
-    """标记 dispatch 的 workspace 参数为运行时注入（对模型隐藏）。"""
+    """标记"需要工作区"的工具参数为运行时注入（对模型隐藏）。
+
+    由 OrchestrateNode 按签名代填（nodes.py::OrchestrateNode._invoke）：dispatch 往该工作区
+    spawn worker，memory 系列工具用它定位 `resource/<ws_key>/memory/memory.md`。模型看不到
+    这个参数，也就无法指定记忆文件路径。
+    """
 
 
 async def _spawn_subagent_worker(task: str, workspace: str) -> str:
@@ -389,4 +397,157 @@ async def dispatch_subtasks(
 
 dispatch_tool: List[BaseTool] = [
     dispatch_subtasks,
+]
+
+# ------------------------- 长期记忆（source="memory"）-------------------------
+# 记忆 = 跨会话、按工作区共享的稳定结论，落 resource/<ws_key>/memory/memory.md——磁盘上的
+# 一等真值文件（不是向量索引那种游离副本，见 docs/LONG_TERM_MEMORY.md §1）。文件路径由注入的
+# workspace 经 app.resource.memory_root 算出、**对模型隐藏**：模型只给 type/content/key。
+#
+# 与 read_note 的分工：notes 是会话内折叠归档（短命、ref=rN，随 checkpoint 存亡），memory 跨
+# 会话长存（ref=mN）；两者并存、语义分开。与 dispatch 同走 OrchestrateNode，因为都需要注入
+# 工作区（对模型隐藏的 InjectedWorkspace）。
+#
+# 两个工具都写成 **async** 且把落盘交给 asyncio.to_thread：读写会碰 os.stat / os.mkdir
+# （Path.exists / mkdir / resolve 底下），langgraph dev 的 blockbuster 会在事件循环里拦截这类
+# 阻塞调用——与 mcp.py::load_mcp_tool、graph.py 默认工作区 mkdir 的处理一致。
+
+
+def _memory_receipt(tool_name: str, tool_call_id: str, content: str) -> dict:
+    """记忆工具的返回切片：只回一条 ToolMessage（这两个工具不碰 state）。"""
+    return {
+        "messages": [
+            ToolMessage(name=tool_name, tool_call_id=tool_call_id, content=content)
+        ]
+    }
+
+
+@tool
+async def write_memory(
+    type: str,
+    content: str,
+    workspace: Annotated[str, InjectedWorkspace],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    key: str = "",
+) -> dict:
+    """把一条**跨会话仍然有用**的稳定事实写进本工作区的长期记忆。
+
+    长期记忆按工作区保存、跨会话长存（下次再做这个项目时还读得到）——所以这里写的是"下次再来
+    做这个项目时仍然成立"的东西，而不是本次任务的流水账。
+
+    何时该写（一段有结论的工作收尾时）：
+    - 用户明确的偏好 / 约束（如"输出与注释用中文""不要动 venv"）；
+    - 敲定的架构决策（如"子 agent 传输定案 stdio，HTTP 等 DAG 再说"）；
+    - 工作区的既有约定或特殊之处（如"测试必须用 python -m pytest 并导出 WORKSPACE_PATH"）。
+    何时别写：
+    - 临时过程与操作流水（"我读了 X 文件"）；猜测、未定方案、还没验证的结论；
+    - 随时能从工作区 / git 重取的 dump（代码内容、目录结构、文件清单）。
+
+    写法：content 一句话成条、带结论（必要时附出处或日期）；type 取
+    user-preference（用户偏好 / 约束）/ decision（决策）/ convention（约定）/
+    project-fact（项目事实）。
+
+    Args:
+        type: 记忆类别，建议取 user-preference / decision / convention / project-fact。
+        content: 一句话结论；空内容会被拒绝（不写空记忆）。
+        key: 省略 = 追加一条新记忆（编号由系统分配，如 m3）；
+            给了已有编号（如 "m2"）= 覆写那一条的类别与正文（编号与首次记入日期不变），
+            用于修正写错 / 过时的记忆——**不要靠追加"更正：…"来叠**。
+        workspace: （系统自动注入，无需传入）本会话工作区。
+        tool_call_id: （系统自动注入，无需传入）本次调用 id。
+
+    Returns:
+        回执：写入 / 覆写的条目 + 当前总条数。要看全部记忆用 read_memory。
+    """
+    kind = (type or "").strip()
+    body = (content or "").strip()
+    if not body:
+        return _memory_receipt(
+            "write_memory", tool_call_id, "记忆内容为空，未写入。content 要写成一句有结论的事实。"
+        )
+    if not kind:
+        return _memory_receipt(
+            "write_memory",
+            tool_call_id,
+            "记忆类别为空，未写入。type 建议取 user-preference / decision / convention / project-fact。",
+        )
+
+    target = (key or "").strip()
+    if target:
+        entry = await asyncio.to_thread(memory.overwrite_entry, workspace, target, kind, body)
+        if entry is None:
+            keys = await asyncio.to_thread(memory.entry_keys, workspace)
+            existing = "、".join(keys) or "（暂无）"
+            return _memory_receipt(
+                "write_memory",
+                tool_call_id,
+                f"记忆 {target} 不存在，未做任何改动。现有编号：{existing}；要新增请省略 key。",
+            )
+        action = f"已覆写 [{entry.key}]（首次记入日期 {entry.date} 不变）"
+    else:
+        entry = await asyncio.to_thread(
+            memory.append_entry, workspace, kind, body, date.today().isoformat()
+        )
+        action = f"已写入 [{entry.key}]"
+
+    total = len(await asyncio.to_thread(memory.entry_keys, workspace))
+    return _memory_receipt(
+        "write_memory",
+        tool_call_id,
+        f"{action} {entry.type} · {entry.date}\n{entry.content}\n\n"
+        f"当前该工作区共 {total} 条长期记忆（要看全部用 read_memory）。",
+    )
+
+
+@tool
+async def read_memory(
+    workspace: Annotated[str, InjectedWorkspace],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    key: str = "",
+) -> dict:
+    """读取本工作区的长期记忆（跨会话保存的偏好 / 决策 / 约定 / 项目事实）。
+
+    何时用：需要确认"用户或这个项目之前定过什么"时——动手前核对既有约定，或想找某条记忆的
+    编号以便用 write_memory 覆写它。想一眼看全当前记了些什么也用它。
+
+    Args:
+        key: 省略 = 返回全部记忆；给编号（如 "m3"）= 只返回那一条。
+        workspace: （系统自动注入，无需传入）本会话工作区。
+        tool_call_id: （系统自动注入，无需传入）本次调用 id。
+
+    Returns:
+        命中：记忆正文（全文或单条）；无记忆 / 编号不存在：说明情况并列出现有编号。
+    """
+    text = await asyncio.to_thread(memory.read_text, workspace)
+    if not text.strip():
+        return _memory_receipt("read_memory", tool_call_id, "当前工作区还没有长期记忆。")
+
+    entries = memory.parse_entries(text)
+    target = (key or "").strip()
+    if target:
+        entry = next((e for e in entries if e.key == target), None)
+        if entry is None:
+            existing = "、".join(e.key for e in entries) or "（暂无）"
+            return _memory_receipt(
+                "read_memory", tool_call_id, f"记忆 {target} 不存在。现有编号：{existing}"
+            )
+        return _memory_receipt(
+            "read_memory",
+            tool_call_id,
+            f"### [{entry.key}] {entry.type} · {entry.date}\n\n{entry.content}",
+        )
+
+    if not entries:
+        return _memory_receipt(
+            "read_memory", tool_call_id, "当前工作区还没有长期记忆条目（只有文件头说明）。"
+        )
+    visible = memory.strip_comments(text).strip()
+    return _memory_receipt(
+        "read_memory", tool_call_id, f"当前该工作区共 {len(entries)} 条长期记忆：\n\n{visible}"
+    )
+
+
+memory_tool: List[BaseTool] = [
+    write_memory,
+    read_memory,
 ]

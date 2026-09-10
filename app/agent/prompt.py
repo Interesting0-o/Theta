@@ -4,13 +4,15 @@
 因为它们决定模型会怎么用工具——而这些信息大多不在工具 schema 的 docstring 里。
 
 注意：模型可见工具 = 编排工具（create_plan/update_plan_step/clear_plan）+ read_note +
-dispatch_subtasks（并发资料收集）+ file_io/terminal/web_search MCP（见 app/agent/graph.py::
-get_main_agent_graph）。若日后增减工具（尤其新增 MCP server / 多 agent 派发工具），需同步核对本文件的
+dispatch_subtasks（并发资料收集）+ write_memory/read_memory（长期记忆）+
+file_io/terminal/git/web_search MCP（见 app/agent/graph.py::get_main_agent_graph）。
+若日后增减工具（尤其新增 MCP server / 多 agent 派发工具），需同步核对本文件的
 "工具总览"，避免提示词与实际工具脱节。
 
 接入方式：LLMNode 每次生成前，把以下 SystemMessage 依次拼在对话历史前：
 `SYSTEM_PROMPT`（本文件静态常量）+ 会话相关的工作区上下文
-`workspace_context_block(workspace_path)` + （若有计划时）# 当前任务 计划回显。
+`workspace_context_block(workspace_path)` + （若有计划时）# 当前任务 计划回显 +
+（若该工作区有长期记忆时）# 长期记忆 正文（worker 不注入，见 inject_memory 开关）。
 见 app/agent/nodes.py::LLMNode.__call__。
 """
 
@@ -132,6 +134,14 @@ SYSTEM_PROMPT = """\
 - create_plan(steps: list[str])：把多步任务拆成有序步骤，建立当前计划。
 - update_plan_step(step_id, status)：把某一步标为 pending / in_progress / done。
 - clear_plan()：整体完成或需求变更重规划时清空当前计划。
+
+[长期记忆]（免审批）
+- write_memory(type, content, key="")：把**跨会话仍然有用**的稳定事实写进本工作区的长期记忆——
+  用户的偏好/约束、敲定的架构决策、工作区的既有约定。省略 key = 追加一条（编号由系统分配）；
+  给了已有编号（如 "m2"）= 覆写那一条（修正写错/过时的记忆，别靠追加"更正：…"堆叠）。
+  别写：临时过程与操作流水、随时能从工作区/git 重取的 dump、猜测或未验证的结论。
+- read_memory(key="")：读长期记忆（省略 key = 全部，给编号 = 单条）。需要确认"用户/这个项目
+  之前定过什么"时用它，或想拿到编号以便覆写某条时才用。
 
 [并发资料收集 · dispatch_subtasks]（派发本身免审批）
 - dispatch_subtasks(sub_tasks)：把**多个相互独立**的查证/调研/资料收集问题一次性并行派给

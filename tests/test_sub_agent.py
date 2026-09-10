@@ -127,6 +127,8 @@ def test_worker_tools_filter():
         "create_plan": {"need_review": False, "source": "plan"},
         "read_note": {"need_review": False, "source": "notes"},
         "dispatch_subtasks": {"need_review": False, "source": "dispatch"},
+        "write_memory": {"need_review": False, "source": "memory"},
+        "read_memory": {"need_review": False, "source": "memory"},
     }
 
     class _FakeTool:
@@ -147,6 +149,8 @@ def test_worker_tools_filter():
         "create_plan",     # 编排 → 剔除
         "read_note",       # notes → 剔除
         "dispatch_subtasks",  # 派发 → 剔除
+        "write_memory",    # 长期记忆 → 剔除（worker 不读写记忆、保持只读隔离）
+        "read_memory",     # 长期记忆 → 剔除
     ]
     kept = worker_tools([_FakeTool(n) for n in names_in], cfg=cfg)
     assert [t.name for t in kept] == [

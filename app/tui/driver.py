@@ -11,27 +11,28 @@ wait(id)` 挂起（run 停、进程自由），审核方 `complete(id, approved)
 本文件只做**装配 + 事件循环调度**。`app/main.py` 是薄入口，调 `run_tui()`。
 `app.agent.*`（graph/model）在 run_tui 内懒加载——保持 `import app.tui` 无 .env、无副作用。
 
-- `get_agent_db_path`：checkpoint 的 SQLite 路径（resource/agent.db）。
 - `resolve_tui_workspace`：TUI 工作区沙箱 = 进程启动目录（cwd），作为 `workspace_path`
   参量传给 `get_main_agent_graph`（langgraph dev 经零参入口默认 <项目根>/tmp）。
+- 会话/DB：每次启动 = 新会话（`session_id=uuid4().hex`）；db/checkpoint/图在**首次用户输入**才懒建
+  （`_build_session_runtime`），路径经 `app/resource.py::session_db_path(workspace, session)` 落到
+  `resource/<ws_key>/sessions/<sid>/agent.db`；启动清理旧单库（`remove_legacy_single_db`）。
 - `drive_turn(step, initial, queue)`：agent turn 核心（step 可注入便于测试）；中断即入
   broker park，返回终态。
 - `run_tui`：事件循环——drain 待批（pending 即服务）→ 无批且 turn 在跑则等
   turn_done / new_pending → 无批且空闲则读用户行起新 turn。
 """
 import asyncio
+import uuid
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
+from app.resource import remove_legacy_single_db, session_db_path
 from app.schema.approval_schema import ApprovalRequest
 from app.tui.approval import LOCAL_WORKER_ID, drain_approvals
 from app.tui.approval_inbox import ApprovalInboxServer
 from app.tui.input import _pump_stdin, _start_stdin_reader
-
-# 会话 thread_id（与旧 app/main.py 保持一致；checkpoint 持久化按它续）
-THREAD_ID = "conversation_456"
 
 # 界面标题：沿用仓库初始 main.py（git 历史 295a775 "初始化"）的 ASCII 框样式。
 _USER_TITLE = """
@@ -44,13 +45,6 @@ _AI_TITLE = """
 | Agent |
 +-------+
 """
-
-
-def get_agent_db_path() -> Path:
-    """agent checkpoint 的持久化 SQLite 路径（项目根/resource/agent.db，自动建目录）。"""
-    db_dir = Path(__file__).resolve().parent.parent.parent / "resource"
-    db_dir.mkdir(parents=True, exist_ok=True)
-    return db_dir / "agent.db"
 
 
 def resolve_tui_workspace() -> str:
@@ -169,39 +163,63 @@ async def _run_turn(step, initial, queue, turn_done: asyncio.Event) -> None:
         turn_done.set()
 
 
-def _build_turn_state(user_input: str) -> dict:
+def _build_turn_state(session_id: str, user_input: str) -> dict:
     return {
-        "session_id": THREAD_ID,
+        "session_id": session_id,
         "messages": [HumanMessage(content=user_input)],
         "pending_tool_calls": [],
         "approved_tool_calls": [],
     }
 
 
-async def run_tui() -> None:
-    """事件驱动 TUI：装配 db/graph/checkpointer/config + 收件箱 + stdin，然后循环调度。
+async def _build_session_runtime(workspace: str, session_id: str):
+    """首次用户输入时才构建运行时：db 落盘 + AsyncSqliteSaver + 编译图 + thread step。
 
-    - pending 审批（本地 park 或 worker HTTP）**即服务**：drain_approvals 逐条渲染收 y/n；
-    - 无审批且 turn 在跑 → 等 turn_done 或 new_pending（park 或新 worker 请求都会唤醒）；
-    - 无审批且空闲 → 读用户行起 turn（q/quit/exit 退出；EOF 结束）。
-    app.agent.* 在此懒加载（入口运行期才有 .env；import app.tui 无需 .env）。
+    返回 (connection, step)：connection 供退出时关闭；step 是 compiled.ainvoke 的闭包
+    （带本会话 thread_id）。首次为某工作区建会话时，顺带播种该工作区的长期记忆模板
+    （app/agent/memory.py::ensure_memory_template，缺失才写）。app.agent.* 在此懒加载
+    ——首次交互时才有 .env 与真实需要。
     """
     import aiosqlite  # noqa: PLC0415
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver  # noqa: PLC0415
     from app.agent.graph import get_main_agent_graph  # noqa: PLC0415
+    from app.agent.memory import ensure_memory_template  # noqa: PLC0415
 
-    db_path = get_agent_db_path()
+    db_path = session_db_path(workspace, session_id)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(ensure_memory_template, workspace)  # 新工作区播种记忆模板
     connection = await aiosqlite.connect(str(db_path))
     checkpointer = AsyncSqliteSaver(connection)
     await checkpointer.setup()
 
-    graph = await get_main_agent_graph(resolve_tui_workspace())
+    graph = await get_main_agent_graph(workspace)
     compiled = graph.compile(checkpointer=checkpointer)
-    config: dict = {"configurable": {"thread_id": THREAD_ID}}
+    config: dict = {"configurable": {"thread_id": session_id}}
     step = lambda inputs: compiled.ainvoke(inputs, config)  # noqa: E731
+    return connection, step
+
+
+async def run_tui() -> None:
+    """事件驱动 TUI：每次启动 = 新会话；db/图在**首次用户输入**时才懒建。
+
+    - 启动只解析工作区（resolve_tui_workspace）并生成 session_id（uuid4），**不建库、不编译图**；
+    - 收到第一条有效用户消息才 `_build_session_runtime`（db 落盘 + checkpointer + 编译图 + thread
+      step），此后同进程内各轮复用同一 runtime；退出时关闭该会话 connection；
+    - pending 审批（本地 park 或 worker HTTP）**即服务**：drain_approvals 逐条渲染收 y/n；
+    - 无审批且 turn 在跑 → 等 turn_done 或 new_pending（park 或新 worker 请求都会唤醒）；
+    - 无审批且空闲 → 读用户行起 turn（q/quit/exit 退出；EOF 结束）。
+    app.agent.* 在 _build_session_runtime 内懒加载（入口运行期才有 .env；import app.tui 无需 .env）。
+    """
+    remove_legacy_single_db()  # 旧 resource/agent.db 单库一次性清理（用户已确认删除）
+    workspace = resolve_tui_workspace()  # 单点来源：db 与 graph 用同一个工作区
+    session_id = uuid.uuid4().hex
+    print(f"[会话] session_id={session_id}")
+    print(f"[工作区] {workspace}（首次输入时才会建库）")
 
     inbox = ApprovalInboxServer()
     pump: asyncio.Task | None = None
+    connection = None  # AsyncSqliteSaver 连接；首次交互创建，退出时关闭
+    runtime_step = None  # compiled.ainvoke 闭包；首次交互创建后复用
     try:
         await inbox.start()  # worker 待审请求收件箱（HTTP，静默监听 127.0.0.1:8010）
 
@@ -242,8 +260,15 @@ async def run_tui() -> None:
                 continue
             if line is None or line in ("quit", "q", "exit"):
                 break  # EOF / quit 直接退出外层
+
+            # 首次交互才建库/checkpoint/图（之后各轮复用同一 runtime）
+            if runtime_step is None:
+                connection, runtime_step = await _build_session_runtime(workspace, session_id)
+
             turn_done.clear()
-            turn = asyncio.create_task(_run_turn(step, _build_turn_state(line), inbox.queue, turn_done))
+            turn = asyncio.create_task(
+                _run_turn(runtime_step, _build_turn_state(session_id, line), inbox.queue, turn_done)
+            )
             # 回循环顶部：新 turn 的审批/终态都从 drain 与 turn_done 两个信号驱动
     finally:
         if pump is not None:
@@ -251,4 +276,5 @@ async def run_tui() -> None:
         if turn is not None and not turn.done():
             turn.cancel()
         await inbox.stop()
-        await connection.close()
+        if connection is not None:
+            await connection.close()
