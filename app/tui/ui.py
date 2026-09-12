@@ -19,7 +19,13 @@ from app.schema.ui_schema import (
     TurnFinished,
 )
 from app.tui.input import _pump_stdin, _start_stdin_reader
-from app.tui.panels import AGENT_TITLE, COMMAND_TITLE, USER_TITLE, format_tool_approval
+from app.tui.panels import (
+    AGENT_TITLE,
+    COMMAND_TITLE,
+    USER_TITLE,
+    format_tool_approval,
+    render_markdown,
+)
 
 
 class TerminalUI:
@@ -81,7 +87,10 @@ class TerminalUI:
             print(USER_TITLE)
         elif isinstance(event, TurnFinished):
             print(AGENT_TITLE)
-            print(event.text)
+            # 模型答复按 markdown 渲染（可选依赖 rich，见 panels.render_markdown）；
+            # 渲染不了就原样打——答复绝不能因为显示层而丢失。
+            if not render_markdown(event.text):
+                print(event.text)
         elif isinstance(event, TurnFailed):
             print(f"\n[agent 运行出错] {event.message}")
         elif isinstance(event, Notice):

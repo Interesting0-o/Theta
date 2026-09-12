@@ -211,7 +211,7 @@ theta/
 │   │   └── commands/           # 控制面命令：/init /help /list session /new session /session
 │   ├── tui/                    # 终端前端（只取输入 + 渲染事件，不碰调度）
 │   │   ├── input.py            # stdin 单 reader 线程 + pump（一问一答）
-│   │   ├── panels.py           # 审批面板 / 标题框 / 截断（纯渲染）
+│   │   ├── panels.py           # 审批面板 / 标题框 / 截断 / markdown 渲染（纯渲染）
 │   │   ├── ui.py               # TerminalUI：实现 UI 协议
 │   │   └── runner.py           # run_tui()：解析启动工作区 → 组 UI + 基座 → 跑
 │   ├── agent/                  # 图本体

@@ -1,15 +1,22 @@
-"""app/tui 的终端辅助函数测试：truncate / format_tool_approval / resolve_tui_workspace。
+"""app/tui 的终端辅助函数测试：truncate / format_tool_approval / render_markdown /
+resolve_tui_workspace。
 
-truncate / format_tool_approval 在 app/tui/panels.py（终端渲染纯函数），resolve_tui_workspace
-在 app/tui/runner.py（**前端策略**：工作区=启动目录）。checkpoint 落点路径已单点到
-app/resource.py（见 tests/test_resource.py）。app.tui 模块 import 期不触发 app.agent →
-本文件无需 .env。
+truncate / format_tool_approval / render_markdown 在 app/tui/panels.py（终端渲染素材），
+resolve_tui_workspace 在 app/tui/runner.py（**前端策略**：工作区=启动目录）。checkpoint 落点
+路径已单点到 app/resource.py（见 tests/test_resource.py）。app.tui 模块 import 期不触发
+app.agent → 本文件无需 .env。
 """
+from io import StringIO
 from types import SimpleNamespace
 
 import asyncio
 
-from app.tui.panels import format_tool_approval, truncate
+import pytest
+
+from app.schema.ui_schema import TurnFinished
+from app.tui import panels
+from app.tui import ui as tui_ui
+from app.tui.panels import format_tool_approval, render_markdown, truncate
 from app.tui.runner import resolve_tui_workspace
 from app.tui.ui import TerminalUI
 
@@ -81,3 +88,70 @@ def test_format_tool_approval_extracts_fields():
     assert "步骤 3" in text
     assert "调用ID: call_1" in text
     assert "已截断" in text  # 超长参数内容被 truncate
+
+
+# ------------------------- markdown 渲染（模型答复） -------------------------
+
+
+def test_render_markdown_formats_markdown():
+    """markdown 正文渲染成终端文本：标记符被吃掉、结构保留（宽度固定便于断言）。"""
+    pytest.importorskip("rich")
+    from rich.console import Console
+
+    buf = StringIO()
+    ok = render_markdown(
+        "# 标题\n\n这是 **粗体**。\n\n- 甲\n- 乙\n",
+        console=Console(file=buf, width=40),
+    )
+
+    out = buf.getvalue()
+    assert ok is True  # True = 已渲染，调用方不必再原样打印
+    assert "标题" in out
+    assert "**" not in out  # markdown 标记被消费
+    assert "•" in out  # 无序列表渲染成 bullet
+
+
+def test_render_markdown_falls_back_when_rich_missing(monkeypatch):
+    """rich 没装（可选依赖）→ 返回 False，由调用方退回纯文本。"""
+    monkeypatch.setattr(panels, "Markdown", None)
+    assert panels.render_markdown("# 标题") is False
+
+
+def test_render_markdown_swallows_render_error(monkeypatch):
+    """渲染抛错也只降级成纯文本——显示层的问题不能吞掉一整轮答复。"""
+
+    def _boom(_text):
+        raise RuntimeError("渲染炸了")
+
+    monkeypatch.setattr(panels, "Markdown", _boom)
+    assert panels.render_markdown("正文") is False
+
+
+def test_render_markdown_blank_text_is_noop():
+    """空白答复视为"无可渲染"返回 True：不打印，调用方也不会多打一行空行。"""
+    assert render_markdown("   \n") is True
+
+
+def test_terminal_ui_emit_uses_markdown_when_available(capsys, monkeypatch):
+    """渲染可用时 emit 走 render_markdown，答复不再是原样带标记的文本。"""
+    seen: dict = {}
+
+    def _fake(text, *args, **kwargs):
+        seen["text"] = text
+        return True
+
+    monkeypatch.setattr(tui_ui, "render_markdown", _fake)
+    TerminalUI().emit(TurnFinished(text="# 标题\n\n**粗体**"))
+
+    assert seen["text"] == "# 标题\n\n**粗体**"
+    out = capsys.readouterr().out
+    assert "#" not in out and "**" not in out  # 原样标记没漏到 stdout
+
+
+def test_terminal_ui_emit_falls_back_to_plain_text(capsys, monkeypatch):
+    """渲染不可用时 emit 原样打印答复——宁可朴素，也不能让人看不到答复。"""
+    monkeypatch.setattr(tui_ui, "render_markdown", lambda *a, **k: False)
+
+    TerminalUI().emit(TurnFinished(text="# 原始 **文本**"))
+
+    assert "# 原始 **文本**" in capsys.readouterr().out

@@ -1,11 +1,24 @@
-"""终端渲染素材：审批面板 / 标题框 / 截断——只把数据变成文本，不含判定也不读输入。
+"""终端渲染素材：审批面板 / 标题框 / 截断 / markdown 渲染——只把数据变成文本，不含判定也
+不读输入。
 
 位置：`app/tui/panels.py`（2026-09-10 基座/前端分家时从 app/tui/approval.py 拆出——判定面
 归基座 `app/platform/approvals.py`，渲染留前端）。
 
-本模块只有纯函数与常量：不发请求、不读 stdin、不改状态。
+本模块不发请求、不读 stdin、不改状态：除 `render_markdown` 往终端**写**渲染结果外都是纯函数
+（renders 本身就是"把数据变成终端输出"，归此天经地义）。
+
+markdown 渲染用 **rich**——它是**可选依赖**（pyproject 的 `ui` 组；实测常被 langchain /
+langsmith 传递装上）：装了就把模型答复渲染成有标题/列表/代码块的样式，没装就退回纯文本原样
+打印，不阻塞主流程（与 TAVILY_API_KEY 留空则跳过联网 server 同一取舍）。审批面板**不走**
+它：那里要精确等宽、不能重排（见 format_tool_approval）。
 """
 import json
+
+try:  # 可选依赖：没装则两个名字为 None，render_markdown 据此退回纯文本
+    from rich.console import Console
+    from rich.markdown import Markdown
+except ImportError:  # pragma: no cover —— 取决于环境是否装了 rich
+    Console = Markdown = None  # type: ignore[assignment,misc]
 
 # 界面标题：沿用仓库初始 main.py（git 历史 295a775 "初始化"）的 ASCII 框样式。
 USER_TITLE = """
@@ -77,3 +90,42 @@ def format_tool_approval(interrupts) -> str:
             lines.append(f"  调用ID: {tool_call_id}")
 
     return "\n".join(lines)
+
+
+# ------------------------- markdown 渲染（模型答复） -------------------------
+
+# 进程内单例 Console：写真实 stdout，宽度与终端能力（颜色 / 老 conhost 降级）由 rich 自己探测。
+# 缓存在这里而不是每次渲染新建，是为了让 rich 只做一次能力探测。
+_console = None
+
+
+def _terminal_console():
+    """终端渲染用的 Console 单例（rich 未装时不会被调用）。"""
+    global _console
+    if _console is None:
+        _console = Console()
+    return _console
+
+
+def render_markdown(text: str, console=None) -> bool:
+    """把模型答复的 markdown 渲染到终端；**rich 不可用或渲染失败 → 返回 False**。
+
+    调用方（`TerminalUI.emit` 的 `TurnFinished` 分支）据此回退成原样 `print(text)`——返回值
+    是"渲染过了吗"，不是"成功了吗"：两种 False 都只意味着"该由调用方自己打"。
+
+    - console：可注入（测试传 `Console(file=StringIO(), width=…)` 捕获输出并固定换行宽度）。
+      缺省用 `_terminal_console()` 写真实 stdout——**让 rich 自己处理终端能力**，比先捕获成
+      字符串再 `print` 稳妥（Windows 老 conhost 的降级要靠 rich 写出去时才生效）。
+    - 空白正文视为"无可渲染"直接返回 True：不打印，也不让调用方再打一行空行。
+    - 渲染异常只降级、不冒泡：这是**展示层**，任何显示问题都不该吞掉一整轮答复（宁可读起来
+      朴素，也不能让用户看不到答复）。
+    """
+    if not (text or "").strip():
+        return True
+    if Markdown is None:  # rich 没装（可选依赖）
+        return False
+    try:
+        (console or _terminal_console()).print(Markdown(text))
+    except Exception:  # noqa: BLE001 —— 见 docstring：展示层兜底，绝不吞掉答复
+        return False
+    return True
