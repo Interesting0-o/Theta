@@ -193,14 +193,20 @@ def test_skills_block_headers_loaded_names_and_inlines_bodies(skills_dir):
     assert "推送前先开分支" in text
 
 
-def test_skills_block_skips_unreadable_names(skills_dir):
-    """清单里有个已失效的名字（技能被删了）→ 跳过它，别崩也别注入空块。"""
+def test_skills_block_names_unreadable_names_as_unavailable(skills_dir):
+    """清单里有个已失效的名字（技能被删了）→ **显式点名告警**，不是静默丢掉。
+
+    静默丢 = 模型以为纪律还在（它是照 loaded_skills 里的名字行事），而正文与工具都已经是空的
+    ——正是 §3.5 要避免的影子态。点名叫它 drop_skill 是可行动的最小补救。
+    """
     _make_skill(skills_dir, "github", body="正文")
 
     text = skills.skills_block(["ghost", "github"])
 
     assert "当前已加载：github" in text
-    assert "ghost" not in text
+    assert "## github" in text  # 存活的那个照常内联
+    assert "已不可用" in text and "ghost" in text  # 失效的那个被点名
+    assert "drop_skill" in text  # 且给出补救动作
 
 
 def test_bodies_size_sums_loaded_bodies(skills_dir):

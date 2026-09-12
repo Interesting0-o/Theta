@@ -170,5 +170,37 @@
     "drop_skill":{
         "need_review":false,
         "source":"skill"
+    },
+    "github_auth_status":{
+        "need_review":false,
+        "source":"skills/github"
+    },
+    "github_repo_view":{
+        "need_review":false,
+        "source":"skills/github"
+    },
+    "github_tree":{
+        "need_review":false,
+        "source":"skills/github"
+    },
+    "github_file_read":{
+        "need_review":false,
+        "source":"skills/github"
+    },
+    "github_search_repos":{
+        "need_review":false,
+        "source":"skills/github"
+    },
+    "github_search_code":{
+        "need_review":false,
+        "source":"skills/github"
+    },
+    "github_issue_view":{
+        "need_review":false,
+        "source":"skills/github"
+    },
+    "github_pr_view":{
+        "need_review":false,
+        "source":"skills/github"
     }
 }

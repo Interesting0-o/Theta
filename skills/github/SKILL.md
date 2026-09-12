@@ -9,9 +9,14 @@ description: GitHub 平台操作（PR / issue / 分支 / 不克隆读远端代�
 > 由 **host 侧**（`get_skill`）读取并注入系统提示；**`server.py` 不读它，也不负责提供约束文本**
 > （见 [[docs/SKILL_DESIGN]] §2.2 的不变量）。**不要在代码里另抄一份约束文本。**
 >
-> 状态：**部分落地**（2026-09-12）—— 本文作为**知识型技能**已能被 `get_skill` 加载并注入系统提示
-> （通道见 [[docs/SKILL_DESIGN]] §11）。但 §1 声明的工具**一个都还没实现**（能力型所需的 `server.py`
-> 尚未编写），所以此刻加载它，读到的是一份"指向不存在工具的纪律"——一期验证的是通道，不是这些工具。
+> 状态：**只读子集已落地**（2026-09-12）——能力型通道已通（[[docs/SKILL_DESIGN]] §11/§13）：
+> `get_skill("github")` 会读本文注入系统提示，**并把 `server.py` 拉起来**、把 §1.1 里标 ✅ 的工具
+> 加进本会话；`drop_skill` 卸下时一并关掉。
+>
+> **尚未实现**：§1.2 的**写操作全部**（开 PR / 推送 / 合并 / 评论），以及 §1.1 里标 ⏳ 的几个只读
+> 工具（issue/PR 列表、diff、files、branch、release）。加载后若发现某个工具不在可用工具表里，
+> 就是它还没实现——**不要照着本文的工具名硬调**。
+>
 > **阅读顺序**：§2.1 硬约束是**结构性**的（不是你该不该遵守的问题，是系统根本不给通路），
 > §2.2 软约束是你**应当遵守**的行动指导。两者都不是建议。
 
@@ -21,19 +26,21 @@ description: GitHub 平台操作（PR / issue / 分支 / 不克隆读远端代�
 
 ### 1.1 只读（免审批）
 
-| 工具 | 作用 |
-| --- | --- |
-| `github_auth_status` | 确认当前 token 身份与可用 scope（诊断"为什么没权限"先调它） |
-| `github_repo_view` | 仓库元信息：描述 / 默认分支 / 语言 / 许可证 / star |
-| `github_tree` | 列**远端**目录树（`ref` 可指分支/tag/commit）——**不克隆** |
-| `github_file_read` | 读**远端**单个文件——**不克隆** |
-| `github_search_repos` | 按关键词搜仓库 |
-| `github_search_code` | 搜代码（可限 `repo` / `language`） |
-| `github_issue_list` / `github_issue_view` | 列 / 读 issue（含评论） |
-| `github_pr_list` / `github_pr_view` | 列 / 读 PR（含描述、评审状态、checks） |
-| `github_pr_diff` / `github_pr_files` | 读 PR 的 diff / 改动文件清单 |
-| `github_branch_list` | 列**远端**分支 |
-| `github_release_list` | 列 release / 版本（"这个库现在什么版本"） |
+| 工具 | 作用 | 状态 |
+| --- | --- | --- |
+| `github_auth_status` | 确认当前 token 身份与可用配额（诊断"为什么没权限"先调它） | ✅ |
+| `github_repo_view` | 仓库元信息：描述 / 默认分支 / 语言 / star / 开放 issue 数 | ✅ |
+| `github_tree` | 列**远端**目录树（`ref` 可指分支/tag/commit）——**不克隆** | ✅ |
+| `github_file_read` | 读**远端**单个文件（或列目录）——**不克隆** | ✅ |
+| `github_search_repos` | 按关键词搜仓库 | ✅ |
+| `github_search_code` | 搜代码（可限 `repo` / `language`） | ✅ |
+| `github_issue_view` | 读单个 issue（含正文 / 标签 / 评论数） | ✅ |
+| `github_pr_view` | 读单个 PR（状态 / 分支 / 增删行数 / 正文） | ✅ |
+| `github_issue_list` | 列 issue | ⏳ 未实现 |
+| `github_pr_list` | 列 PR | ⏳ 未实现 |
+| `github_pr_diff` / `github_pr_files` | 读 PR 的 diff / 改动文件清单 | ⏳ 未实现 |
+| `github_branch_list` | 列**远端**分支 | ⏳ 未实现 |
+| `github_release_list` | 列 release / 版本（"这个库现在什么版本"） | ⏳ 未实现 |
 
 > **`github_tree` + `github_file_read` 是"不克隆读代码"的主力**：只想看一个文件、一层目录时用它们，
 > 不要为了看一眼去 `git clone` 整个仓库（慢、占工作区、还可能触发审批）。
@@ -102,7 +109,12 @@ description: GitHub 平台操作（PR / issue / 分支 / 不克隆读远端代�
 
 ---
 
-## 3. 审批策略登记（落地时写进 `app/agent/tool.json`）
+## 3. 审批策略登记（`app/agent/tool.json`）
+
+> 本表是**这个领域的登记口径**；`app/agent/tool.json` 里此刻只有 ✅ 那 8 条 —— 写操作与 ⏳ 的工具
+> 等实现时再连同登记一起加。**登记是硬约束的落点**：一个工具若没登记（或 `source` 不是
+> `skills/github`），`get_skill` 会**拒绝加载整个技能**并告警——这是刻意的，"写操作默认免审"
+> 是不允许的失败形态（[[docs/SKILL_DESIGN]] §13.4）。
 
 | 工具 | `need_review` | `source` |
 | --- | --- | --- |
@@ -125,11 +137,14 @@ description: GitHub 平台操作（PR / issue / 分支 / 不克隆读远端代�
 | --- | --- | --- |
 | `GITHUB_TOKEN` | **是** | Personal Access Token。私有仓库读写需 `repo` scope；只碰公开仓库 `public_repo` 即可 |
 
-- 服务端按 [[docs/SKILL_DESIGN]] §9 的 `${VAR}` 声明式取用，**由启动器从配置转发**——
-  不要在技能代码里自己读 `.env` 或让模型去猜凭据从哪来。
-- **token 为空时**：服务端应当**拒绝启动并明确报错**（`ConfigError`），而不是让模型在调用时
-  撞一堆 401——参照 `mcp_service/web_search.py` 对 `TAVILY_API_KEY` 的处理，只是那里是"跳过 server"
-  （联网是可选能力），这里的方向相反：**用户既然要了 GitHub skill，缺 token 就该立刻说清楚**。
+- 声明在**同目录的 `skill.json`**（`{"env": ["GITHUB_TOKEN"]}`），由 host 侧按
+  `app/config.py::SKILL_ENV_WHITELIST` 从配置取明文转发进子进程 env——
+  **不要在技能代码里自己读 `.env`**，也不要让模型去猜凭据从哪来。
+  （空值 → `get_skill` 拒绝加载并回执点名 `GITHUB_TOKEN`，不会让模型撞一堆 401。）
+- **token 为空时的两道闸**：① host 侧先拦——`get_skill` 拒绝加载并回执点名 `GITHUB_TOKEN`
+  （模型看到的是一句可行动的话，不是一堆 401）；② `server.py` 在 **import 时**再校验一次并抛
+  `ConfigError`（照 `mcp_service/file_io.py` 校验 `WORKSPACE_PATH` 的做法，只是那里是"跳过 server"
+  ——联网是可选能力；这里方向相反：**用户既然要了 GitHub skill，缺凭证就该立刻说清楚**）。
 - **绝不允许把 token 写进**：代码、提交、PR 描述、issue 留言。需要引用时只写"见 `GITHUB_TOKEN`"。
 
 ---

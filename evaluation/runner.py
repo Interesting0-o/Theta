@@ -17,8 +17,9 @@ app/main.py 的循环是评估的原型——这里唯一的变化是把 `input(
   get_main_agent_graph，天然受 file_io 沙箱约束；
 - 加 max_rounds 上限：拒绝路径若死循环，评估必须能报错收场而不是挂死。
 
-已知代价：每任务建图会各自拉起一次 MCP 子进程组（mcp.py 有按工作区的进程级
-缓存，同工作区重复评估只付一次握手成本）。TODO：按工作区分组复用编译图。
+已知代价：每任务建图会各自拉起一次 MCP 子进程组（mcp.py 按工作区缓存工具 schema，
+实际运行体按 (工作区, 任务名) 懒起、任务结束即关，见 app/agent/mcp.py）。
+TODO：按工作区分组复用编译图。
 
 TODO（层 A）：无 LLM 成本的录制回放——把真实运行的 tool_calls 序列存下来，
 用 tests/ 里"假模型 + scripted AIMessage"的模式回放（tests/test_review_routing.py），
@@ -39,6 +40,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from app.agent.graph import get_main_agent_graph
+from app.agent.mcp import close_session_pool
 from app.agent.state import AgentState
 
 from .policy import Policy
@@ -70,13 +72,16 @@ class EvalResult:
     error: Optional[str] = None
 
 
-async def build_eval_graph(workspace: Path):
+async def build_eval_graph(workspace: Path, session: str):
     """按评估工作区编译图（InMemorySaver，不碰正式 agent.db）。
 
     工作区作为 workspace_path 实参传给 get_main_agent_graph：工作区注入、MCP 子进程
     拉起（子进程 env 由父进程据此注入）、沙箱校验都走现有链路。
+
+    session 决定 MCP 运行体的作用域（每任务一组，key=(工作区, 会话)）；调用方必须在任务结束时
+    `close_session_pool`，否则常驻子进程会跨任务累积。
     """
-    graph = await get_main_agent_graph(str(workspace))
+    graph = await get_main_agent_graph(str(workspace), session_id=session)
     return graph.compile(checkpointer=InMemorySaver())
 
 
@@ -174,10 +179,13 @@ async def run_suite(
         workspace = Path(tempfile.mkdtemp(prefix=f"eval-{task.name}-", dir=root))
         try:
             apply_setup(workspace, task.setup)
-            graph = await build_eval_graph(workspace)
+            graph = await build_eval_graph(workspace, task.name)
             result = await run_task(graph, task, workspace)
             outcomes.append((task, result, workspace))
         finally:
+            # 先关本任务的常驻 MCP 运行体、再删目录——顺序是硬的：server 的 cwd 就在工作区，
+            # 进程活着时（Windows 上）rmtree 删不掉；且不关就会跨任务累积子进程。
+            await close_session_pool(str(workspace), task.name)
             if not keep_workspace:
                 shutil.rmtree(workspace, ignore_errors=True)
     return outcomes

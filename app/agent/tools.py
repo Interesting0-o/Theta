@@ -20,22 +20,28 @@
 """
 import asyncio
 import json
+import logging
 import os
 import sys
 from datetime import date
+from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, List
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, InjectedToolArg, InjectedToolCallId, tool
 from langgraph.prebuilt import InjectedState
-from app.agent import memory, skills
+from app.agent import mcp, memory, skills
 from app.agent.state import AgentState
 from app.agent.utils import format_tool_result
-from app.schema.agent_schema import PlanStatus, PlanStep
+from app.config import skill_env
+from app.exception import ConfigError
+from app.schema.agent_schema import PlanStatus, PlanStep, SkillMeta
 
 # 项目根：spawn worker 子进程时 cwd 用项目根使 .env 可读（worker 内懒加载 get_main_chat_model）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -582,11 +588,104 @@ memory_tool: List[BaseTool] = [
 # 若正文既当 ToolResult 又注入系统提示，就是两份拷贝——而淘汰只能抹掉注入那份，"淘汰"就成了谎。
 # 只存名字让这条**结构性成立**：正文只有系统提示一个家，卸载 = 删一个名字。
 #
-# get_skill 要读 SKILL.md，故与记忆工具同样写成 async + asyncio.to_thread（避开 langgraph dev
-# 的 blockbuster）；drop_skill 只碰 state，保持同步（同 read_note）。
+# get_skill 要读盘 / 起进程，故与记忆工具同样写成 async + asyncio.to_thread（避开 langgraph dev
+# 的 blockbuster）；drop_skill 要 await 关运行体，也必须是 async（编排节点原生支持 async）。
 #
-# 技能源只有一个（项目根 skills/，见 app/agent/skills.py），所以这两个工具**不需要注入
-# workspace**——与 memory/dispatch 那两组不同。
+# 两个工具**都注入 workspace**：能力型技能要按工作区造连接（server 的 cwd = 工作区、env 里带
+# WORKSPACE_PATH），与 memory/dispatch 那两组同款（`InjectedWorkspace` 对模型隐藏）。
+# 技能**源**仍在项目根（不随工作区变），变的只是"它被拉起来时待在哪个工作区里"。
+#
+# 能力型的完整链路（§13）：get_skill 读正文 → 校验（目录名/会话/env/工具登记）→ 起 server →
+# 把工具加进本会话（mcp.register_server）→ 工具随下一次模型调用出现；drop_skill 反向移除。
+# **加载失败一律拒绝加载**（不写 loaded_skills）：语义一致——"已加载"意味着正文与工具都到位。
+
+
+@lru_cache(maxsize=1)
+def _tool_config() -> dict[str, dict]:
+    """`tool.json` 的解析结果（进程内只读一次）。审批策略与 source 的唯一权威表。
+
+    单独抽出来是为了给测试留缝：校验"技能的工具是否已登记"必须能注入假表，否则用例只能去改
+    仓库里真的 tool.json。
+    """
+    with _WORKER_TOOL_CONFIG.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def _skill_server_name(meta_or_name) -> str:
+    """技能运行体在 mcp 注册表里的 server 名：`skills/<目录名>`（= tool.json 的 source）。"""
+    dir_name = getattr(meta_or_name, "dir_name", meta_or_name)
+    return f"{skills.SKILLS_PACKAGE}/{dir_name}"
+
+
+async def _register_skill_runtime(
+    meta: SkillMeta, workspace: str, session: str | None
+) -> str | None:
+    """把能力型技能的 server 加进本会话；成功 → None，失败 → 可行动的错误正文。
+
+    顺序：**先把所有校验做完 → 再一次加入 → 逐条校验工具名 → 任一不满足就回滚**。
+    """
+    server = _skill_server_name(meta)
+
+    if not session:
+        return (
+            f"技能 {meta.name} 是能力型（带工具），但当前会话没有会话标识"
+            f"（state.session_id 为空），无法隔离它的运行体。知识型技能不受影响。"
+        )
+    if meta.name != meta.dir_name:
+        return (
+            f"技能 {meta.name} 带 server.py，但它的目录名 {meta.dir_name!r} 与技能名不一致——"
+            f"能力型要求两者相同（启动模块与工具登记都按目录名走）。"
+            f"请把 SKILL.md 的 name 改成目录名，或改目录名。"
+        )
+
+    try:
+        env = skill_env(await asyncio.to_thread(skills.read_skill_env, meta))
+    except ConfigError as exc:
+        return f"技能 {meta.name} 需要的凭证没配好，已拒绝加载：{exc}"
+
+    connection = mcp.stdio_connection(skills.server_module(meta), workspace, env)
+    existing_names = mcp.session_tool_names(workspace, session) | set(_ORCHESTRATE_TOOL_NAMES)
+
+    try:
+        names = await mcp.register_server(workspace, session, server, connection)
+    except Exception as exc:  # noqa: BLE001 —— 起不来就是加载失败，交给回执说清楚
+        return (
+            f"技能 {meta.name} 的 server 起不来或没列出工具，已拒绝加载："
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    problem = _check_skill_tools(meta, server, names, existing_names)
+    if problem is not None:
+        await mcp.unregister_server(workspace, session, server)
+        return problem
+    return None
+
+
+def _check_skill_tools(
+    meta: SkillMeta, server: str, names: list[str], existing_names: set[str]
+) -> str | None:
+    """校验技能带来的工具名（登记 / 重名 / 自重复）；有问题 → 可行动的错误正文。"""
+    duplicated = sorted({n for n in names if names.count(n) > 1})
+    if duplicated:
+        return f"技能 {meta.name} 暴露了重名工具 {duplicated}，已拒绝加载。"
+
+    clash = sorted(set(names) & existing_names)
+    if clash:
+        return (
+            f"技能 {meta.name} 的工具与已有工具重名：{clash}，已拒绝加载。"
+            f"请改名后重试（同名会让模型与审批策略都无法区分两者）。"
+        )
+
+    cfg = _tool_config()
+    unregistered = [n for n in names if cfg.get(n, {}).get("source") != server]
+    if unregistered:
+        return (
+            f"技能 {meta.name} 的工具没有在 app/agent/tool.json 里按要求登记：{unregistered}。"
+            f'请在 tool.json 为每个工具加一行 {{"need_review": true/false, "source": "{server}"}} '
+            f"后重试。**这是技能配置问题、不是你的调用方式问题**——请把这条回执告知用户，"
+            f"不要自己绕道（例如改用 read_file 去读技能目录）。"
+        )
+    return None
 
 
 @tool
@@ -594,31 +693,34 @@ async def get_skill(
     name: str,
     state: Annotated[AgentState, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId],
+    workspace: Annotated[str, InjectedWorkspace],
 ) -> dict:
-    """加载一个技能的正文，让这个领域的做法与纪律在本会话生效。
+    """加载一个技能：把它的正文注入系统提示，能力型还会把它的工具加进本会话。
 
     何时用：任务落进某个已安装技能覆盖的领域（如 GitHub 平台操作），而你需要那个领域的
     做法、约束或能力清单时——**先看本工具说明末尾的"可用技能"目录**，判断相关再加载。
-    技能一旦加载就在本会话常驻（每轮都在系统提示里），所以**不相关的别加**；
-    加载后不需要了，用 drop_skill 卸下、把预算还回来。
+    标 [带工具] 的技能加载后会多出一批工具（下一次模型调用就能看到）；技能一旦加载就在本会话
+    常驻（每轮都在系统提示里），所以**不相关的别加**；不需要了用 drop_skill 卸下、把预算还回来。
 
     Args:
         name: 技能名，取自本工具说明里的"可用技能"目录（如 "github"）。
         state: （系统自动注入，无需传入）当前 AgentState，读 loaded_skills。
         tool_call_id: （系统自动注入，无需传入）本次调用 id。
+        workspace: （系统自动注入，无需传入）当前工作区，能力型技能的 server 在它里面运行。
 
     Returns:
-        成功：回执（正文已进系统提示，下一次模型调用即可见）。
-        失败：技能名不存在（附可用清单）/ 已在加载中 / 正文预算已满（附已加载清单，
-        要求先用 drop_skill 卸下一个）。
+        成功：回执（正文已进系统提示；能力型另注明工具数）。
+        失败：技能名不存在（附可用清单）/ 已在加载中 / 正文预算已满（附已加载清单，要求先
+        卸一个）/ 能力型加载失败（缺凭证、目录名与技能名不一致、工具未登记或重名、server
+        起不来）——**失败即拒绝加载**，正文与工具都不会生效。
     """
     wanted = (name or "").strip()
     loaded = list(state.get("loaded_skills") or [])
 
-    body = await asyncio.to_thread(skills.read_body, wanted)
-    if body is None:
-        available = await asyncio.to_thread(skills.scan_skills)
-        names = "、".join(sorted(available)) or "（无）"
+    metas = await asyncio.to_thread(skills.scan_skills)
+    meta = metas.get(wanted)
+    if meta is None:
+        names = "、".join(sorted(metas)) or "（无）"
         return _tool_receipt(
             "get_skill", tool_call_id, f"技能 {wanted!r} 不存在。可用技能：{names}"
         )
@@ -626,6 +728,12 @@ async def get_skill(
     if wanted in loaded:
         return _tool_receipt(
             "get_skill", tool_call_id, f"技能 {wanted} 已在本会话加载中，无需重复加载。"
+        )
+
+    body = await asyncio.to_thread(skills.body_of, meta)
+    if body is None:
+        return _tool_receipt(
+            "get_skill", tool_call_id, f"技能 {wanted} 的正文读取失败（SKILL.md 读不到），未加载。"
         )
 
     # 预算满 → **拒绝**，并要求模型先卸一个（§3.5）。不静默淘汰：知识型技能没有可观测的
@@ -641,29 +749,34 @@ async def get_skill(
             f"请先用 drop_skill 卸下一个不再需要的技能，再重试。",
         )
 
+    if meta.capability:
+        # 能力型：先把它拉起来再加名字——**失败即拒绝加载**（不写 loaded_skills），
+        # 否则模型会以为工具可用，照着 SKILL.md 里的工具名去调、全部撞 unknown_tool。
+        problem = await _register_skill_runtime(meta, workspace, state.get("session_id"))
+        if problem is not None:
+            return _tool_receipt("get_skill", tool_call_id, problem)
+
     loaded.append(wanted)
+    content = f"已加载技能 {wanted}，其正文已进系统提示（下一次模型调用即可见）。"
+    if meta.capability:
+        content += "该技能带的工具也已加入本会话，下次模型调用即可调用。"
+    content += f"当前已加载：{'、'.join(loaded)}"
     return {
         "loaded_skills": loaded,
         "messages": [
-            ToolMessage(
-                name="get_skill",
-                tool_call_id=tool_call_id,
-                content=(
-                    f"已加载技能 {wanted}，其正文已进系统提示（下一次模型调用即可见）。"
-                    f"当前已加载：{'、'.join(loaded)}"
-                ),
-            )
+            ToolMessage(name="get_skill", tool_call_id=tool_call_id, content=content)
         ],
     }
 
 
 @tool
-def drop_skill(
+async def drop_skill(
     name: str,
     state: Annotated[AgentState, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId],
+    workspace: Annotated[str, InjectedWorkspace],
 ) -> dict:
-    """卸下一个已加载的技能，把它占的系统提示预算还回来。
+    """卸下一个已加载的技能：正文移出系统提示，（能力型）它的工具也从本会话移除。
 
     何时用：某领域的活干完了；或者 get_skill 报"预算已满"，你需要腾出位置加载别的技能。
     卸下后该技能的正文不再进系统提示，它的纪律与做法也就不再对你有约束力——需要时重新加载。
@@ -672,6 +785,7 @@ def drop_skill(
         name: 要卸下的技能名（当前已加载清单里的名字）。
         state: （系统自动注入，无需传入）当前 AgentState，读 loaded_skills。
         tool_call_id: （系统自动注入，无需传入）本次调用 id。
+        workspace: （系统自动注入，无需传入）当前工作区，用于关掉该技能在本会话的运行体。
 
     Returns:
         回执 + 卸下后的已加载清单；名字本就不在清单里则说明情况。
@@ -687,16 +801,25 @@ def drop_skill(
             f"技能 {wanted!r} 不在已加载清单里，无需卸下。当前已加载：{current}",
         )
 
+    session = state.get("session_id")
+    server = _skill_server_name(wanted)
+    released = False
+    if server in mcp.registered_servers(workspace, session):
+        # 能力型：把运行体一起关掉（§3.3 第二坑——拆 server 必须同时注销它的工具）。
+        # 名字不在注册表里（知识型，或运行体本来就没起来）就什么都不用做。
+        await mcp.unregister_server(workspace, session, server)
+        released = True
+
     loaded.remove(wanted)
     current = "、".join(loaded) or "（无）"
+    content = f"已卸下技能 {wanted}，其正文已从系统提示移除。"
+    if released:
+        content += "它的工具也已从本会话移除。"
+    content += f"当前已加载：{current}"
     return {
         "loaded_skills": loaded,
         "messages": [
-            ToolMessage(
-                name="drop_skill",
-                tool_call_id=tool_call_id,
-                content=f"已卸下技能 {wanted}，其正文已从系统提示移除。当前已加载：{current}",
-            )
+            ToolMessage(name="drop_skill", tool_call_id=tool_call_id, content=content)
         ],
     }
 
@@ -705,6 +828,94 @@ skill_tool: List[BaseTool] = [
     get_skill,
     drop_skill,
 ]
+
+# 编排工具（不走 tool.json 审批、也不在 MCP 工具表里）的名字集合——技能工具**不许与它们重名**：
+# 同名会让模型的两份 schema 指向同一个名字，而 tool.json 放不下两条同键登记。
+_ORCHESTRATE_TOOL_NAMES: frozenset[str] = frozenset(
+    t.name for t in (orchestrate_tool + note_tools + dispatch_tool + memory_tool + skill_tool)
+)
+
+
+class SessionToolset:
+    """"某会话当前可见的工具集"的接线点：LLMNode / ToolNode / ReviewNode 三家共用一份。
+
+    为什么落在 tools.py 而不是 mcp.py：它除了取工具，还要做**技能对账**——而"哪些名字是技能、
+    是不是能力型"是这边的知识（mcp.py 只认识 server，不认识技能这个概念）。
+
+    与 §13.2 原稿的差别：不另造"注册表对象"，运行时状态（谁注册了哪个 server、版本几）仍按
+    (工作区, 会话) 落在 mcp.py——与 §12 已落地的运行体注册表同源，避免两套平行状态各走各的。
+    """
+
+    def __init__(self, workspace: str, static_tools: list[BaseTool] | None = None) -> None:
+        self.workspace = workspace
+        # 静态工具（编排 / 笔记 / 派发 / 记忆 / 技能三件套）：它们不进 MCP 注册表，但**模型必须
+        # 一直看得到**——动态绑定若只给 MCP 工具，连 get_skill 自己都会从模型眼前消失。
+        self._static_tools = list(static_tools or [])
+
+    async def tools_and_version(self, state: AgentState) -> tuple[list[BaseTool], int]:
+        """给 LLMNode：当前工具表（静态 + MCP）+ 版本（版本变了才需要重新 `bind_tools`）。"""
+        session = state.get("session_id")
+        try:
+            await self._reconcile(state, session)
+        except Exception as exc:  # noqa: BLE001 —— 对账失败不许炸整轮（§13.3）
+            logger.warning("技能对账失败，本轮沿用现状：%s", exc)
+        return (
+            [*self._static_tools, *mcp.session_tools(self.workspace, session)],
+            mcp.tools_version(self.workspace, session),
+        )
+
+    async def tools_map(self, state: AgentState) -> dict[str, BaseTool]:
+        """给 ToolNode：按名查表。**每轮重解析**——技能可能在本回合的编排阶段刚被卸载。
+
+        只含 MCP 工具：编排工具走 OrchestrateNode，不经这里执行（若把静态工具也塞进来，
+        一个错误分流的编排调用会在这里被当成普通工具执行、撞上缺失的注入参数）。
+        """
+        session = state.get("session_id")
+        try:
+            await self._reconcile(state, session)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("技能对账失败，本轮沿用现状：%s", exc)
+        return {tool.name: tool for tool in mcp.session_tools(self.workspace, session)}
+
+    def known_names(self, state: AgentState) -> set[str]:
+        """给 ReviewNode：当前工具表里的名字集合（含编排工具）。同步、纯内存。"""
+        session = state.get("session_id")
+        static = {tool.name for tool in self._static_tools} or set(_ORCHESTRATE_TOOL_NAMES)
+        return mcp.session_tool_names(self.workspace, session) | static
+
+    async def _reconcile(self, state: AgentState, session: str | None) -> None:
+        """让"运行体"与 state 的 `loaded_skills` 对齐。
+
+        **快乐路径 = 一次内存集合比较**（两边一致就直接返回，不读盘、不起进程）——它每轮都会被调。
+        只在真不一致时才动手：
+
+        - 运行体在、state 里没有 → 注销。防的是"工具在、纪律不在"：注册成功但 state 没落
+          （回执写回前回合被取消），模型手里就会有工具、却没读过那个领域的约束；
+        - state 里有、运行体没有（进程重启、切会话转回来）→ 只重建**能力型**的那个。
+
+        ⚠️ 这里只有"只加不减"是不够的：两个方向都要对。**反向对账之所以安全，前提是运行体按
+        会话分片**（本设计如此）——若键退化成全局，双向对账会变成两个会话互相拆台。
+        """
+        loaded = {n.strip() for n in (state.get("loaded_skills") or []) if n and n.strip()}
+        prefix = f"{skills.SKILLS_PACKAGE}/"
+        registered = {
+            server.removeprefix(prefix)
+            for server in mcp.registered_servers(self.workspace, session)
+            if server.startswith(prefix)
+        }
+        if loaded == registered:
+            return
+
+        for extra in sorted(registered - loaded):
+            await mcp.unregister_server(self.workspace, session, f"{prefix}{extra}")
+
+        for name in sorted(loaded - registered):
+            meta = await asyncio.to_thread(skills.get_meta, name)
+            if meta is None or not meta.capability:
+                continue  # 知识型没有运行体；源被删的名字由 skills_block 的告警提示模型卸下
+            problem = await _register_skill_runtime(meta, self.workspace, session)
+            if problem is not None:
+                logger.warning("技能 %s 的运行体重建失败：%s", name, problem)
 
 
 def skill_tools_for() -> list[BaseTool]:

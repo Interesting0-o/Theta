@@ -35,7 +35,9 @@ async def build_session_runtime(workspace: str, session_id: str):
     checkpointer = AsyncSqliteSaver(connection)
     await checkpointer.setup()
 
-    graph = await get_main_agent_graph(workspace)
+    # session_id 一并传入：MCP 运行体按 (工作区, 会话) 隔离（terminal 的受管进程表是会话
+    # 语义状态，跨会话共享即泄漏）；切会话时由 AgentPlatform.switch_session 关掉旧会话的池。
+    graph = await get_main_agent_graph(workspace, session_id)
     compiled = graph.compile(checkpointer=checkpointer)
     config: dict = {"configurable": {"thread_id": session_id}}
     step = lambda inputs: compiled.ainvoke(inputs, config)  # noqa: E731

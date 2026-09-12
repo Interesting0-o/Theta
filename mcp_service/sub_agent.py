@@ -214,13 +214,16 @@ async def run_subtask_impl(
 
     workspace = str(Path(workspace).expanduser().resolve())
 
+    # 会话 id 先生成：它既是图 state 的 session_id，也是 MCP 运行体的作用域键（app/agent/mcp.py）。
+    session_id = uuid.uuid4().hex
+
     if tools is None:
-        tools = worker_tools(await load_mcp_tool(workspace))
+        tools = worker_tools(await load_mcp_tool(workspace, session_id))
 
     graph = get_sub_agent_graph(tools, workspace, model=model)
 
     state: dict = {
-        "session_id": uuid.uuid4().hex,
+        "session_id": session_id,
         "messages": [HumanMessage(content=task)],
         "pending_tool_calls": [],
         "approved_tool_calls": [],

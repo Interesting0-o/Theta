@@ -10,6 +10,7 @@ from app.agent.model import get_main_chat_model
 from app.agent.prompt import WORKER_SYSTEM_PROMPT
 from app.agent.mcp import load_mcp_tool
 from app.agent.tools import (
+    SessionToolset,
     orchestrate_tool,
     note_tools,
     dispatch_tool,
@@ -53,13 +54,17 @@ def should_continue_after_orchestrate(state: AgentState):
     return "tool_node" if state.get("approved_tool_calls") else "llm_node"
 
 
-async def get_main_agent_graph(workspace_path: str | None = None):
+async def get_main_agent_graph(workspace_path: str | None = None, session_id: str | None = None):
     """
     返回未编译的 StateGraph（compile 由调用方完成，以支持挂 checkpointer 的 interrupt 审批）。
 
     工作区是显式参量（见 _resolve_workspace）：TUI 由 run_tui 传入启动目录、
     evaluation/runner 传入各任务临时工作区；langgraph dev/Platform 经
     get_main_agent_graph_langgraph 零参调用 → 默认 <项目根>/tmp。
+
+    session_id 同样是构造期参量：它决定 MCP **运行体的作用域**（(工作区, 会话) 一个池，
+    见 app/agent/mcp.py）。TUI 传真实会话 id、evaluation 传任务名、worker 传自己的会话 id；
+    零参入口（langgraph dev）为 None → 所有会话共享一组运行体（已知偏差）。
     """
     workspace_path = _resolve_workspace(workspace_path)
     # 默认 tmp 工作区需存在：os.makedirs 属阻塞调用，放到线程执行（blockbuster 不拦）
@@ -67,33 +72,36 @@ async def get_main_agent_graph(workspace_path: str | None = None):
         await asyncio.to_thread(DEFAULT_WORKSPACE.mkdir, parents=True, exist_ok=True)
 
     graph = StateGraph(AgentState)
-    mcp_tools = await load_mcp_tool(workspace_path)
+    # 核心 MCP 工具仍要在这里"加载"一次：它把 shim 表按 (工作区, 会话) 建起来，而动态工具集
+    # 每轮就是从那份缓存里取的。**绑定**不在这里做了（见下）。
+    await load_mcp_tool(workspace_path, session_id)
 
     # 技能目录在**构图期**烤进 get_skill 的 docstring（§3.2）——装技能是低频事件，
-    # "扫一次、重开会话生效"够用（同 AGENT.md 的实例内 memo）。技能**带来**的工具不在这里，
-    # 二期能力型才需要（那时它们才进 ToolNode）。
+    # "扫一次、重开会话生效"够用（同 AGENT.md 的实例内 memo）。
     skill_tools = skill_tools_for()
+    static_tools = orchestrate_tool + note_tools + dispatch_tool + memory_tool + skill_tools
 
-    # 模型能看到全部工具（含计划工具）；但只有"可执行工具"会进 review→tool_node
-    all_tools = (
-        orchestrate_tool + note_tools + dispatch_tool + memory_tool + skill_tools + mcp_tools
+    # 动态工具集（§13.4）：技能加载/卸载会改工具表，三个节点共用这一份接线——技能对账
+    # （state 说加载了、运行体没有 → 重建）也在它里面。
+    toolset = SessionToolset(workspace_path, static_tools)
+
+    # 模型**不在这里 bind_tools**：交给 LLMNode 按工具集版本做（只在版本变化时重绑）。
+    # 仍传未绑定的原始 model —— binding 上没有再 bind_tools 的能力。
+    model = get_main_chat_model()
+
+    graph.add_node(
+        "llm_node", LLMNode(model=model, workspace_path=workspace_path, toolset=toolset)
     )
-    model = get_main_chat_model().bind_tools(all_tools)
-
-    graph.add_node("llm_node", LLMNode(model=model, workspace_path=workspace_path))
     graph.add_node("queue_node", QueueNode())
     # dispatch_subtasks（spawn worker）与 memory 读写（定位 memory.md）都需要工作区，
-    # 由 node 按签名注入（InjectedWorkspace 对模型隐藏）；技能工具不需要工作区（源只有一个，
-    # 在项目根，见 app/agent/skills.py）
+    # 由 node 按签名注入（InjectedWorkspace 对模型隐藏）；技能工具也要工作区——能力型的 server
+    # 在它里面运行（cwd / WORKSPACE_PATH），虽然技能**源**在项目根、不随工作区变。
     graph.add_node(
         "orchestrate_node",
-        OrchestrateNode(
-            orchestrate_tool + note_tools + dispatch_tool + memory_tool + skill_tools,  # type: ignore[arg-type]
-            workspace_path=workspace_path,
-        ),
+        OrchestrateNode(static_tools, workspace_path=workspace_path),  # type: ignore[arg-type]
     )
-    graph.add_node("review_node", ReviewNode())
-    graph.add_node("tool_node", ToolNode(mcp_tools))  # type: ignore
+    graph.add_node("review_node", ReviewNode(toolset=toolset))
+    graph.add_node("tool_node", ToolNode(toolset=toolset))  # type: ignore
     compact_node = CompactNode()
     graph.add_node("compact_node", compact_node)
 
@@ -140,6 +148,9 @@ async def get_main_agent_graph_langgraph():
 
     langgraph.json 的 my_agent 指向本函数（而不是 get_main_agent_graph——后者带
     workspace_path 参量，框架按签名调用不可靠）。零参调用保证框架不把 config 当参量塞进来。
+
+    代价之一是 MCP 运行体拿不到会话（session_id=None）：该路径下所有会话共享一组常驻运行体，
+    且没有关闭时机（本路径无 finally）——已知偏差，见 docs/SKILL_DESIGN.md §12。
     """
     return await get_main_agent_graph()
 

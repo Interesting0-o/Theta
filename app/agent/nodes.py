@@ -58,7 +58,10 @@ class LLMNode:
         workspace_path: str | None = None,
         system_prompt: str = SYSTEM_PROMPT,
         inject_session_context: bool = True,
+        toolset=None,
     ) -> None:
+        # `model` 是**未绑定**的原始模型：给了 toolset 就由本节点按工具集版本调 bind_tools
+        # （技能加载/卸载会改工具集）。没给 toolset（worker、单测）就用原样传进来的 model。
         self.model: Runnable = model
         self.workspace_path: str | None = workspace_path
         self.system_prompt: str = system_prompt
@@ -67,6 +70,13 @@ class LLMNode:
         self.inject_session_context: bool = inject_session_context
         # 项目画像实例内 memo：会话第一次启动时读入，之后复用（§4；画像慢变）
         self._profile_block: str | None = None
+        # 动态工具集（app/agent/tools.py::SessionToolset）：None = 静态绑定，行为与改造前一致
+        self.toolset = toolset
+        # ⚠️ 当前 binding 与"未绑定 model"**必须分开存**：`RunnableBinding` 上**没有** bind_tools
+        # （那只定义在 BaseChatModel 上），若把 binding 覆盖回 self.model，第二次版本变化就会
+        # AttributeError: 'RunnableBinding' object has no attribute 'bind_tools'。
+        self._bound: Runnable | None = None
+        self._bound_key: tuple | None = None
 
     @staticmethod
     def format_plan_status(step: PlanStep) -> str:
@@ -137,8 +147,27 @@ class LLMNode:
                 system_messages.append(SystemMessage(content=skill_text))
 
         messages = [*system_messages, *state["messages"]]
-        res = await self.model.ainvoke(messages)
+        model = await self._model_for(state)
+        res = await model.ainvoke(messages)
         return {"messages": [res]}
+
+    async def _model_for(self, state: AgentState) -> Runnable:
+        """取本次要用的模型：按工具集版本决定要不要重新 `bind_tools`（§3.4——不必每轮 bind）。
+
+        缓存键含 (工作区, 会话, 版本)：会话必须进键——同一节点实例可能服务多个会话
+        （langgraph dev 一图多 thread），只按版本比会把 A 会话的工具集绑给 B。
+        """
+        if self.toolset is None:
+            # 没有 toolset：**一次都不调 bind_tools**。worker 路径与一批单测的假模型只有
+            # ainvoke，无条件 bind 会把它们全打红。
+            return self.model
+
+        tools, version = await self.toolset.tools_and_version(state)
+        key = (self.workspace_path, state.get("session_id"), version)
+        if self._bound is None or self._bound_key != key:
+            self._bound = self.model.bind_tools(tools)
+            self._bound_key = key
+        return self._bound
 
     @staticmethod
     def agent_md_block(workspace_path: str, cap: int = AGENT_MD_INJECT_CAP) -> str:
@@ -180,16 +209,26 @@ class ToolNode:
     本节点只负责 ainvoke 执行已批准工具 + 拼 ToolMessage。
     """
 
-    def __init__(self, tools: list[Callable] | list[BaseTool]) -> None:
+    def __init__(self, tools: list[Callable] | list[BaseTool] | None = None, toolset=None) -> None:
+        # toolset 给了就**每轮重解析**工具表（技能可能在本回合的编排阶段刚被卸载/加载）；
+        # 没给就用固定的 tools 列表——worker 路径与既有单测一字不变。
+        self.toolset = toolset
         self.tools_map = {}
 
-        for tool_obj in tools:
+        for tool_obj in tools or []:
             name = getattr(tool_obj, "name", None)
             if name:
                 self.tools_map[name] = tool_obj
 
+    async def _current_map(self, state: AgentState) -> dict:
+        """本次要查的工具表：给了 toolset 就现取（动态），否则用构造时的固定表。"""
+        if self.toolset is None:
+            return self.tools_map
+        return await self.toolset.tools_map(state)
+
     async def __call__(self, state: AgentState) -> dict | AgentState:
         tool_calls = list(state.get("approved_tool_calls", []))
+        tools_map = await self._current_map(state)
 
         results: list[ToolMessage] = []
 
@@ -199,10 +238,15 @@ class ToolNode:
             tool_call_id = tool_call.get("id", "unknown")
 
             extra: dict = {}
-            if not tool_name or tool_name not in self.tools_map:
+            if not tool_name or tool_name not in tools_map:
                 results.append(
                     ToolMessage(
-                        content=f"工具不存在或未注册: {tool_name}",
+                        content=(
+                            f"工具不存在或未注册: {tool_name}"
+                            f"（不在本会话当前可用的工具表里——可能所属技能刚被卸载、"
+                            f"或它的运行体已断开）。若仍需要它，请先用 get_skill 重新加载对应技能，"
+                            f"不要原样重试。"
+                        ),
                         tool_call_id=tool_call_id,
                         name=tool_name,
                         additional_kwargs={"error_type": "unknown_tool"},
@@ -210,7 +254,7 @@ class ToolNode:
                 )
                 continue
 
-            tool_obj = self.tools_map[tool_name]
+            tool_obj = tools_map[tool_name]
             try:
                 # MCP 工具是 async-only(只实现了 coroutine)，必须用 ainvoke
                 # (同步 invoke 会抛 "StructuredTool does not support sync invocation")
@@ -262,10 +306,62 @@ class ReviewNode:
         with _TOOL_CONFIG_PATH.open("r", encoding="utf-8") as file:
             return json.load(file)
 
-    def __init__(self, log: bool = True) -> None:
-        """log=False 供 stdio MCP server 型 worker 使用（stdout 即 JSON-RPC 协议，不能 print）。"""
+    def __init__(self, log: bool = True, toolset=None) -> None:
+        """log=False 供 stdio MCP server 型 worker 使用（stdout 即 JSON-RPC 协议，不能 print）。
+
+        toolset：给了才做"存在性 + 漏登记"那道防线（主图给；worker 与单测不给 → 行为与改造前一致）。
+        """
         self.tool_review = self._tool_config()
         self.log = log
+        self.toolset = toolset
+
+    def _known_names(self, state: AgentState) -> set[str] | None:
+        """当前可用的工具名（含编排工具）；无 toolset（worker / 单测）→ None = 不判存在性。"""
+        if self.toolset is None:
+            return None
+        return self.toolset.known_names(state)
+
+    def _decide(self, tool_name: str | None, tool_cfg: dict, state: AgentState) -> str:
+        """给一条待审调用定处置：`unknown` / `review` / `free`。
+
+        - **unknown**：名字不在当前工具表里（模型编的，或它所属技能刚被卸载）→ 回执、**不弹面板**。
+          否则模型每编一个名字就打断人一次，而它无论如何都会被 ToolNode 拒掉；
+        - **review**：`tool.json` 说要审批；**或**它在工具表里却没登记 —— 这条是 §13.4 的第二道防线
+          （fail-closed）：有人往 MCP server 加了个写工具却忘了登记，旧行为是"未登记 = 免审"，
+          等于静默放行一次写操作。限定在"在表里"是为了不误伤模型编出来的名字。
+        - **free**：登记过且 `need_review: false`。
+        """
+        if tool_name is None:
+            return "free"
+        known = self._known_names(state)
+        if known is not None and tool_name not in known:
+            return "unknown"
+        if tool_cfg.get("need_review"):
+            return "review"
+        if known is not None and tool_name not in self.tool_review:
+            return "review"
+        return "free"
+
+    def _unknown_result(self, state: AgentState, current_tool: dict) -> dict:
+        """未知工具：兑现悬空 tool_call + 回一条可行动回执（既不打扰人、也不放行去执行）。"""
+        tool_name = current_tool.get("name")
+        return {
+            "pending_tool_calls": list(state.get("pending_tool_calls", []))[1:],
+            "approved_orchestrate_calls": list(state.get("approved_orchestrate_calls", [])),
+            "approved_tool_calls": list(state.get("approved_tool_calls", [])),
+            "messages": [
+                ToolMessage(
+                    name=tool_name,
+                    tool_call_id=current_tool.get("id"),
+                    content=(
+                        f"工具不存在或未注册: {tool_name}"
+                        f"（不在本会话当前可用的工具表里——可能所属技能刚刚被卸载、或它的运行体"
+                        f"已断开）。若仍需要它，请先用 get_skill 重新加载对应技能；不要原样重试。"
+                    ),
+                    additional_kwargs={"error_type": "unknown_tool"},
+                )
+            ],
+        }
 
     async def __call__(self, state: AgentState) -> dict | AgentState:
         pending = list(state.get("pending_tool_calls", []))
@@ -281,7 +377,12 @@ class ReviewNode:
         approved = True
         denied_messages: list[ToolMessage] = []
 
-        if tool_name and tool_cfg.get("need_review"):
+        action = self._decide(tool_name, tool_cfg, state)
+        if action == "unknown":
+            # 模型编出来的名字（本会话根本没绑定过它）：回执而不弹面板，见 _decide 的说明
+            return self._unknown_result(state, current_tool)
+
+        if action == "review":
             payload = {
                 "type": "tool_approval",
                 "current_step": "1/1",

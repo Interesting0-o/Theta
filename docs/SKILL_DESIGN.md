@@ -1,7 +1,11 @@
 # Theta $\theta$ 技能（Skill）设计（草稿）
 
 > 状态标注：`[已落地]` = 已实现（可指到代码/测试）；`[未做]` = 目标态（设计方向，尚未实现）。
-> **一期已落地（2026-09-12）**：`get_skill` / `drop_skill` 通道（两型共用那半）已实现——见 §11「一期落地」。文中其余标 `[已落地]` 的仍是**既有基建**（当时为"将来复用"而标），不是 skill 能力本身；**能力型仍未实现**（`server.py` 生命周期、会话级注册表）。
+> **一期已落地（2026-09-12）**：`get_skill` / `drop_skill` 通道（两型共用那半）——见 §11「一期落地」。
+> **前置里程碑已落地（2026-09-12）**：§12 = 「MCP 运行体常驻化」（**通用基建，非 skill 专属**）——含它的承重约束（anyio × langgraph 的 Task 绑定），改那套机制前必读。
+> **二期已落地（只读子集，2026-09-12）**：§13 = 能力型——技能可以带 `server.py`，工具随加载出现、随卸载消失。
+> **未做**：GitHub 的写操作与部分只读工具（§13.9）、技能运行体的空闲回收、`/skills` 命令、§6 的 fork 执行、§10 的命令收敛。
+> 文中标 `[已落地]` 的另一些是**既有基建**（当时为"将来复用"而标），不是 skill 能力本身。
 > 相关：[[docs/ARCHITECTURE]] §4（"图内一条边" vs "基座上一类事件"的判据）、[[docs/MULTI_AGENT]] §6（统一审批视图 / 子 agent 写权限下放）、[[docs/EXCEPTION_DESIGN]]（`guard` 与错误语义）、[[docs/CONTEXT_ENGINEERING]]（notes 的"轻注入"同构）、[[docs/LONG_TERM_MEMORY]]（工作区内容 → 注入的既有通道）。
 
 ---
@@ -88,6 +92,8 @@
 - **idle 计时不能把"park 等审批"算进去。** 一次 `github_pr_merge` 挂起等人按 y/n，人可能十分钟后才回；若按 wall-clock 计 idle，server 会在 park 中途被拆掉。计时以"最近一次工具调用**完成**"为基准，挂起期间冻结。
 - **拆 server 必须同时注销它的工具**（否则模型会去调已经不存在的工具）——这条与 §3.4 的 (b) 注册表强耦合。
 
+> **本节的两个坑已落地 → §12**（"懒起 + idle 回收"改成了**常驻到宿主关闭**，理由见 §12.3 决定 4；另有一处实测结论：改造前项目里**根本没有池**，连核心四件套都是每次调用重起 server 子进程，已造成 `terminal` 的跨调用缺陷）。本节留作**为什么需要常驻**的论证，机制细节不复述。
+
 ### 3.4 ⚠️ 鸡生蛋：工具什么时候 bind 到模型上 → **已定：走 (b) 真·动态绑定**（2026-09-11）
 
 现状是**构图期**一次 `load_mcp_tool` → `bind_tools(all_tools)`、`ToolNode` 持固定 `tools_map`——工具集**构图期定死**。而 skill 的工具在 `get_skill` 之前不存在。两条路：
@@ -109,6 +115,11 @@
 - **卸载有两条触发路径，走同一个卸载函数**：① **模型显式关**（`drop_skill`，主动、便宜）；② **idle 超时**（§3.3，被动、保证进程不堆积）。**两条都要**——只给模型权力，它可能忘记关；只靠超时，则白占一段时间的上下文与进程。
 - **`tool.json` 仍是静态的**（skill 的工具预先登记，§8.3）——所以 `ReviewNode` 的查表不受动态绑定影响，只是"注册表里有这个工具吗"要问注册表。
 - **这是本项目第一个"运行中改变工具集"的机制**，值得单独立项、单独测。
+
+> **已落地（2026-09-12）→ §13.2/§13.4/§13.6**。三处与本节原稿不同：① "注册表 = 会话级对象"简化成
+> **技能 = 按需加入的 server**（运行时状态按 (工作区, 会话) 落在 `app/agent/mcp.py`，与 §12 同源，
+> 不另造对象）；② 卸载**只剩一条路径** `drop_skill`（不做 idle 回收，与 §12 决定 4 一致）；
+> ③ `version` 计数与"只在版本变化时 bind"照原样落地（`LLMNode` 持未绑定 model + 按版本缓存 binding）。
 
 ### 3.5 注入机制：正文怎么进系统提示（2026-09-11 定）
 
@@ -290,7 +301,7 @@ skills/<name>/
 
 - ~~**(a) vs (b)**（§3.4）：先做 (a) 验证价值，还是直接上 (b)？~~ → **已决（2026-09-12）：(a) 不做，直接上 (b)。** 与 §3.4 的口径就此统一（此前 §3.4 已定 (b)、§9 却仍留"先做 (a)"，是两处没对齐）。
   > ⚠️ **代价说清**：能力型 skill 的"工具按需出现"因此**一期就得有 §3.4 的会话级注册表**，没有"先拿常驻 schema 探路"这条退路。若想一期避开注册表，唯一的路是**改做知识型优先**（知识型无工具，只动 state + `LLMNode`）；但 §2.1 定的优先序是能力型（只有它解决"能力当前根本没有"）。**两条不能都要**——先做哪个，见 §9 末「一期切法」。
-- **idle timeout 的取值与触发点**，以及"拆 server 同时注销工具"在 (b) 下怎么与注册表对齐。
+- ~~**idle timeout 的取值与触发点**，以及"拆 server 同时注销工具"在 (b) 下怎么与注册表对齐。~~ → **已决（2026-09-12）**：核心四件套**不做空闲回收**（常驻到宿主关闭，§12.3 决定 4），所以没有"取值与触发点"这回事；"拆 server 必须同时注销工具"在 **§13.6 的 `unload`** 里落（技能运行体的关闭是 §13 自己的事——见 §13.6 括注）。
 
 **约束承载**
 
@@ -301,7 +312,7 @@ skills/<name>/
 
 **环境与凭证**
 
-- **env 声明 / 凭证转发**：GitHub 要 token，而 `_build_servers` / `_worker_child_env` 都是**逐 server 硬编码 env、整体替换**。通用化就得有"这个 skill 需要哪些 env 键"的声明，由 launcher 从 `get_settings()` 取明文转发（同 TAVILY_API_KEY 的做法）。**不钉这条，skill server 拿不到凭证。**
+- **env 声明 / 凭证转发**：GitHub 要 token，而 `_build_servers` / `_worker_child_env` 都是**逐 server 硬编码 env、整体替换**。通用化就得有"这个 skill 需要哪些 env 键"的声明，由 launcher 从 `get_settings()` 取明文转发（同 TAVILY_API_KEY 的做法）。**不钉这条，skill server 拿不到凭证。** → **形态已定于 §13.5**（`skill.json` + host 侧白名单 + 缺键拒绝加载）；下面两条语法讨论作为 §13.5 的依据保留。
   - **语法可直接抄 `opencode-lazy-loader`**：skill 的 MCP 配置里写 `${VAR}` / `${VAR:-default}` 展开——简洁，且天然吻合本项目"键不可缺、值可空"的 `.env` 约定（空值 = 当未设置）。
   - **但展开必须白名单**：`${VAR}` 若能被 skill 任意点名，等于 skill 配置可读**进程里任何一个环境变量**（含 `CHAT_MODEL_API_KEY`）。只转发 skill **显式声明、且落在已知配置表**里的键，**不做通用 env 透传**。
 - ~~**依赖隔离**（§5.1）：skill 的三方库进主 `pyproject.toml`，还是做独立 venv / `uvx` 启动？~~ → **已决（2026-09-12）：同一个 venv**（所有 server 共用 `sys.executable`），skill 的三方库进主 `pyproject.toml`；**不做独立 venv / `uvx`**。
@@ -352,7 +363,300 @@ skills/<name>/
 
 **已知错配**：`skills/github/SKILL.md` 正文声明的 20 个工具此刻并不存在——它是能力型的稿子，一期验证的是**通道**（目录 → 加载 → 注入 → 卸载），不是那些工具。
 
-**二期（未做）**：能力型 `server.py` 生命周期、会话级工具注册表 + 动态 `bind_tools`、idle 回收、env 声明与白名单转发、`/skills` 控制面命令、§10 的 `PROMPT_COMMANDS` 收敛。
+**二期（未做）**：能力型 `server.py` 生命周期、会话级工具注册表 + 动态 `bind_tools`、env 声明与白名单转发、`/skills` 控制面命令、§10 的 `PROMPT_COMMANDS` 收敛。**前置里程碑 §12（MCP 运行体常驻化）已落地（2026-09-12）**，二期设计见 §13——它骑在那批常驻运行体上。
+
+---
+
+## 12. MCP 运行体常驻化（**通用基建，非 skill 专属**）——**已落地（2026-09-12）**
+
+> **位置说明**：这一节住在 skill 设计文档里，是因为它由 §3.3 的需要挖出来、二期骑在它上面；但它的**主体是 MCP 层**，不是 skill。将来它若长大（远程传输、可观测性），应独立成篇，不必因为它在本文里就把它读成 skill 的一部分。
+> **本节已落地**（落点见 §12.6、测试见 §12.7）。**改这套机制前先读 §12.2 的承重约束**——它决定了这套东西只能长成现在这个形状；初稿那份"池 + 事后惰性回收"的设计已被它证伪。
+
+### 12.1 改造前：没有池，而且已经坏了（**实测**，不是推理）
+
+`app/agent/mcp.py::load_mcp_tool` 用 `client.get_tools()` 拿工具。适配器这条路径的语义是 **每次调用新建会话**：
+
+- 源码：`langchain_mcp_adapters/tools.py` 里 `if session is None:` → `async with create_session(...)` + `await tool_session.initialize()`（**传了连接、没传会话**时走这条）；`client.get_tools()` 正是只传连接。
+- 观测：一次 `load_mcp_tool` 后连续调三个工具，服务端日志出现**三组** `ListToolsRequest` + `CallToolRequest`。
+
+stdio 下"新建会话"= **重起一个 `python -m mcp_service.*` 子进程 + 重新握手**。`_MCP_TOOLS_CACHE` 只缓存了**工具清单**，没缓存会话——它解决的是"langgraph dev 每次进图重拉子进程"，**没解决"每次调用重拉子进程"**。
+
+**后果不只是慢，是一处真实缺陷**（实测原文）：
+
+```
+start_process(...)  → "进程 p1 仍在运行（常驻）：已在后台常驻"
+下一次调用 process_list → "当前没有受管进程。"
+```
+
+`mcp_service/terminal.py` 的整套跨调用进程管理（`start_process` → `process_wait`/`process_read`/`process_kill`）在这个语义下**结构性失效**：句柄活在那个已经退出的 server 进程里，下一个调用是全新的空注册表。模型被告知"已常驻"，实际既认不到、也（子进程退出时 atexit 已）没人管。
+
+> 这条**独立于 skill** 就该修。skill 只是让"必须有池"这件事变得不可回避。
+
+### 12.2 承重约束：**anyio 的 cancel scope 与 asyncio Task 绑定**（本节最重要的新知）
+
+三条事实叠在一起，决定了唯一可行的机制形状：
+
+1. **anyio**：退出 cancel scope 时校验宿主 task —— `anyio/_backends/_asyncio.py` 在
+   `current_task() is not self._host_task` 时抛
+   `RuntimeError("Attempted to exit cancel scope in a different task than it was entered in")`。
+2. **langgraph**：`pregel/_executor.py` 经 `run_coroutine_threadsafe` → `langgraph/_internal/_future.py`
+   的 `loop.create_task(...)` 跑节点协程——**每个节点执行都在新 Task 里**。
+3. **MCP**：会话内部就是 `anyio.create_task_group()`（`mcp/client/stdio/__init__.py`、
+   `mcp/shared/session.py`），stdio 子进程挂在里面。
+
+**推论（改这套机制前必须记住）**：
+
+- 会话**建在** ToolNode 那个 Task 里，就**不能在**别的 Task 里关。所以初稿那份"池 + 事后惰性回收"
+  **不可实现**：清理动作会在退出路径上抛 RuntimeError，而且都在最难查的位置（TUI 退出、
+  evaluation 的 per-task finally——后者还会顶掉在传播的异常、打断整批评估）。
+- **复用**会话是安全的，只有**建与关**受约束。于是唯一可行的形状是**专职 owner task**：建、调用、关闭
+  全部发生在它自己的 Task 里（§12.4）。
+- 顺带解释了一件事：适配器"每次调用新建会话"很可能不是疏忽，而是这个执行模型下最省心的写法。
+  我们不是在修一个 bug，是在补一个**只有常驻才能有**的能力。
+
+### 12.3 常驻模型：四个已定的决定（2026-09-12）
+
+| # | 决定 | 理由 / 含义 |
+| --- | --- | --- |
+| 1 | **机制在 agent 层，生命周期归宿主** | 机制的落点是 `app/agent/mcp.py`（**不新增模块**）；"何时关"由宿主调 `close_session_pool` / `close_all_pools`。理由：worker 子进程（`mcp_service/sub_agent.py`）也要用同一套机制而**它没有平台**，机制不能寄生在平台里；关闭时机只有宿主知道 |
+| 2 | **作用域 = (工作区, 会话)** | 与 `session_db_path` 同口径。terminal 的受管进程表是**会话语义状态**，按工作区共享就会跨会话泄漏（A 会话起的进程 B 会话能看见、能杀） |
+| 3 | **懒起：首次真调用时** | 空会话零进程。schema 另走临时会话（按工作区缓存），所以构图期仍 spawn 一遍（与改造前相同），但**常驻体一个都不预养** |
+| 4 | **全部不回收（常驻到宿主关闭）** | 没有空闲计时器、没有 `busy` 计数、没有 sweep。terminal 的常驻进程因此不会被静默杀掉；代价是"进程只增不减"的担忧整体**交接给 §13**（卸载技能必须关运行体） |
+
+> **正面记下这次改口**：§3.3 写过"不是'懒起后常留'"。当时的假设是"skill 一多进程爆炸"；而 core 四件套的
+> 规模固定（每 (工作区, 会话) ≤4，按需起），且 terminal 的**跨调用状态只有常驻才能成立**。所以结论改了，
+> 理由是新的，不是被忘掉的。
+
+### 12.4 实现
+
+#### owner task：每 (工作区, 会话, server) 一个（`_ServerWorker`）
+
+任何 Task 都能 `call()`，但它只是把请求投进队列、等 owner 执行完：
+
+```
+call(tool_name, args)  →  _ensure_started()  →  队列投 (tool, args, fut)  →  await fut
+                                                          │
+_run()（owner task）：  queue.get() → 建会话（懒）→ 执行 → fut.set_result
+                        收到 _SHUTDOWN 哨兵 → 出循环 → stack.aclose()   ← 与创建同一个 Task
+```
+
+- **串行化是诚实的**：一条 stdio 管道本就串行；每 server 一个 owner，互不阻塞。**因此不需要 `busy`
+  计数、也不会有"回收正在用的会话"**——调用在飞时 owner 根本不在等队列。
+- **关闭走哨兵而非 `task.cancel()`**：取消会腰斩 `finally` 里的 `aclose`（子进程可能残留）；
+  哨兵让它走正常退出路径，且在途调用会被先处理完（队列有序）。
+- **自愈**：传输类异常（`anyio.ClosedResourceError`/`BrokenResourceError`/`EndOfStream`、`McpError`）
+  → 关掉当前会话 → 重建 → **重试一次**。改造前"每次调用重开进程"天然有这个能力，常驻后必须显式补回，
+  否则一个坏会话会让该会话**永久残废**。**业务错误不在此列**——`mcp_service` 的 guard 把工具失败收成
+  普通返回值，根本不以异常形态冒到这里。
+
+#### shim：工具**不绑会话**（关键解耦）
+
+`load_mcp_tools(session)` 返回的工具把会话**闭包**在 coroutine 里——会话一关，工具立刻报
+`ClosedResourceError`。所以不能"把会话连同它的工具一起放进池"（那样回收即废工具）。
+
+本项目的做法：`load_mcp_tool` 返回**自造的 `StructuredTool`**，只带 schema，执行时才向 owner 要会话：
+
+```
+async def _call(**kwargs):
+    worker = get_worker(workspace, session, spec.server, connection)   # 调用时解析，不闭包池对象
+    return (await worker.call(spec.name, kwargs), None)
+```
+
+三条**不能踩的坑**（改了就与改造前的模型可见文本不一致）：
+
+- **不给内层传 `tool_call_id` / `config`**：传了之后 `_format_output` 会提前返回
+  `ToolMessage(status="error")`，`format_tool_result` 的 content-block 分支失效，模型可见文本变样；
+- **不设 `handle_tool_error`**：内层（adapter 原生工具）已经吞掉 `ToolException`，这一层再也见不到它；
+  设 True 只会把漏出来的裸 `ToolException` 降级成信息更少的字符串；
+- **`args_schema` 原样搬运** MCP 的 `inputSchema`：不规范化成 pydantic、不 snake_case、不重排
+  （server 顺序 = connections 顺序、server 内 = list_tools 顺序）——schema 一变就污染 prompt cache
+  与评估复现。
+
+**形状契约已由测试锁死**：shim 的返回值与真 adapter 工具**逐字节同形**（四种变体：普通 content-block、
+`structuredContent` 非 None、`isError=True`、空 `content=[]`），模型可见文本因此不变。
+
+> 顺带修正一处**既有**认知：adapter 工具在 `tool_call_id is None` 时，`_format_output` 就已经丢掉了
+> artifact 与 `status="error"`——那是改造前就有的行为，不是 shim 引入的。
+
+#### 会话 id 的传递（决定 2 的实施前提）
+
+`session_id` 成为图的**构造期参量**（与 `workspace_path` 同级），不做运行时注入：
+
+| 路径 | 会话来源 | 关闭时机 |
+| --- | --- | --- |
+| **TUI** | `build_session_runtime(workspace, session_id)` 原样传入 | ① `/session`、`/new session` → `switch_session` 关**旧会话**；② `run()` 的 finally 关全部（先 `await` 被取消的 turn，避免与在途调用并发踩同一运行体） |
+| **evaluation** | `build_eval_graph(workspace, session)`，调用方传 `task.name`（与 state 的 `session_id` 一致） | 每任务 finally —— **必须在 `shutil.rmtree` 之前**（见 §12.5） |
+| **worker 子进程** | `sub_agent.py` 先生成 uuid 再 `load_mcp_tool` | 不显式关：父进程死后 stdin EOF → 子进程正常退出 → `atexit` 照跑 |
+| **langgraph dev** | 零参入口 → `None` | **没有关闭时机**（该路径无 finally）——已知偏差，见 §12.5 |
+
+### 12.5 常驻的后果与代价（用户可见，别当实现细节）
+
+1. **配置在启动时刻固化**：env / cwd / `WORKSPACE_PATH`（`mcp_service/file_io.py` 在 **import 时**校验）
+   都是建运行体时定的 → 改 `.env`（如换 `TAVILY_API_KEY`）需重开会话。
+2. **Windows 下"活着的 server"会让工作区删不掉**：server 的 cwd 就是工作区。所以 evaluation 里
+   "先关池、再 rmtree"是**硬顺序**，不是优化。（`create_session` 的 teardown 会关 stdin、等进程退出、
+   超时后 SIGKILL，故 `aclose` 返回即子进程已收。）
+3. **`terminal._PROCS` 成为会话级状态**：这正是本次要修的东西，也意味着长会话里受管进程会累积——
+   模型需自己 `process_kill` 收尾，退出时 terminal 自己的 `atexit` 兜底。
+4. **进程上界**：每 (工作区, 会话) ≤ server 数（当前 4），**按需起**（只用 file_io 就只起一个）。
+   TUI = 1 会话；evaluation 靠 per-task 关闭压回；langgraph dev 会累积（无关闭点）。
+5. **langgraph dev 的偏差**：该入口零参、没有会话，故所有会话共享一组运行体、且随 server 生命周期累积。
+   开发工具，接受并记录在案。
+6. **可观测性**：四条 `logger` 生命周期日志——**建**（server + 工作区 + 会话 + 工具数）/ **关闭** /
+   **传输失败重建** / **更换事件循环丢弃**。"为什么有进程、这次为什么慢"要能答。
+
+### 12.6 落地清单（2026-09-12）
+
+| 落点 | 内容 |
+| --- | --- |
+| **`app/agent/mcp.py`** | 三件事合一：`_build_servers`（连接配置）、`_tool_specs` + `_make_shim` + `load_mcp_tool`（工具加载，**不绑会话**）、`_ServerWorker` + `get_worker` + `close_session_pool` / `close_all_pools`（运行体常驻）。原 `_MCP_TOOLS_CACHE` 从"缓存工具对象"改成"缓存 shim"，另加按工作区的 schema 缓存 |
+| `app/agent/graph.py` | `get_main_agent_graph(workspace_path=None, session_id=None)` → 传给 `load_mcp_tool` |
+| `app/platform/runtime.py` | `build_session_runtime` 把会话 id 传进构图 |
+| `app/platform/loop.py` | 两个宿主挂点：`switch_session` 关旧会话、`run()` finally 关全部（`app.agent.*` 懒加载，保持"无 .env 可顶层 import 基座"） |
+| `evaluation/runner.py` | `build_eval_graph(workspace, session)`；每任务 finally **先关池后 rmtree** |
+| `mcp_service/sub_agent.py` | 会话 id 提前生成（一处顺序调整） |
+| **`mcp_service/terminal.py`** | **一行没改**——跨调用进程管理自动恢复，这是"通用池化"相对"只为 skill 做池"的直接收益 |
+
+### 12.7 测试与验证
+
+- **新增 `tests/test_mcp_pool.py`**（13 例，不拉真 MCP）：复用不重起、**关闭发生在 owner 的 Task 里**
+  （假会话的 `__aexit__` 断言创建者一致——把承重约束变成红灯）、按会话隔离、关闭后透明重建、
+  传输失败自愈、调用方被取消不打死 owner、**shim 与原 adapter 工具形状逐字节同形**（4 变体）、
+  保名保序 + `worker_tools` 过滤照旧、shim 缓存按会话分键、关闭时路径归一化。
+- **端到端验收**（缺陷判据，实测通过）：`start_process` 起常驻进程 → **下一次调用** `process_list`
+  认得它 → `process_read` / `process_kill` 通；`_WORKERS` 里只有真正用到的 server（懒起成立）；
+  关池后注册表空、再调用透明重建。
+- **全量回归**：`python -m pytest` → **295 passed / 4 skipped**（无回归）。
+
+### 12.8 遗留与交接
+
+- **不做空闲回收**（决定 4）⇒ 这条交接给 §13：**`drop_skill` 必须关掉该技能的运行体**，否则加载过的
+  技能会永久占着进程（这正是 §3.6"进程只增不减"担忧的新落点）。
+- **terminal 受管进程的自动上界**：现在靠模型自觉 `process_kill` + 退出时 atexit。有真实需求再单列。
+- **传输面**：本设计假定 stdio。远程 / HTTP MCP（[[docs/MULTI_AGENT]] §9 的未落地项）进来时，
+  运行体的键与生命周期要重看。
+- **`_spawn_subagent_worker`（`app/agent/tools.py`）刻意没接进来**：它自建 client、每子任务一个进程，
+  那正是子任务要的**进程隔离**；接进池会让子任务间状态互相污染。
+
+---
+
+## 13. 能力型：技能自带的工具（**已落地：只读子集**，2026-09-12）
+
+> **本节已落地**（落点见 §13.7、测试见 §13.8）。**机制在实现时被简化过一次**：原稿打算"造一个会话级
+> 注册表对象、注入三个节点"，实现时发现 §12 的常驻运行体本来就是"任意 server 的运行体"——技能只是
+> 第五类 server。于是改成 **技能 = 按需加入的 server**，mcp.py 只多一条"运行中增删 server"的能力。
+> 下面按落地后的口径写；原稿的推理只在容易误解的地方留一句对照。
+
+### 13.1 一句话
+
+**能力型 = 知识型 + 一个进程**（§2.1）：`get_skill` 除注入正文外，把技能目录里的 `server.py` 拉起来、
+把它的工具加进**本会话**；`drop_skill` 关掉运行体、移除工具。**工具随加载出现、随卸载消失。**
+
+### 13.2 机制：技能 = 按需加入的 server
+
+| 落点 | 职责 |
+| --- | --- |
+| `mcp.register_server` / `unregister_server` | 加/减一个 server 的工具，维护**工具集版本** |
+| `mcp.session_tools` / `session_tool_names` / `registered_servers` / `tools_version` | 取当前工具表 / 名字集合 / 已注册 server / 版本（**同步纯内存**，每轮都被调） |
+| `skills.server_module` / `read_skill_env` | 按**目录名**拼 import 路径 / 读 `skill.json` 的 env 声明 |
+| `tools.get_skill` / `drop_skill` | 加载期的四道校验 + 加/减；失败即回滚 |
+| `tools.SessionToolset` | 三节点共用的接线点（取工具 + **双向对账**） |
+
+**mcp.py 不认识"技能"**：它只知道"某会话多了一个 server"。技能的知识（目录名、`skill.json`、
+`tool.json` 的登记口径）全在 skills.py / tools.py 这一侧。
+
+**会话键 = `state["session_id"]`**（不是构图期参量）：两个真实宿主里两者相同（TUI = 会话 id、
+evaluation = `task.name`，关池用的也是它）；langgraph dev 零参 → `None` → **禁止注册能力型**
+（否则所有 thread 共享一组工具）。这也是 §12"运行体按 (工作区, 会话) 分片"的同一个键。
+
+### 13.3 加载期的四道校验（**失败即拒绝加载**）
+
+能力型在写 `loaded_skills` 之前依次过四关，任一不过 → 回滚 + 可行动回执 + **不写 `loaded_skills`**
+（"已加载"必须意味着正文与工具都到位）：
+
+1. **目录名**：要求 frontmatter 的 `name` == 目录名（启动模块与 `source` 都按目录名走），且目录名
+   是合法 Python identifier（不是 → `scan_skills` 直接把它降级为知识型，正文仍可用）；
+2. **会话**：`state["session_id"]` 非空；
+3. **凭证**：`skill.json` 声明的键必须在 `app/config.py::SKILL_ENV_WHITELIST` 里、取值非空；
+4. **工具名**：server 真暴露的每个工具都必须在 `tool.json` 登记、`source == skills/<目录名>`，
+   **且不与核心工具 / 编排工具 / 其它已加载技能重名**（同名会让模型与审批策略都无法区分两者）。
+
+第 4 条同时是**未登记工具的防线**：旧行为里"未登记 = 免审"，对写操作等于静默放行。
+
+### 13.4 动态 bind 与限定版 fail-closed
+
+- `LLMNode` 持**未绑定** model + `SessionToolset`，按 `(工作区, 会话, 版本)` 缓存 binding，**只在版本
+  变化时**重绑（§3.4 的原意）。`RunnableBinding` 不能再 `bind_tools`，所以"未绑定 model"与"当前
+  binding"**必须分字段存**；`toolset is None`（worker / 单测）时**一次都不调** `bind_tools`。
+- `ToolNode` 每轮从 toolset 取表——**必须每轮重解析**：同回合 `[drop_skill(A), A_tool()]` 在动态表下
+  走 `unknown_tool`（正确）；在固定表下，shim 会在调用时把已卸载的运行体**重新造出来**（"卸载"失效）。
+- `ReviewNode` **不再是原稿说的"不变"**：除按 `tool.json` 判 `need_review`，还多一道**限定版 fail-closed**
+  ——名字**在当前工具表里**却没登记 → 转审批；名字**压根不在表里**（模型编的）→ 直接回 `unknown_tool`
+  回执、**不弹面板**（否则每编一个名字就打断人一次，而它无论如何都会被 ToolNode 拒掉）。
+
+### 13.5 env 声明与转发
+
+- 载体 = `skills/<name>/skill.json`（`{"env": ["GITHUB_TOKEN"]}`）——**不塞进 SKILL.md 的 frontmatter**
+  （那里只认单行 `key: value`，列表要另写解析）。
+- 白名单落 `app/config.py::SKILL_ENV_WHITELIST`（env 键 → Settings 属性名）。**绝不通用透传**：技能
+  配置若能任意点名 `${VAR}`，就能读走 `CHAT_MODEL_API_KEY`。
+- 值必须从 `get_settings()` 取、**不能读 `os.environ`**：`.env` 是 pydantic-settings 自己读的文件，
+  其键值不在 `os.environ` 里——用 `os.environ.get` 会对用户写得清清楚楚的键报"未配置"。
+- `GITHUB_TOKEN` **带空默认**（`SecretStr("")`），**有意偏离**"所有字段无默认值"那条约定：技能是可
+  插拔的，它的凭证缺失不该让核心起不来；空值 = 该技能拒绝加载。
+- 键不在白名单 / 值为空 → `skill_env` 抛 `ConfigError`（带键名），由 `get_skill` 翻成回执。
+
+### 13.6 卸载：**只有一条触发路径**（对 §3.4"两条都要"的改口）
+
+**只靠 `drop_skill`**——不做空闲回收（与 §12 决定 4 一致：核心四件套也不回收）。代价说清：**模型忘
+了卸，那个技能的进程就一直占着**（靠 §13.7 的目录标记与正文预算压力推动它卸）。`unregister_server`
+里"摘 shim → 关运行体 → 版本 +1"是一步动作，§3.3 那个"拆 server 必须同时注销工具"的坑因此**结构性
+不存在**。
+
+### 13.7 落点清单（2026-09-12）
+
+| 落点 | 内容 |
+| --- | --- |
+| `app/schema/agent_schema.py` | `SkillMeta` 增 `dir_name` / `capability` |
+| `app/agent/skills.py` | `SKILLS_PACKAGE` / `SERVER_FILENAME` / `SKILL_CONFIG_FILENAME`；能力型判定（含 identifier 校验与降级）；`server_module` / `read_skill_env` / `get_meta` / `body_of`；`catalog_block` 标 `[带工具]`；`skills_block` 点名"已不可用的技能" |
+| `app/config.py` | `GITHUB_TOKEN`（可选带空默认）+ `SKILL_ENV_WHITELIST` + `skill_env` |
+| `app/agent/mcp.py` | `stdio_connection`（核心与技能共用）；**独立的 per-server schema 缓存**（见下）；`register_server` / `unregister_server` / `session_tools` / `session_tool_names` / `registered_servers` / `tools_version`；`close_session_pool` 一并清 extras 与版本 |
+| `app/agent/tools.py` | `get_skill` / `drop_skill`（加注入 workspace；drop 改 async）+ 四道校验 + `SessionToolset`（含双向对账）+ `_tool_config()` 校验缝 |
+| `app/agent/nodes.py` | `LLMNode` 动态 bind；`ToolNode` 动态查表 + 可行动 `unknown_tool` 文案；`ReviewNode` 限定版 fail-closed |
+| `app/agent/graph.py` | 主图装配 `SessionToolset(workspace, static_tools)`、model **不在此绑定**；worker 路径一行未改 |
+| `skills/github/` | `server.py`（8 个只读工具，stdlib HTTP）+ `skill.json` + `SKILL.md` 同步 |
+| `app/agent/tool.json` | 8 条 `skills/github` 登记（`need_review: false`） |
+
+**最硬的一处坑（写在这里防复发）**：`_TOOL_SPECS` 按**工作区**缓存"核心四件套"的 schema，内容是
+"调用方传进来的那批 connections"。若技能列 schema 复用它、只传技能自己的 connection，就会把该工作区
+的缓存覆盖成"只剩技能工具"——**之后每个新会话的核心工具都会静默消失**。所以技能走**独立的
+`_SERVER_SPECS`（键 = (工作区, server)）**，且两个列 schema 的函数都"完整列完后一次写入"。
+
+### 13.8 测试与验证
+
+- **`tests/test_skill_runtime.py`**（14 例）：加载/卸载、知识型不动工具、四道校验各一例、双向对账
+  （重建一次 + 幂等；运行体在而 state 没有 → 注销）、对账失败不炸整轮、动态 bind 只在版本变化时重绑 /
+  无 toolset 一次都不绑 / 工具表含静态工具，以及**一条真 spawn 的端到端**（`tests/fixtures/skills_pkg/echo/`：
+  真起 `python -m skills_pkg.echo.server` → 真调它的工具 → 卸载后运行体与子进程都被收掉；技能源与包名
+  一起指到 fixture，不碰仓库的 `skills/`）。
+- **端到端验收（实测通过）**：`load_mcp_tool` → `get_skill("github")` → 8 个 `github_*` 进表、核心 32 个
+  **不受影响**、版本 +1；真调一次工具 → 运行体键出现（懒起）；`drop_skill` → 工具与运行体一起消失、
+  版本再 +1；**另一会话的核心工具仍是完整 32 个**（锁住上面那颗雷）。
+- 全量 `python -m pytest`：**309 passed / 4 skipped**。
+
+### 13.9 待定 / 未做（本期边界）
+
+- **GitHub 的写操作**（开 PR / 推送 / 合并 / 评论）与 §1.1 里标 ⏳ 的只读工具 → 下一期；`SKILL.md`
+  §1.1/§1.2/§3 已把口径写好，实现时照它加工具 + 加 `tool.json` 登记行即可。PyGithub 依赖也留到那时
+  （§9 已决：共用 venv，不做隔离）。
+- **技能运行体的空闲回收**：已定不做（§13.6）。
+- **`/skills` 控制面命令**：注意它得读 **checkpoint 里的 `loaded_skills`**（注册表只反映本进程、不代表
+  状态），照 `app/platform/commands/session.py` 的 saver 读法。
+- **`ReviewNode._tool_config` 是 `lru_cache`**：改 `tool.json` 要重启进程才生效（装技能同理）。
+- **技能的 `sys.path` 面**：技能 server 的 `sys.path[0]` 是工作区（cwd），工作区里的同名模块可以
+  shadow 技能 server 的 import——核心 server 早有这个面，但技能把"可插拔任意代码"引进来，记在案。
+- **evaluation 与能力型**：带外依赖（token / 网络）会让评估结果不确定；评估任务要用技能得自己想清楚。
+
 
 ---
 
@@ -361,11 +665,13 @@ skills/<name>/
 | 模块 | 关系 |
 | --- | --- |
 | `mcp_service/`（file_io / terminal / git / web_search） | **内置核心能力**，skill 与它并列而不混入（§8.1）；`terminal.py::_deny_sudo` 是"结构性拒绝"的样板 |
-| `skills/<name>/`（**新增顶层库**） | 一个技能一个目录：`SKILL.md`（+ 可选 `server.py`）。首个 = `skills/github/` |
+| `skills/<name>/`（顶层库） | 一个技能一个目录：`SKILL.md` + 可选 `server.py`（能力型）+ 可选 `skill.json`（env 声明）。首个 = `skills/github/`（2026-09-12 起带 server.py，含 8 个只读工具） |
 | `mcp_service/sub_agent.py` + `app/agent/graph.py::get_sub_agent_graph` + `app/agent/tools.py::worker_tools` | **fork 执行的现成骨架**（独立上下文 / 工具子集 / 跨进程审批回流）——§6 要复用它 |
-| `app/agent/mcp.py::_build_servers` / `load_mcp_tool` | 逐 server 硬编码 env（待通用化）。**`get_resources` 管道一期不做**（§9 已决）——软约束由 host 读 `SKILL.md` |
-| `app/agent/tool.json` | skill 工具的审批策略登记处；硬约束的落点之一。`get_skill`/`drop_skill` 已登记（§11） |
-| `app/agent/nodes.py::ReviewNode.ORCHESTRATE_SOURCES` | 已加 `skill`（§11）；`(b)` 动态绑定还要动 `ToolNode.tools_map` 与这里的查表 |
+| `app/agent/mcp.py` | **§12 已落地**：现在同时承载连接配置、工具加载（**不绑会话的 shim**）与运行体常驻（`_ServerWorker` + `get_worker` + `close_session_pool`）。`load_mcp_tool(workspace, session_id)` 增加会话参量；`get_resources` 管道一期不做（§9 已决）——软约束由 host 读 `SKILL.md` |
+| `mcp_service/terminal.py` | **§12 顺带修好了它的跨调用进程管理**（改造前 `start_process` 起的进程下次调用就认不到，实测）——池化后自动恢复，**本文件一行没改** |
+| `app/platform/runtime.py::build_session_runtime` | **§13.2 的注册表宿主**：与 graph / checkpointer 一起造的会话级运行时对象，构图期注入 LLMNode / ToolNode / OrchestrateNode |
+| `app/agent/tool.json` | 审批策略的**唯一权威表**，也是硬约束的落点之一。`get_skill`/`drop_skill` 走 `source: skill`（§11）；技能带来的工具走 `source: skills/<目录名>`（§13）。**未登记的工具，`get_skill` 会拒绝加载整个技能**（§13.3） |
+| `app/agent/nodes.py` | `ORCHESTRATE_SOURCES` 含 `skill`（§11）；二期又动了三处：`LLMNode` 动态 bind、`ToolNode` 动态查表、`ReviewNode` 限定版 fail-closed（§13.4） |
 | `app/agent/memory.py` | 知识型的同族通道（"工作区内容 → 注入"），新模块 `skills.py` 与它并列 |
 | ~~`app/agent/profile.py`~~ | **已于 2026-09-12 并入 `LLMNode.agent_md_block`**——生产侧只有 LLMNode 一个消费者，按上面那条判据不单独立模块。`skills.py` 不受此影响（它是 memory.py 的处境，不是 profile.py 的） |
 | `app/platform/commands/prompts.py` | `/init`、`/fast readme` 载荷——§10 待收敛 |

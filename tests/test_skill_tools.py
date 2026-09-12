@@ -34,10 +34,29 @@ def skills_dir(tmp_path, monkeypatch) -> Path:
     return root
 
 
+# 技能工具现在都注入 workspace（能力型的 server 在工作区里运行，见 SKILL_DESIGN §13）
+_WORKSPACE = "/tmp/does-not-need-to-exist"
+
+
 def _get_skill(name: str, loaded: list[str] | None = None):
     return asyncio.run(
         get_skill.coroutine(
-            name=name, state={"loaded_skills": loaded or []}, tool_call_id="c1"
+            name=name,
+            state={"loaded_skills": loaded or []},
+            tool_call_id="c1",
+            workspace=_WORKSPACE,
+        )
+    )
+
+
+def _drop_skill(name: str, loaded: list[str] | None = None):
+    """drop_skill 是 async（要 await 关技能运行体）。"""
+    return asyncio.run(
+        drop_skill.coroutine(
+            name=name,
+            state={"loaded_skills": loaded or []},
+            tool_call_id="c1",
+            workspace=_WORKSPACE,
         )
     )
 
@@ -73,13 +92,17 @@ def test_skill_tools_for_without_skills_keeps_module_tools(skills_dir):
     assert skill_tools_for()[0] is get_skill
 
 
-def test_skill_tools_need_no_workspace():
-    """技能源只有一个（项目根），所以两个工具都不声明 InjectedWorkspace。"""
+def test_skill_tools_inject_workspace():
+    """两工具都注入 InjectedWorkspace（能力型技能要按工作区造 server 连接：cwd + WORKSPACE_PATH）。
+
+    ⚠️ 这条契约在能力型二期改过一次：一期"技能源在项目根、不需要工作区"只对**知识型**成立。
+    模型仍然看不到它（InjectedWorkspace 会从可见 schema 里剔除）。
+    """
     from inspect import signature
 
     for tool_obj in skill_tool:
         fn = getattr(tool_obj, "coroutine", None) or tool_obj.func
-        assert "workspace" not in signature(fn).parameters
+        assert "workspace" in signature(fn).parameters
 
 
 # ---------------------- get_skill ----------------------
@@ -139,14 +162,14 @@ def test_get_skill_refuses_over_budget_and_lists_loaded(skills_dir, monkeypatch)
 
 
 def test_drop_skill_removes_and_returns_slice():
-    out = drop_skill.func(name="github", state={"loaded_skills": ["github", "x"]}, tool_call_id="c1")
+    out = _drop_skill("github", ["github", "x"])
 
     assert out["loaded_skills"] == ["x"]
     assert "已卸下技能 github" in out["messages"][0].content
 
 
 def test_drop_skill_not_loaded():
-    out = drop_skill.func(name="ghost", state={"loaded_skills": ["github"]}, tool_call_id="c1")
+    out = _drop_skill("ghost", ["github"])
 
     assert list(out) == ["messages"]
     assert "不在已加载清单" in out["messages"][0].content
@@ -166,7 +189,7 @@ def _orch_state(calls, loaded=None):
 
 def test_orchestrate_node_merges_loaded_skills_slice(skills_dir):
     _make_skill(skills_dir, "github")
-    node = OrchestrateNode(skill_tool)
+    node = OrchestrateNode(skill_tool, workspace_path=_WORKSPACE)
 
     out = asyncio.run(
         node(_orch_state([{"name": "get_skill", "args": {"name": "github"}, "id": "c1"}]))
@@ -180,7 +203,7 @@ def test_orchestrate_node_merges_loaded_skills_slice(skills_dir):
 def test_orchestrate_node_chains_loaded_skills_within_turn(skills_dir):
     """同回合多次编排调用链式传递：后一条看得到前一条写的 loaded_skills。"""
     _make_skill(skills_dir, "github")
-    node = OrchestrateNode(skill_tool)
+    node = OrchestrateNode(skill_tool, workspace_path=_WORKSPACE)
 
     out = asyncio.run(
         node(

@@ -114,8 +114,17 @@ SKILL_DESIGN §11）。`skills/github/` 没有 `server.py`，故**当前自动�
 **未做**：能力型（`server.py` 生命周期、会话级注册表 + 动态 `bind_tools`、idle 回收、
 env 声明与白名单转发）——那是 §3.3/§3.4 那套，也是最重的一块。
 
-**动手做能力型前先读 SKILL_DESIGN.md §9「待定 / 待验」**——绑定时机 (b) 的注册表落地姿势、
-env 展开白名单、多源目录的沙箱边界这几条没钉死之前，不要开工。
+**前置里程碑已落地（2026-09-12）**：SKILL_DESIGN **§12「MCP 运行体常驻化」**——MCP server 从
+"每次调用重起的临时脚本"变成"会话期常驻的后台服务"（每 (工作区, 会话, server) 一个 owner task）。
+顺带修好了 `mcp_service/terminal.py` 的跨调用进程管理（`start_process` 起的进程以前下次调用就认不到）。
+承重约束（anyio 的 cancel scope 与 Task 绑定 × langgraph 每节点开新 Task）写在 §12.2，**改那套机制前必读**。
+
+**二期已落地（只读子集，2026-09-12）**：SKILL_DESIGN **§13 能力型**——技能可以带 `server.py`，
+`get_skill` 把它的工具拉进本会话、`drop_skill` 一并关掉（机制 = "技能就是按需加入的 server"，
+复用 §12 的运行体）。首个能力型技能 `skills/github/` 落了 **8 个只读工具**（stdlib HTTP，不引 PyGithub）。
+
+**未做**：GitHub 的**写操作**（开 PR / 推送 / 合并 / 评论）与若干只读工具；技能运行体的空闲回收
+（已定不做，只靠 `drop_skill`）；`/skills` 控制面命令。口径见 §13.9。
 
 **与本文其它条目的关系**：SKILL_DESIGN §6 与上面的「反思节点」打通——skill fork 到隔离子 agent 执行，
 本身即一次结构性反思，且 `mcp_service/sub_agent.py` 那套骨架已经在了；但它卡在

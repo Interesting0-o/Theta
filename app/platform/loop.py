@@ -38,6 +38,24 @@ from app.schema.ui_schema import (
 EXIT_WORDS = ("quit", "q", "exit")
 
 
+async def _close_mcp_session(workspace: str, session: str | None) -> None:
+    """关掉某会话的 MCP 常驻运行体（切会话用）。
+
+    机制在 `app/agent/mcp.py`，**生命周期归宿主**（此处）——worker 子进程也要用同一套机制，
+    所以机制不能寄生在平台里，只有"何时关"归平台。`app.agent.*` 懒加载：import 即需 .env。
+    """
+    from app.agent.mcp import close_session_pool  # noqa: PLC0415
+
+    await close_session_pool(workspace, session)
+
+
+async def _close_all_mcp_sessions() -> None:
+    """关掉本进程全部 MCP 常驻运行体（退出用）。"""
+    from app.agent.mcp import close_all_pools  # noqa: PLC0415
+
+    await close_all_pools()
+
+
 class AgentPlatform:
     """基座：驱动 agent 图与审批 broker，经 UI 协议与前端说话（不 print、不读 stdin）。
 
@@ -115,9 +133,15 @@ class AgentPlatform:
         finally:
             if turn is not None and not turn.done():
                 turn.cancel()
+                # 等它真的停下，再关运行体：否则"取消中的调用"会与"关闭会话"并发踩同一个运行体
+                await asyncio.gather(turn, return_exceptions=True)
             await inbox.stop()
             if self._connection is not None:
                 await self._connection.close()
+            # 关常驻 MCP 运行体（子进程）。守卫用 _step：没建过运行时就没有运行体可关，
+            # 也避开"无 .env 时 import app.agent 抛 ValidationError"把干净退出变成 traceback。
+            if self._step is not None:
+                await _close_all_mcp_sessions()
 
     async def switch_session(self, session_id: str) -> None:
         """切到另一个会话（`/session <id>`、`/new session` 命令用）。
@@ -125,7 +149,12 @@ class AgentPlatform:
         当前会话的 checkpoint 是**逐步落盘**的，不需要额外"落定"动作，关掉连接即可；
         `step` 的闭包捕获了本会话的 thread_id，所以必须丢弃、由下一条消息懒重建
         （走 `_step_factory`，测试注入的假 step 照常生效）。
+
+        旧会话的 MCP 常驻运行体也在这里关：它按 (工作区, 会话) 隔离，不关就会每切一次会话
+        多攒一组常驻子进程（terminal 的受管进程表也会跨会话可见——那正是要避免的泄漏）。
         """
+        if self._step is not None:
+            await _close_mcp_session(self.workspace, self.session_id)
         if self._connection is not None:
             await self._connection.close()
             self._connection = None
