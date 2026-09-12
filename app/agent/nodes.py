@@ -12,7 +12,6 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 from app.agent.memory import memory_block
-from app.agent.profile import agent_md_block
 from app.agent.state import AgentState
 from app.agent.utils import coerce_tool_result, format_tool_result
 from app.agent.prompt import SYSTEM_PROMPT, workspace_context_block
@@ -40,6 +39,17 @@ def _tool_call_log(tool_call: dict) -> str:
     return f"→ 工具调用: {name}  {_short(brief)}"
 
 #-------------------大模型节点----------------------
+
+# 工作区根的项目画像文件名（`/init` 命令生成的就是它；与 file_io 沙箱同一根）
+AGENT_MD_FILENAME = "AGENT.md"
+
+# 画像注入上限（与 memory.py::MEMORY_INJECT_CAP 同量级）：超长只截断、不做压缩/摘要
+AGENT_MD_INJECT_CAP = 8000
+
+# 注入块标题：AGENT.md 由模型/人自由撰写，加一行标题让模型知道这段是什么
+_PROFILE_BLOCK_HEADER = "# 项目画像（工作区 AGENT.md）\n\n"
+
+
 class LLMNode:
     def __init__(
         self,
@@ -118,13 +128,35 @@ class LLMNode:
         res = await self.model.ainvoke(messages)
         return {"messages": [res]}
 
+    @staticmethod
+    def agent_md_block(workspace_path: str, cap: int = AGENT_MD_INJECT_CAP) -> str:
+        """读工作区根的 AGENT.md，返回注入用的正文（带块标题）；没有该文件/内容为空 → `""`。
+
+        超 `cap` 截断并附一行提示——画像本应精简，截断只是兜底。
+
+        原为独立模块 `app/agent/profile.py`（2026-09-12 并入）：生产侧只有本节点一个消费者，
+        独立成模块的收益（与 memory.py 成对、常量集中）不抵一层间接。**留作静态方法而非内联**
+        ——测试仍可直接调用它，不必构造 LLMNode 实例。
+        """
+        path = Path(workspace_path) / AGENT_MD_FILENAME
+        if not path.is_file():
+            return ""
+        text = path.read_text(encoding="utf-8").strip()
+        if not text:
+            return ""
+        if len(text) > cap:
+            text = text[:cap] + f"\n…（AGENT.md 超长已截断，共 {len(text)} 字符；用 read_file 看全文）"
+        return _PROFILE_BLOCK_HEADER + text
+
     async def _read_profile(self) -> str:
         """项目画像只读一次（会话首启读入，§4）：实例内 memo——画像默认慢变。
 
         后续若用户改了 AGENT.md，重开会话即生效（新会话 = 新建图/新 LLMNode 实例）。
         """
         if self._profile_block is None:
-            self._profile_block = await asyncio.to_thread(agent_md_block, self.workspace_path)
+            self._profile_block = await asyncio.to_thread(
+                self.agent_md_block, self.workspace_path
+            )
         return self._profile_block
 
 #-------------------工具调用节点-----------------------

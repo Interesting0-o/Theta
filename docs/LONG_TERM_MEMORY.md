@@ -126,7 +126,7 @@ resource/
 
 实现注记：AGENT.md 在会话建立时被程序检测/读入，作为该会话的常驻项目画像与 SYSTEM_PROMPT/workspace 同源拼装；memory.md 每轮实时读盘。AGENT.md 的生成不归 `write_memory`（那是 resource 私有记忆），归 `/init` 命令（写进工作区、随仓库走）。
 
-**读取侧已落地（2026-09-10）**：`app/agent/profile.py::agent_md_block()` 读工作区根的 AGENT.md（加一行 `# 项目画像` 块标题；缺文件/空白 → 空串；超 cap 8000 截断），`LLMNode` 在 `inject_session_context` 打开时注入——顺序 `SYSTEM_PROMPT → 工作区上下文 → 计划 → 项目画像 → 长期记忆`，画像**实例内 memo**（会话首启读入，不每轮重读；改画像重开会话即生效），worker 与记忆一起关掉。独立成模块而非并入 `memory.py`：两通道不混一个文件（本表的分工）。
+**读取侧已落地（2026-09-10）**：`LLMNode.agent_md_block()` 读工作区根的 AGENT.md（加一行 `# 项目画像` 块标题；缺文件/空白 → 空串；超 cap 8000 截断），`LLMNode` 在 `inject_session_context` 打开时注入——顺序 `SYSTEM_PROMPT → 工作区上下文 → 计划 → 项目画像 → 长期记忆`，画像**实例内 memo**（会话首启读入，不每轮重读；改画像重开会话即生效），worker 与记忆一起关掉。（曾独立为 `app/agent/profile.py`，**2026-09-12 并入 `LLMNode` 静态方法**——生产侧只有该节点一个消费者，45 行、stdlib-only，独立成模块的收益不抵一层间接。`memory.py` 反之保留独立模块：它有三个消费者——`nodes` / `tools` / `runtime`。）
 
 ---
 
@@ -193,7 +193,7 @@ resource/
 
 - **Phase A · resource + 会话目录重构** `[已落地 2026-09-10]`：路径解析收敛 + workspace_key + `sessions/<sid>/agent.db` 落位 + 每次启动用新 session_id + 旧库不读（并删除）+ 测试更新。会话的**列表/切换命令**随后在 Phase B 一并落地（§7 会话三条命令）。此阶段无记忆，纯地基。
 - **Phase B · 最简单长期记忆闭环 + 项目画像**：memory.md 格式 + 写入/读取工具 + tool.json/source + LLMNode SystemMessage 注入 + SYSTEM_PROMPT 纪律 + **AGENT.md 检测/会话首启注入 + `/init` 生成骨架** + 单测 + 手工冒烟（两段会话：第二段能看到第一段写的 memory；重开会话能看到 AGENT.md 画像）。`reviewed.json` 的加入交互/接线不在 A/B。
-  - **进度（2026-09-10）**：memory.md 格式 + `write_memory`/`read_memory` 工具 + tool.json/source + **LLMNode 每轮注入（§4）** + 单测 `[已落地]`（§3/§4/§5）——记忆闭环已通（写入 → 落盘 → 下轮注入），worker 侧不注入、工具也被 `worker_tools` 挡住。**同日续做**：AGENT.md 读取侧（`app/agent/profile.py` + LLMNode 注入）与 `/init` 命令（`app/platform/commands/`，投预设提示词）`[已落地]`（§4/§7）——画像闭环亦通（`/init` 生成 → 下个会话注入）。**尚未做**：SYSTEM_PROMPT 的"长期记忆/项目画像"纪律小节（§6）。会话三条命令（`/list session`/`/new session`/`/session`）与 `/help` 亦已落地（§7）。
+  - **进度（2026-09-10）**：memory.md 格式 + `write_memory`/`read_memory` 工具 + tool.json/source + **LLMNode 每轮注入（§4）** + 单测 `[已落地]`（§3/§4/§5）——记忆闭环已通（写入 → 落盘 → 下轮注入），worker 侧不注入、工具也被 `worker_tools` 挡住。**同日续做**：AGENT.md 读取侧（`LLMNode.agent_md_block` + 注入）与 `/init` 命令（`app/platform/commands/`，投预设提示词）`[已落地]`（§4/§7）——画像闭环亦通（`/init` 生成 → 下个会话注入）。**尚未做**：SYSTEM_PROMPT 的"长期记忆/项目画像"纪律小节（§6）。会话三条命令（`/list session`/`/new session`/`/session`）与 `/help` 亦已落地（§7）。
 - **Phase C · 明确不做（后续再议）**：记忆压缩/分层摘要、记忆全文检索、跨工作区共享记忆、多会话选择 UI、reviewed.json 交互接线、把记忆 promote 进 repo（与 CONTEXT_ENGINEERING 的 promote 复用/分合另议）。
 
 ---

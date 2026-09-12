@@ -223,7 +223,6 @@ theta/
 │   │   ├── mcp.py              # 以 stdio 子进程拉起四个 MCP server 并收集工具
 │   │   ├── tools.py            # agent 侧工具：编排 / read_note / dispatch / 记忆读写
 │   │   ├── memory.py           # 长期记忆 memory.md 的读写与注入渲染
-│   │   ├── profile.py          # 项目画像 AGENT.md 的读取
 │   │   ├── utils.py            # format_tool_result / coerce_tool_result（工具结果归一化）
 │   │   └── tool.json           # 审批策略集中登记（need_review / source）
 │   └── schema/                 # 数据形状（agent / approval / ui / session 四个域）
