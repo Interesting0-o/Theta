@@ -25,3 +25,9 @@ class AgentState(TypedDict):
     # 笔记区：折叠时"不可免费重取"的联网检索正文落点；外层 dict 的 key = notes#<n>（稳定 ref），
     # 随 checkpoint 存亡（不做跨会话语义库）。无 reducer → 写入方读改写合并。
     notes: Dict[str, NoteEntry]
+
+    #--------------技能（skill）-----------------
+    # 已加载技能的 name 清单。**只存名字、不存正文**：正文由 LLMNode 每轮从盘上读
+    # （口径同记忆的"文件即真值"）。只存名字让 SKILL_DESIGN §3.5 的铁律**结构性成立**——
+    # 正文只有一个家（系统提示），卸载就是删一个名字，不存在"两份拷贝"。无 reducer。
+    loaded_skills: List[str]

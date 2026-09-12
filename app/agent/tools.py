@@ -29,7 +29,7 @@ from typing import Annotated, List
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, InjectedToolArg, InjectedToolCallId, tool
 from langgraph.prebuilt import InjectedState
-from app.agent import memory
+from app.agent import memory, skills
 from app.agent.state import AgentState
 from app.agent.utils import format_tool_result
 from app.schema.agent_schema import PlanStatus, PlanStep
@@ -430,8 +430,12 @@ dispatch_tool: List[BaseTool] = [
 # 阻塞调用——与 mcp.py::load_mcp_tool、graph.py 默认工作区 mkdir 的处理一致。
 
 
-def _memory_receipt(tool_name: str, tool_call_id: str, content: str) -> dict:
-    """记忆工具的返回切片：只回一条 ToolMessage（这两个工具不碰 state）。"""
+def _tool_receipt(tool_name: str, tool_call_id: str, content: str) -> dict:
+    """"只回话、不改 state"的编排工具的返回切片。
+
+    记忆读写与技能加载/卸载共用这个形状——它们都只产一条给模型看的 ToolMessage，
+    不写任何 state 切片（对比计划三件套，它们要回 `current_plan`）。
+    """
     return {
         "messages": [
             ToolMessage(name=tool_name, tool_call_id=tool_call_id, content=content)
@@ -479,11 +483,11 @@ async def write_memory(
     kind = (type or "").strip()
     body = (content or "").strip()
     if not body:
-        return _memory_receipt(
+        return _tool_receipt(
             "write_memory", tool_call_id, "记忆内容为空，未写入。content 要写成一句有结论的事实。"
         )
     if not kind:
-        return _memory_receipt(
+        return _tool_receipt(
             "write_memory",
             tool_call_id,
             "记忆类别为空，未写入。type 建议取 user-preference / decision / convention / project-fact。",
@@ -495,7 +499,7 @@ async def write_memory(
         if entry is None:
             keys = await asyncio.to_thread(memory.entry_keys, workspace)
             existing = "、".join(keys) or "（暂无）"
-            return _memory_receipt(
+            return _tool_receipt(
                 "write_memory",
                 tool_call_id,
                 f"记忆 {target} 不存在，未做任何改动。现有编号：{existing}；要新增请省略 key。",
@@ -508,7 +512,7 @@ async def write_memory(
         action = f"已写入 [{entry.key}]"
 
     total = len(await asyncio.to_thread(memory.entry_keys, workspace))
-    return _memory_receipt(
+    return _tool_receipt(
         "write_memory",
         tool_call_id,
         f"{action} {entry.type} · {entry.date}\n{entry.content}\n\n"
@@ -537,7 +541,7 @@ async def read_memory(
     """
     text = await asyncio.to_thread(memory.read_text, workspace)
     if not text.strip():
-        return _memory_receipt("read_memory", tool_call_id, "当前工作区还没有长期记忆。")
+        return _tool_receipt("read_memory", tool_call_id, "当前工作区还没有长期记忆。")
 
     entries = memory.parse_entries(text)
     target = (key or "").strip()
@@ -545,21 +549,21 @@ async def read_memory(
         entry = next((e for e in entries if e.key == target), None)
         if entry is None:
             existing = "、".join(e.key for e in entries) or "（暂无）"
-            return _memory_receipt(
+            return _tool_receipt(
                 "read_memory", tool_call_id, f"记忆 {target} 不存在。现有编号：{existing}"
             )
-        return _memory_receipt(
+        return _tool_receipt(
             "read_memory",
             tool_call_id,
             f"### [{entry.key}] {entry.type} · {entry.date}\n\n{entry.content}",
         )
 
     if not entries:
-        return _memory_receipt(
+        return _tool_receipt(
             "read_memory", tool_call_id, "当前工作区还没有长期记忆条目（只有文件头说明）。"
         )
     visible = memory.strip_comments(text).strip()
-    return _memory_receipt(
+    return _tool_receipt(
         "read_memory", tool_call_id, f"当前该工作区共 {len(entries)} 条长期记忆：\n\n{visible}"
     )
 
@@ -568,3 +572,155 @@ memory_tool: List[BaseTool] = [
     write_memory,
     read_memory,
 ]
+
+# ------------------------- 技能（skill） -------------------------
+# 按需加载的"领域包"（docs/SKILL_DESIGN.md）：**目录**（name + description）在构图期由
+# skill_tools_for 烤进 get_skill 的 docstring，**正文**由 get_skill 只写进 state 的
+# loaded_skills 名字清单、再由 LLMNode 每轮从盘上读进系统提示。
+#
+# ⚠️ **回执里绝不带正文**（§3.5 的铁律）：工具结果会进 message history、此后每轮随历史重发；
+# 若正文既当 ToolResult 又注入系统提示，就是两份拷贝——而淘汰只能抹掉注入那份，"淘汰"就成了谎。
+# 只存名字让这条**结构性成立**：正文只有系统提示一个家，卸载 = 删一个名字。
+#
+# get_skill 要读 SKILL.md，故与记忆工具同样写成 async + asyncio.to_thread（避开 langgraph dev
+# 的 blockbuster）；drop_skill 只碰 state，保持同步（同 read_note）。
+#
+# 技能源只有一个（项目根 skills/，见 app/agent/skills.py），所以这两个工具**不需要注入
+# workspace**——与 memory/dispatch 那两组不同。
+
+
+@tool
+async def get_skill(
+    name: str,
+    state: Annotated[AgentState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> dict:
+    """加载一个技能的正文，让这个领域的做法与纪律在本会话生效。
+
+    何时用：任务落进某个已安装技能覆盖的领域（如 GitHub 平台操作），而你需要那个领域的
+    做法、约束或能力清单时——**先看本工具说明末尾的"可用技能"目录**，判断相关再加载。
+    技能一旦加载就在本会话常驻（每轮都在系统提示里），所以**不相关的别加**；
+    加载后不需要了，用 drop_skill 卸下、把预算还回来。
+
+    Args:
+        name: 技能名，取自本工具说明里的"可用技能"目录（如 "github"）。
+        state: （系统自动注入，无需传入）当前 AgentState，读 loaded_skills。
+        tool_call_id: （系统自动注入，无需传入）本次调用 id。
+
+    Returns:
+        成功：回执（正文已进系统提示，下一次模型调用即可见）。
+        失败：技能名不存在（附可用清单）/ 已在加载中 / 正文预算已满（附已加载清单，
+        要求先用 drop_skill 卸下一个）。
+    """
+    wanted = (name or "").strip()
+    loaded = list(state.get("loaded_skills") or [])
+
+    body = await asyncio.to_thread(skills.read_body, wanted)
+    if body is None:
+        available = await asyncio.to_thread(skills.scan_skills)
+        names = "、".join(sorted(available)) or "（无）"
+        return _tool_receipt(
+            "get_skill", tool_call_id, f"技能 {wanted!r} 不存在。可用技能：{names}"
+        )
+
+    if wanted in loaded:
+        return _tool_receipt(
+            "get_skill", tool_call_id, f"技能 {wanted} 已在本会话加载中，无需重复加载。"
+        )
+
+    # 预算满 → **拒绝**，并要求模型先卸一个（§3.5）。不静默淘汰：知识型技能没有可观测的
+    # "使用事件"（正文被动注入、模型每轮都看得到），"最久未用"根本无从定义。
+    used = await asyncio.to_thread(skills.bodies_size, loaded)
+    if used + len(body) > skills.SKILL_BODY_BUDGET:
+        current = "、".join(loaded) or "（无）"
+        return _tool_receipt(
+            "get_skill",
+            tool_call_id,
+            f"技能正文预算已满（上限 {skills.SKILL_BODY_BUDGET} 字符，当前已用 {used}），"
+            f"无法加载 {wanted}。当前已加载：{current}。"
+            f"请先用 drop_skill 卸下一个不再需要的技能，再重试。",
+        )
+
+    loaded.append(wanted)
+    return {
+        "loaded_skills": loaded,
+        "messages": [
+            ToolMessage(
+                name="get_skill",
+                tool_call_id=tool_call_id,
+                content=(
+                    f"已加载技能 {wanted}，其正文已进系统提示（下一次模型调用即可见）。"
+                    f"当前已加载：{'、'.join(loaded)}"
+                ),
+            )
+        ],
+    }
+
+
+@tool
+def drop_skill(
+    name: str,
+    state: Annotated[AgentState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> dict:
+    """卸下一个已加载的技能，把它占的系统提示预算还回来。
+
+    何时用：某领域的活干完了；或者 get_skill 报"预算已满"，你需要腾出位置加载别的技能。
+    卸下后该技能的正文不再进系统提示，它的纪律与做法也就不再对你有约束力——需要时重新加载。
+
+    Args:
+        name: 要卸下的技能名（当前已加载清单里的名字）。
+        state: （系统自动注入，无需传入）当前 AgentState，读 loaded_skills。
+        tool_call_id: （系统自动注入，无需传入）本次调用 id。
+
+    Returns:
+        回执 + 卸下后的已加载清单；名字本就不在清单里则说明情况。
+    """
+    wanted = (name or "").strip()
+    loaded = list(state.get("loaded_skills") or [])
+
+    if wanted not in loaded:
+        current = "、".join(loaded) or "（无）"
+        return _tool_receipt(
+            "drop_skill",
+            tool_call_id,
+            f"技能 {wanted!r} 不在已加载清单里，无需卸下。当前已加载：{current}",
+        )
+
+    loaded.remove(wanted)
+    current = "、".join(loaded) or "（无）"
+    return {
+        "loaded_skills": loaded,
+        "messages": [
+            ToolMessage(
+                name="drop_skill",
+                tool_call_id=tool_call_id,
+                content=f"已卸下技能 {wanted}，其正文已从系统提示移除。当前已加载：{current}",
+            )
+        ],
+    }
+
+
+skill_tool: List[BaseTool] = [
+    get_skill,
+    drop_skill,
+]
+
+
+def skill_tools_for() -> list[BaseTool]:
+    """构图期把技能目录烤进 get_skill 的 docstring（§3.2），返回本图要用的技能工具。
+
+    目录是**唯一的发现通道**：它随工具 schema 每轮都在模型眼前，模型据此判断该不该加载。
+    没有它，模型不知道存在任何技能，`get_skill` 就永远不可达。**正文不进目录**——目录每轮
+    付费，塞正文等于每轮全量付费，正是渐进披露要避免的（§3.6 的两个预算）。
+
+    用 `model_copy` 复制而非原地改 description：模块级的 `get_skill` 是共享对象，直接改会
+    污染同进程里的其它图（评估与测试各建各的图）。
+    """
+    catalog = skills.catalog_block()
+    if not catalog:
+        return list(skill_tool)
+    return [
+        get_skill.model_copy(update={"description": f"{get_skill.description}\n\n{catalog}"}),
+        drop_skill,
+    ]

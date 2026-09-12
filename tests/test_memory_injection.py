@@ -11,10 +11,12 @@ import app.agent.* 经 __init__ 触发 get_settings()，需 .env 存在（CLAUDE
 import asyncio
 from pathlib import Path
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 import app.agent.graph as graph_mod
 import app.agent.memory as memory
+import app.agent.skills as skills_mod
 import app.resource as resource
 from app.agent.nodes import LLMNode
 
@@ -50,6 +52,24 @@ def _write_profile(ws: str, text: str) -> None:
     path = Path(ws) / "AGENT.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def _write_skill(skills_root: Path, name: str, body: str) -> None:
+    """在技能源里写一个知识型技能。"""
+    path = skills_root / name / "SKILL.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\nname: {name}\ndescription: 测试技能\n---\n\n{body}\n", encoding="utf-8"
+    )
+
+
+@pytest.fixture
+def skills_dir(tmp_path, monkeypatch) -> Path:
+    """技能源指到 tmp（不扫仓库里真实的 skills/）。"""
+    root = tmp_path / "skills"
+    root.mkdir()
+    monkeypatch.setattr(skills_mod, "SKILLS_DIR", root)
+    return root
 
 
 def test_main_llm_node_injects_memory_last(tmp_path, monkeypatch):
@@ -143,3 +163,57 @@ def test_worker_graph_builds_llm_node_without_context(monkeypatch):
 
     assert captured["inject_session_context"] is False
     assert captured["system_prompt"].startswith("你是主 agent（Theta）派出来")
+
+
+# ---------------------- 技能正文注入（docs/SKILL_DESIGN.md §3.5） ----------------------
+
+
+def test_main_llm_node_injects_loaded_skills_last(tmp_path, monkeypatch, skills_dir):
+    """已加载技能的正文进系统提示，拼在画像/记忆**之后**，抬头列出已加载清单。"""
+    ws = _seed(tmp_path, monkeypatch)
+    _write_skill(skills_dir, "demo", "纪律正文：推送前先开分支")
+    model = _CaptureModel()
+
+    asyncio.run(
+        LLMNode(model=model, workspace_path=ws)(
+            {"messages": [HumanMessage(content="hi")], "loaded_skills": ["demo"]}
+        )
+    )
+
+    contents = _system_contents(model)
+    assert contents[-1].startswith("# 已加载技能")  # 拼在最后
+    assert "推送前先开分支" in contents[-1]
+    assert "当前已加载：demo" in contents[-1]  # 抬头——模型据此决定卸哪个（§3.5）
+
+
+def test_llm_node_skips_skills_when_none_loaded(tmp_path, monkeypatch, skills_dir):
+    """没加载任何技能 → 不追加空块（否则每轮白塞一条系统消息）。"""
+    ws = _seed(tmp_path, monkeypatch)
+    _write_skill(skills_dir, "demo", "正文")
+    model = _CaptureModel()
+
+    asyncio.run(LLMNode(model=model, workspace_path=ws)({"messages": [HumanMessage(content="hi")]}))
+
+    assert not any(c.startswith("# 已加载技能") for c in _system_contents(model))
+
+
+def test_skill_block_is_independent_of_session_context(tmp_path, monkeypatch, skills_dir):
+    """技能块**不受** inject_session_context 影响（2026-09-12 的决定）。
+
+    它不是"这个项目/用户是谁"那类会话背景，而是模型自己按需取来的领域纪律——所以画像/记忆
+    关掉时技能照旧注入。（worker 实际不会触发：它没有 get_skill，loaded_skills 天然为空。）
+    """
+    ws = _seed(tmp_path, monkeypatch)
+    _write_profile(ws, "# 项目\n\n画像正文")
+    _write_skill(skills_dir, "demo", "纪律正文")
+    model = _CaptureModel()
+
+    asyncio.run(
+        LLMNode(model=model, workspace_path=ws, inject_session_context=False)(
+            {"messages": [HumanMessage(content="hi")], "loaded_skills": ["demo"]}
+        )
+    )
+
+    contents = _system_contents(model)
+    assert not any(c.startswith("# 项目画像") for c in contents)  # 画像照旧不注入
+    assert any(c.startswith("# 已加载技能") for c in contents)  # 技能照旧注入

@@ -12,6 +12,7 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 from app.agent.memory import memory_block
+from app.agent.skills import skills_block
 from app.agent.state import AgentState
 from app.agent.utils import coerce_tool_result, format_tool_result
 from app.agent.prompt import SYSTEM_PROMPT, workspace_context_block
@@ -96,12 +97,14 @@ class LLMNode:
         每次生成都在头部拼接系统提示词，顺序：行为契约 SYSTEM_PROMPT（见 prompt.py）+
         本次会话的具体工作区上下文 workspace_context_block（若有，含工作区根目录与
         终端 cwd 差异提醒）+ 当前计划的状态回显（若有）+ **项目画像**（工作区根的 AGENT.md，
-        会话首启读入、实例内 memo）+ **长期记忆**（若有条目，`# 长期记忆（工作区 …）` 正文）。
-        后两环见 docs/LONG_TERM_MEMORY.md §4。只构造成临时列表传给模型，不改动
-        state["messages"]（LangGraph state 应不可变更新；系统消息也不应渗入历史被持久化）。
+        会话首启读入、实例内 memo）+ **长期记忆**（若有条目，`# 长期记忆（工作区 …）` 正文）
+        + **已加载技能正文**（若有，`# 已加载技能` 正文）。
+        前两环见 docs/LONG_TERM_MEMORY.md §4、末环见 docs/SKILL_DESIGN.md §3.5。只构造成临时
+        列表传给模型，不改动 state["messages"]（LangGraph state 应不可变更新；系统消息也不应
+        渗入历史被持久化）。
 
-        记忆**每轮实时读盘**（记忆文件即真值）；画像**只读一次**（画像慢变）。两处读盘都是
-        阻塞调用，走 to_thread 以避开 langgraph dev 的 blockbuster。
+        记忆与技能正文**每轮实时读盘**（文件即真值）；画像**只读一次**（画像慢变）。三处读盘
+        都是阻塞调用，走 to_thread 以避开 langgraph dev 的 blockbuster。
         """
         system_messages = [SystemMessage(content=self.system_prompt)]
         if self.workspace_path:
@@ -123,6 +126,15 @@ class LLMNode:
             block = await asyncio.to_thread(memory_block, self.workspace_path)
             if block:
                 system_messages.append(SystemMessage(content=block))
+
+        # 技能正文**独立于 inject_session_context**：它不是"这个项目/用户是谁"那类会话背景，
+        # 而是模型自己按需取来的领域纪律。worker 没有 get_skill，loaded_skills 天然为空，
+        # 所以不需要额外开关。state 里只有名字，正文每轮从盘上读（§3.5 的铁律）。
+        loaded_skills = state.get("loaded_skills") or []
+        if loaded_skills:
+            skill_text = await asyncio.to_thread(skills_block, loaded_skills)
+            if skill_text:
+                system_messages.append(SystemMessage(content=skill_text))
 
         messages = [*system_messages, *state["messages"]]
         res = await self.model.ainvoke(messages)
@@ -235,8 +247,13 @@ class ReviewNode:
     # "state 工具"在 tool.json 的 source 取值集合：命中即分流进 approved_orchestrate_calls，
     # 交 OrchestrateNode（通用 state 工具执行器）处理。plan=编排；notes=笔记读回；
     # dispatch=并发资料收集派发（app/agent/tools.py::dispatch_subtasks）；
-    # memory=长期记忆读写（同文件 write_memory/read_memory，靠注入的 workspace 定位记忆文件）。
-    ORCHESTRATE_SOURCES: frozenset[str] = frozenset({"plan", "notes", "dispatch", "memory"})
+    # memory=长期记忆读写（同文件 write_memory/read_memory，靠注入的 workspace 定位记忆文件）；
+    # skill=技能加载/卸载（同文件 get_skill/drop_skill）。
+    # 注意：技能**带来**的工具不走这里——它们的 source 取 `skills/<name>`，不命中本集合 → 进普通
+    # 工具队列。这正是想要的：get_skill 是编排动作，它带来的工具不是。
+    ORCHESTRATE_SOURCES: frozenset[str] = frozenset(
+        {"plan", "notes", "dispatch", "memory", "skill"}
+    )
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -314,6 +331,12 @@ class ReviewNode:
 
 
 #----------------------编排节点----------------------
+
+# 编排工具可以写回的"额外" state 切片（current_plan 不在此列——它有链式语义、单独处理，
+# 且最终返回恒带上它）。**加新切片只改这一行 + state.py**，别再去 __call__ 里加分支。
+_EXTRA_SLICE_KEYS: tuple[str, ...] = ("loaded_skills",)
+
+
 class OrchestrateNode:
     """消费编排类调用（approved_orchestrate_calls），执行编排工具并合并写回 state。
 
@@ -387,6 +410,9 @@ class OrchestrateNode:
         working.setdefault("current_plan", [])
 
         messages: list[ToolMessage] = []
+        # 本回合真的被工具写过的额外切片（working 由 state 复制而来，所以"键存在"不等于
+        # "被写过"——只有写过的才需要回传，其余交给 LangGraph 保留原值）
+        written: set[str] = set()
 
         for tool_call in tool_calls:
             tool_name = tool_call.get("name")
@@ -430,9 +456,13 @@ class OrchestrateNode:
                 )
                 continue
 
-            # 工具返回切片：有 current_plan 则链式更新；messages 回执原样收集
+            # 工具返回切片：链式更新进 working（同回合后续调用看得到），messages 回执原样收集
             if "current_plan" in result:
                 working["current_plan"] = result["current_plan"]
+            for key in _EXTRA_SLICE_KEYS:
+                if key in result:
+                    working[key] = result[key]
+                    written.add(key)
             for block in result.get("messages", []) or []:
                 if isinstance(block, ToolMessage):
                     messages.append(block)
@@ -441,10 +471,13 @@ class OrchestrateNode:
                         ToolMessage(content=str(block), tool_call_id=tool_call_id, name=tool_name)
                     )
 
+        # current_plan 恒带回（既有行为不变，链式默认值已在上面 setdefault）；
+        # 额外切片只在本回合真的被写过时才带回。
         return {
             "approved_orchestrate_calls": [],
             "messages": messages,
             "current_plan": working["current_plan"],
+            **{key: working[key] for key in _EXTRA_SLICE_KEYS if key in written},
         }
 
 

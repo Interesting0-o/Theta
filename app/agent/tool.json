@@ -162,5 +162,13 @@
     "read_memory":{
         "need_review":false,
         "source":"memory"
+    },
+    "get_skill":{
+        "need_review":false,
+        "source":"skill"
+    },
+    "drop_skill":{
+        "need_review":false,
+        "source":"skill"
     }
 }

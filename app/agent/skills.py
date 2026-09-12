@@ -1,0 +1,225 @@
+"""技能（skill）：按需加载的"领域包"——扫描 / 解析 / 渲染的**只读单点**。
+
+设计见 docs/SKILL_DESIGN.md。一句话：把某个领域要用的**工具**与该领域的**纪律**打成一包，
+平时既不占上下文、也不起进程，需要时才整个拉进来（渐进披露）。
+
+**源只有一个**：项目根的 `skills/`，即 `<项目根>/skills/<name>/SKILL.md`。
+（设计 §8.2 曾规划第二个"工作区源" `<workspace>/.theta/skills/`，2026-09-12 决定**先不做**：
+单源少掉"重名谁覆盖谁"与"工作区外的目录要不要进沙箱故事"两处复杂度。以后真需要再加回来，
+那时重新论证比留一段没人跑的代码便宜。）
+
+**位置**：与 `app/agent/memory.py` 并列，同属"工作区内容 → 注入"的通道。**独立成模块**
+（而非并进 `LLMNode`）是因为消费者跨三个文件：`tools.py` 的 `get_skill`/`drop_skill`、
+`nodes.py::LLMNode` 的注入块、`graph.py` 构图期把目录烤进 docstring。
+
+**一个技能 = 一个目录**：`<name>/SKILL.md`。有 `server.py` 是能力型、没有是知识型——**本期
+只处理两者共用的那半**（读正文 → 注入）；`server.py` 的生命周期见 §3.3/§3.4，属二期。
+
+三条纪律：
+
+- **只读**。技能是用户写的文件，agent 不改它——所以本模块没有写单点（与 `memory.py` 不同）。
+- **`name` 白名单校验，绝不拼路径**。`name` 来自模型（`get_skill(name)`），而按 §2.2 的不变量是
+  **host 侧读 `SKILL.md`**：`read_body` 只接受扫描结果里已有的名字，`get_skill("../../etc/passwd")`
+  不会变成一次任意文件读。技能目录在**工作区之外**（项目根），file_io 的沙箱管不到这里，必须自查。
+- **正文不落 state**。state 只存技能 `name` 清单（`loaded_skills`），正文每轮由 `skills_block`
+  从盘上读——口径同记忆的"文件即真值"。这条让 §3.5 的铁律（正文只有一个家）**结构性成立**：
+  工具回执里不带正文、state 里不存正文，卸载就是删一个名字，不存在"两份拷贝"。
+
+本模块只依赖 stdlib。
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# ---------------------- 常量 ----------------------
+
+# 项目根：技能源的位置（与 graph.py / tools.py 同一算法）
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# 技能源目录（随 Theta 出厂；首个技能 = skills/github/）
+SKILLS_DIR = _PROJECT_ROOT / "skills"
+
+# 技能定义文件名。固定叫 SKILL.md（两型都是），扫描逻辑因此只有一套。
+SKILL_FILENAME = "SKILL.md"
+
+# 正文注入预算（字符，口径同 memory.MEMORY_INJECT_CAP / LLMNode.AGENT_MD_INJECT_CAP）。
+# 满了**不淘汰**：由 get_skill 拒绝新加载并要求模型先 drop_skill（§3.5——知识型没有可观测的
+# "使用事件"，自动淘汰无法定义）。
+SKILL_BODY_BUDGET = 8000
+
+# 目录条数上限（§3.6：目录与正文是两个预算，别混用一个数）。目录**不可淘汰**（淘汰 =
+# 不可发现 = 技能等于不存在），溢出只能截断——所以设宽一点，且溢出必须告警。
+SKILL_CATALOG_CAP = 60
+
+
+# ---------------------- 解析 ----------------------
+
+
+@dataclass(frozen=True)
+class SkillMeta:
+    """一个已安装技能的元信息（目录用）。
+
+    - name：技能名（frontmatter 的 `name`，缺省退化用目录名）——模型传给 get_skill 的标识；
+    - description：**"什么时候用 + 解决什么"**，决定模型会不会、该不该加载它（§9）；
+    - path：SKILL.md 的路径。
+    """
+
+    name: str
+    description: str
+    path: Path
+
+
+def _split_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    """切出 `---` 包围的 frontmatter 与正文。
+
+    **自写最小实现，不引 YAML**（§9：别默认蹭传递依赖）——只认单行 `key: value`，
+    不支持嵌套 / 列表 / 多行值。技能的 frontmatter 只有 `name` 和 `description` 两个键，
+    用不上完整 YAML；真需要时再加。
+
+    没有 frontmatter（或 `---` 未闭合）→ `({}, 原文)`，正文原样返回。
+    """
+    if not text.startswith("---"):
+        return {}, text
+
+    lines = text.split("\n")
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
+        return {}, text
+
+    meta: dict[str, str] = {}
+    for line in lines[1:end]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, sep, value = stripped.partition(":")
+        if sep:
+            meta[key.strip()] = value.strip()
+    return meta, "\n".join(lines[end + 1 :]).strip()
+
+
+def _read_skill_md(path: Path) -> tuple[dict[str, str], str]:
+    return _split_frontmatter(path.read_text(encoding="utf-8"))
+
+
+# ---------------------- 扫描 ----------------------
+
+
+def scan_skills() -> dict[str, SkillMeta]:
+    """扫描技能源，返回 {name: SkillMeta}；源目录不存在 → 空表。
+
+    坏技能（有目录但没 SKILL.md、或没写 description）**跳过并告警**，不影响其余技能。
+    """
+    found: dict[str, SkillMeta] = {}
+    if not SKILLS_DIR.is_dir():
+        return found
+
+    for entry in sorted(SKILLS_DIR.iterdir()):
+        if not entry.is_dir():
+            continue
+        skill_md = entry / SKILL_FILENAME
+        if not skill_md.is_file():
+            # 目录里没有 SKILL.md：不是技能（可能是别的杂物），不算坏——静默跳过
+            continue
+        try:
+            meta, _body = _read_skill_md(skill_md)
+        except OSError as exc:  # 编码错 / 权限 / 读取失败：坏技能，别让一个目录拖垮整次扫描
+            logger.warning("技能 %s 读取失败，已跳过：%s", entry.name, exc)
+            continue
+
+        name = (meta.get("name") or entry.name).strip()
+        description = (meta.get("description") or "").strip()
+        if not description:
+            # §9：description 决定模型该不该用——没有它这条目录对模型毫无信息量，不如不进目录
+            logger.warning("技能 %s 缺 description（%s），已跳过", name, skill_md)
+            continue
+        found[name] = SkillMeta(name=name, description=description, path=skill_md)
+
+    return found
+
+
+def _body_of(meta: SkillMeta) -> str | None:
+    """读某个已解析技能的正文（已剥 frontmatter）；读取失败 → None。"""
+    try:
+        _meta, body = _read_skill_md(meta.path)
+    except OSError as exc:
+        logger.warning("技能 %s 正文读取失败：%s", meta.name, exc)
+        return None
+    return body
+
+
+def read_body(name: str) -> str | None:
+    """按名读某技能的正文（已剥掉 frontmatter）；名字不在**扫描结果**里 → None。
+
+    **这是那条安全纪律的落点**：只用模型给的名字去查扫描结果，**不拿它拼路径**——
+    所以 `../`、绝对路径、符号链接在这里都不可能生效。技能目录在项目根、不在工作区内，
+    file_io 的沙箱管不到这里，必须自查。
+    """
+    meta = scan_skills().get((name or "").strip())
+    return _body_of(meta) if meta is not None else None
+
+
+# ---------------------- 渲染 ----------------------
+
+
+def catalog_block(cap: int = SKILL_CATALOG_CAP) -> str:
+    """渲染"可用技能"目录——构图期烤进 `get_skill` 的 docstring（§3.2）。
+
+    只列 `name` + `description`：正文不进目录（目录每轮都在工具 schema 里，塞正文等于每轮
+    全量付费，正是渐进披露要避免的）。装不下时**截断并告警**——截断意味着某些技能
+    "装了却不可发现"，是最坏的失败形态，绝不静默（§3.6）。
+    """
+    metas = list(scan_skills().values())
+    if not metas:
+        return ""
+
+    shown = metas[:cap]
+    lines = [
+        "可用技能（需要某领域的做法时，用 get_skill(name) 取回它的正文照做）：",
+        *(f"- {m.name}: {m.description}" for m in shown),
+    ]
+    if len(metas) > cap:
+        dropped = "、".join(m.name for m in metas[cap:])
+        logger.warning("技能目录超上限 %d，以下技能不可发现：%s", cap, dropped)
+        lines.append(f"（另有 {len(metas) - cap} 个技能因目录上限未列出：{dropped}）")
+    return "\n".join(lines)
+
+
+def _usable_bodies(loaded: list[str]) -> dict[str, str]:
+    """把 `loaded` 解析成 {name: 正文}，只留真的读得到正文的（扫一次盘）。"""
+    metas = scan_skills()
+    bodies: dict[str, str] = {}
+    for name in loaded:
+        meta = metas.get((name or "").strip())
+        if meta is None:
+            continue
+        body = _body_of(meta)
+        if body:
+            bodies[meta.name] = body
+    return bodies
+
+
+def bodies_size(loaded: list[str]) -> int:
+    """已加载技能的正文总字符数——get_skill 据此判预算。读不到的技能按 0 计。"""
+    return sum(len(body) for body in _usable_bodies(loaded).values())
+
+
+def skills_block(loaded: list[str]) -> str:
+    """把已加载技能的正文渲染成注入用的系统消息正文；没有可注入的 → `""`。
+
+    抬头**列出当前已加载的技能**（§3.5）：这是模型决定卸哪个的依据，也让"某技能不在列表里了"
+    成为卸载信号——否则 history 里那句"已加载 X"的回执还在，模型会以为纪律仍然生效。
+    """
+    if not loaded:
+        return ""
+
+    bodies = _usable_bodies(loaded)
+    if not bodies:
+        return ""
+
+    header = f"# 已加载技能\n\n当前已加载：{'、'.join(bodies)}（不再需要时用 drop_skill 卸下）"
+    rendered = [f"## {name}\n\n{body}" for name, body in bodies.items()]
+    return f"{header}\n\n" + "\n\n".join(rendered)

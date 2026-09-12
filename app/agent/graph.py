@@ -9,7 +9,13 @@ from app.agent.nodes import *
 from app.agent.model import get_main_chat_model
 from app.agent.prompt import WORKER_SYSTEM_PROMPT
 from app.agent.mcp import load_mcp_tool
-from app.agent.tools import orchestrate_tool, note_tools, dispatch_tool, memory_tool
+from app.agent.tools import (
+    orchestrate_tool,
+    note_tools,
+    dispatch_tool,
+    memory_tool,
+    skill_tools_for,
+)
 
 # 项目根：模块导入期由 __file__ 算好，避免在运行时调用阻塞式 os.getcwd()
 # （langgraph dev 的 blockbuster 会拦截事件循环内的同步阻塞调用）
@@ -63,18 +69,26 @@ async def get_main_agent_graph(workspace_path: str | None = None):
     graph = StateGraph(AgentState)
     mcp_tools = await load_mcp_tool(workspace_path)
 
+    # 技能目录在**构图期**烤进 get_skill 的 docstring（§3.2）——装技能是低频事件，
+    # "扫一次、重开会话生效"够用（同 AGENT.md 的实例内 memo）。技能**带来**的工具不在这里，
+    # 二期能力型才需要（那时它们才进 ToolNode）。
+    skill_tools = skill_tools_for()
+
     # 模型能看到全部工具（含计划工具）；但只有"可执行工具"会进 review→tool_node
-    all_tools = orchestrate_tool + note_tools + dispatch_tool + memory_tool + mcp_tools
+    all_tools = (
+        orchestrate_tool + note_tools + dispatch_tool + memory_tool + skill_tools + mcp_tools
+    )
     model = get_main_chat_model().bind_tools(all_tools)
 
     graph.add_node("llm_node", LLMNode(model=model, workspace_path=workspace_path))
     graph.add_node("queue_node", QueueNode())
     # dispatch_subtasks（spawn worker）与 memory 读写（定位 memory.md）都需要工作区，
-    # 由 node 按签名注入（InjectedWorkspace 对模型隐藏）
+    # 由 node 按签名注入（InjectedWorkspace 对模型隐藏）；技能工具不需要工作区（源只有一个，
+    # 在项目根，见 app/agent/skills.py）
     graph.add_node(
         "orchestrate_node",
         OrchestrateNode(
-            orchestrate_tool + note_tools + dispatch_tool + memory_tool,  # type: ignore[arg-type]
+            orchestrate_tool + note_tools + dispatch_tool + memory_tool + skill_tools,  # type: ignore[arg-type]
             workspace_path=workspace_path,
         ),
     )

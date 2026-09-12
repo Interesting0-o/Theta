@@ -99,6 +99,28 @@
 - 可测性：用 `Console(file=StringIO())` 捕获输出断言；Windows 老终端（conhost）会降级，需实测。
 - 相关背景：`app/tui/ui.py`（`emit`）、`app/tui/panels.py`、`docs/ARCHITECTURE.md` §3（前端职责）。
 
+## [~] 技能（skill）：按需加载的"领域包"——**一期已落地，能力型待做**
+
+> **设计已独立成文** → [[docs/SKILL_DESIGN]]。本条只留指针与当前状态，**别再往这里堆内容**。
+
+一句话：把某个领域要用的**工具**和这个领域的**纪律**打成一包、按需加载。典型 = **GitHub**（推送 /
+PR / issue / 搜索 / 不克隆就读远端代码，外加"先开分支""master 不能随便提"等约束）。差异化在
+**约束三分法**——软约束走 `SKILL.md` 正文（host 读取、注入系统提示）、硬闸门走 `tool.json`、
+结构性拒绝写死在工具里。
+
+**当前状态（2026-09-12）**：**两型共用的那条通道已落地**——`app/agent/skills.py` +
+`get_skill`/`drop_skill` + state 的 `loaded_skills` + `LLMNode` 注入（落地清单见
+SKILL_DESIGN §11）。`skills/github/` 没有 `server.py`，故**当前自动是知识型**、可加载。
+**未做**：能力型（`server.py` 生命周期、会话级注册表 + 动态 `bind_tools`、idle 回收、
+env 声明与白名单转发）——那是 §3.3/§3.4 那套，也是最重的一块。
+
+**动手做能力型前先读 SKILL_DESIGN.md §9「待定 / 待验」**——绑定时机 (b) 的注册表落地姿势、
+env 展开白名单、多源目录的沙箱边界这几条没钉死之前，不要开工。
+
+**与本文其它条目的关系**：SKILL_DESIGN §6 与上面的「反思节点」打通——skill fork 到隔离子 agent 执行，
+本身即一次结构性反思，且 `mcp_service/sub_agent.py` 那套骨架已经在了；但它卡在
+`docs/MULTI_AGENT.md` §6「子 agent 写权限下放」这个里程碑上。
+
 ## 相关但未立项（讨论过，待显式拍板再单列）
 
 - 读策略太保守：`read_file` docstring 的"避免大文件整段塞满上下文"引导模型把 1280 行文件

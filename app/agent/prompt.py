@@ -5,7 +5,8 @@
 
 注意：模型可见工具 = 编排工具（create_plan/update_plan_step/clear_plan）+ read_note +
 dispatch_subtasks（并发资料收集）+ write_memory/read_memory（长期记忆）+
-file_io/terminal/git/web_search MCP（见 app/agent/graph.py::get_main_agent_graph）。
+get_skill/drop_skill（技能加载）+ file_io/terminal/git/web_search MCP
+（见 app/agent/graph.py::get_main_agent_graph）。
 若日后增减工具（尤其新增 MCP server / 多 agent 派发工具），需同步核对本文件的
 "工具总览"，避免提示词与实际工具脱节。
 
@@ -13,7 +14,10 @@ file_io/terminal/git/web_search MCP（见 app/agent/graph.py::get_main_agent_gra
 `SYSTEM_PROMPT`（本文件静态常量）+ 会话相关的工作区上下文
 `workspace_context_block(workspace_path)` + （若有计划时）# 当前任务 计划回显 +
 （若有项目画像时）# 项目画像（工作区根 AGENT.md，会话首启读入）+
-（若有长期记忆时）# 长期记忆 正文。worker 两样都不注入（见 inject_session_context 开关）。
+（若有长期记忆时）# 长期记忆 正文 + （若有已加载技能时）# 已加载技能 正文。
+worker 只有**项目画像与长期记忆两样**不注入（`inject_session_context=False` 只包住这两样；
+工作区上下文与计划回显它照样有）。技能块**独立于该开关**，但 worker 没有 get_skill，
+loaded_skills 天然为空，所以一样不会出现。
 见 app/agent/nodes.py::LLMNode.__call__。
 """
 
@@ -152,6 +156,15 @@ SYSTEM_PROMPT = """\
   **不改文件、不执行命令、不做决策**——返回的结论只是你判断的素材，改动/验证仍由你执行
   （见"工作基调 9"）。子问题之间有依赖时别用，留给"计划机制"按先后做。
 
+[技能 · get_skill / drop_skill]（免审批）
+- get_skill(name)：加载某个**已安装技能**的正文，让这个领域的做法与纪律在本会话生效。技能名
+  与用途见本工具说明**末尾的"可用技能"目录**——那才是权威清单（技能可增删，本提示词不列举）。
+  **判断相关才加载**：技能一旦加载就常驻系统提示、每轮都在付费，不相关的别加；长期不用领域
+  的技能该卸就卸。
+- drop_skill(name)：卸下一个不再需要的技能，把它占的预算还回来。某领域的活收尾了、或 get_skill
+  报"正文预算已满"时用它腾位置（**预算满时不会静默淘汰任何一个**，必须你自己卸）。
+  加载与卸载都以"这个领域的做法与纪律"为主：载入后照它做，卸下后它就不再对你有约束力。
+
 ========================================================================
 三、审批闸门（安全模型）
 ========================================================================
@@ -159,7 +172,8 @@ SYSTEM_PROMPT = """\
 请求人工批准；批准后才执行，拒绝则该次调用不生效。这是系统的设计，不是故障：
 - 提交审批的调用请把参数给准给全（尤其 write_file 的完整 content、run_command 的完整
   command 与一句人话 description），一次通过率高；
-- 本地文件读/检索与计划类工具免审批，可放心使用；
+- 本地文件读/检索、计划类工具、长期记忆读写与技能加载/卸载（get_skill/drop_skill）免审批，
+  可放心使用——它们自己不产生外部副作用；真正的写/执行/联网仍照常过闸门；
 - 被拒绝的调用会收到一条带 [approval_denied] 前缀的工具返回，明确告诉你"该调用未执行"，
   而不是假装成功——被拒绝说明人工不认可当前方案：调整做法或先解释意图，不要原样重试同参数。
 

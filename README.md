@@ -221,8 +221,9 @@ theta/
 │   │   ├── prompt.py           # 系统提示词：行为契约 + 工作区上下文
 │   │   ├── model.py            # 聊天模型初始化（OpenAI 兼容）
 │   │   ├── mcp.py              # 以 stdio 子进程拉起四个 MCP server 并收集工具
-│   │   ├── tools.py            # agent 侧工具：编排 / read_note / dispatch / 记忆读写
+│   │   ├── tools.py            # agent 侧工具：编排 / read_note / dispatch / 记忆读写 / 技能加载
 │   │   ├── memory.py           # 长期记忆 memory.md 的读写与注入渲染
+│   │   ├── skills.py           # 技能（skill）扫描 / 解析 / 注入渲染（只读单点）
 │   │   ├── utils.py            # format_tool_result / coerce_tool_result（工具结果归一化）
 │   │   └── tool.json           # 审批策略集中登记（need_review / source）
 │   └── schema/                 # 数据形状（agent / approval / ui / session 四个域）
@@ -233,9 +234,11 @@ theta/
 │   ├── web_search.py           # Tavily 联网检索四件套 + 上游失败翻译
 │   ├── sub_agent.py            # worker（子 agent）MCP server：run_subtask（spawn 即走，只读）
 │   └── utils.py                # guard 异常收口装饰器（只 return 不 raise）
+├── skills/                     # 技能库（可插拔的领域包；命名空间包）。一个技能一个目录：
+│   └── github/                 #   SKILL.md（必备）+ 可选 server.py（有=能力型，无=知识型）
 ├── evaluation/                 # 模型行为评估框架（真实 LLM + 自动审批策略）
 ├── tests/                      # 机制层 pytest 单测（沙箱 / guard / 审批路由 / 计划 / 会话命令）
-├── docs/                       # 设计文档（六篇 + 索引，见 docs/README.md）
+├── docs/                       # 设计文档（七篇 + 索引，见 docs/README.md）
 ├── resource/                   # 运行时数据（gitignore）：<ws_key>/{sessions/<sid>/agent.db, memory/}
 ├── langgraph.json              # LangGraph CLI/Platform 注册（my_agent → get_main_agent_graph_langgraph）
 └── pyproject.toml              # 项目与依赖定义
