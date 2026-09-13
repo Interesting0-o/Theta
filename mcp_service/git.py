@@ -32,6 +32,7 @@ from git.exc import GitCommandError
 import re
 from pathlib import Path
 from typing import List
+from urllib.parse import urlsplit
 from mcp.server.fastmcp import FastMCP
 
 
@@ -399,6 +400,108 @@ async def git_pull(repo_path: str, remote: str = "origin", branch: str = "") -> 
         return f"当前分支 {repo.active_branch.name}，最新提交 {commit.hexsha[:8]} {commit.summary}"
 
     return ToolResult(success=True, content="拉取成功。" + await asyncio.to_thread(_after))
+
+
+def _reject_credentials_in_url(url: str) -> None:
+    """拒绝把凭据写进 http(s) 地址（`https://user:token@host/...`）。
+
+    地址会**进命令行参数**（进程列表可见）、也会进回执与对话历史——token 一旦这么传就是当众
+    泄露，且会在历史里长期留存。认证应当由**设备凭据**给（credential helper / ssh-agent）。
+    ssh 的 `git@host:path`（scp 语法）里 `git` 只是用户名、不是凭据，所以只查 http(s) 两种 scheme。
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:  # 畸形地址交给 git 自己报错，别在这里造一个假诊断
+        return
+    if parts.scheme in ("http", "https") and (parts.username or parts.password):
+        raise InvalidArgumentError(
+            "地址里不要写用户名 / token / 密码（它们会出现在命令行与对话历史里）："
+            "请给不带凭据的地址，认证交给本机凭据（credential helper / ssh 密钥）"
+        )
+
+
+@mcp.tool()
+@guard
+async def git_push(repo_path: str, url: str, branch: str = "") -> ToolResult:
+    """
+    把本地已提交的改动推送到**远程仓库地址**（写操作，需人工审批）。
+
+    推之前先确认三件事：① 要推的提交都已提交（`git_status` / `git_log`；**未提交的改动不会被推
+    上去**）；② 推的是哪个分支（`branch`）；③ 地址确实是你要推去的那个仓库——**推错地方是事故**。
+
+    **地址要来自用户**：用户给的地址，或用户确认过的地址；**拿不准就问用户**——不要凭记忆拼
+    地址，也不要去猜（猜错就是把代码推到别人仓库里去）。本工具**不查**本地 remote 配置，
+    你给的地址就是要推去的地方。
+    Args:
+        repo_path: 仓库根目录路径；传 list_repos 给出的绝对路径或相对工作区根
+            的相对路径均可。
+        url: 远程仓库的**完整地址**（如 `https://github.com/owner/repo.git` 或
+            `git@github.com:owner/repo.git`），**不是** `origin` 这类 remote 名——给 remote 名
+            本工具解析不了要去哪儿。地址里**不要写 token / 密码**（带凭据的 http(s) 地址会被
+            直接拒绝）：认证交给设备上的凭据（credential helper / ssh 密钥），缺凭据会快速
+            失败并回显原因，不会弹出交互登录把这次调用挂死。
+        branch: 要推送的**本地**分支名（推成远端同名分支）；该分支必须已在本地存在。
+            留空 = 推送当前分支；游离 HEAD 会失败并说明。
+    """
+    repo_root = _resolve_repo_path(repo_path)
+    _ensure_known_repo(repo_root)
+
+    target_url = (url or "").strip()
+    if not target_url:
+        raise InvalidArgumentError(
+            "url 不能为空：要给远程仓库的完整地址（如 https://github.com/owner/repo.git），"
+            "不是 origin 这类 remote 名"
+        )
+    _reject_credentials_in_url(target_url)
+
+    repo = await _get_repo(repo_root)
+
+    def _target_branch() -> str:
+        if branch and branch.strip():
+            name = branch.strip()
+            if name not in [head.name for head in repo.heads]:
+                raise InvalidArgumentError(
+                    f"本地没有分支 {name}，无法推送（要新建就先 git_switch，或改用已有分支名）"
+                )
+            return name
+        if repo.head.is_detached:
+            raise InvalidArgumentError(
+                "当前处于游离 HEAD，没有分支可推；请先 git_switch 到一个分支"
+            )
+        name = repo.active_branch.name
+        if name not in [head.name for head in repo.heads]:
+            # 仓库还没有任何提交（unborn HEAD）：`active_branch` 会返回配置里的初始分支名，
+            # 但那个 ref 并不存在——直接推只会拿到 git 的 "src refspec ... does not match any"。
+            raise InvalidArgumentError(
+                f"分支 {name} 还没有任何提交，没有可推送的内容（先 git_add + git_commit）"
+            )
+        return name
+
+    name = await asyncio.to_thread(_target_branch)
+    # 推的必须是你**本地的那个分支**（而不是 HEAD）：显式 src:dst 以免"当前在别的分支上"
+    # 时把别的分支的提交推成目标分支——refspec 写成内层名字而不是裸分支名，就是为了这个。
+    refspec = f"refs/heads/{name}:refs/heads/{name}"
+
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(repo.git.push, target_url, refspec), timeout=_SYNC_TIMEOUT
+        )
+    except TimeoutError:
+        return ToolResult(success=False, content="push 超时（60 秒），疑似网络或认证问题。")
+    except GitCommandError as exc:
+        # 非快进 / 认证失败 / 网络不通：stderr 原样回显（非快进时 git 自己会提示先 pull）
+        stderr = exc.stderr.strip() if exc.stderr else str(exc)
+        return ToolResult(success=False, content=f"push 失败：{stderr}")
+
+    head = await asyncio.to_thread(lambda: repo.head.commit.hexsha[:8])
+    return ToolResult(
+        success=True,
+        content=(
+            f"已推送分支 {name} → {target_url}（提交 {head}）。\n"
+            f"注意：本次推送**不设置上游跟踪**——之后要拉取请给 git_pull 显式的 remote/branch，"
+            f"或让人手动执行一次 git push -u。"
+        ),
+    )
 
 
 @mcp.tool()

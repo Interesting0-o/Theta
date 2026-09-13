@@ -25,7 +25,7 @@ import app.config as config
 from app.agent import mcp, skills
 from app.agent.nodes import LLMNode
 from app.agent.tools import SessionToolset, drop_skill, get_skill
-from app.schema.agent_schema import MCPToolSpec
+from app.schema.agent_schema import MCPToolSpec, SkillMeta, SkillPreflight
 
 # 读侧（session_tools / names / version）按原样查键，**不归一化**——所以测试也要给归一化后的路径
 # （生产里三个调用点拿到的都是 _resolve_workspace 的结果，天然一致，见 mcp.session_tools）
@@ -141,6 +141,237 @@ def test_load_registers_tools_and_drop_removes_them(skills_dir, monkeypatch):
     assert "它的工具也已从本会话移除" in out["messages"][0].content
 
 
+def test_unregister_drops_the_server_schema_cache(skills_dir, monkeypatch):
+    """卸载时连该 server 的 schema 缓存一起丢。
+
+    缓存是"列一次用一辈子"的，留着会让"改技能 → drop_skill 再 get_skill"拿到**新代码 + 旧工具表**
+    （新增/改名的工具看不见，而运行体已经是新的了）。这里直接种一条缓存再卸载，验证它被清掉。
+    """
+    mcp._reset_pools_for_tests()
+    _fake_settings(monkeypatch)
+    key = (_WS, "skills/demo")
+    mcp_module._SERVER_SPECS[key] = []
+
+    asyncio.run(mcp.unregister_server(_WS, _SESSION, "skills/demo"))
+
+    assert key not in mcp_module._SERVER_SPECS
+
+
+def test_reload_reraises_missing_runtime(skills_dir, monkeypatch):
+    """名字已在清单里、运行体却不在（对账重建失败被退避）→ get_skill 是**正常重试入口**。
+
+    失败退避（见 `_register_failed`）把"每轮自动重试"换掉了，若这里也按"已加载无需重复"
+    一挡，模型就再没有重试路径了：正文在、工具没有，照 SKILL.md 去调工具只会撞 unknown_tool，
+    而那条回执恰恰指它来 get_skill。
+    """
+    mcp._reset_pools_for_tests()
+    _make_skill(skills_dir, "demo")
+    _fake_cfg(monkeypatch, {"demo_tool": "skills/demo"})
+    calls = _fake_specs(monkeypatch, {"skills/demo": ["demo_tool"]})
+    _fake_settings(monkeypatch)
+
+    _load("demo")
+    assert len(calls) == 1
+
+    mcp._EXTRA_TOOLS.clear()  # 模拟"运行体没了"（重建失败被退避后的状态）
+    out = _load("demo", ["demo"])
+
+    assert len(calls) == 2  # 真的重新拉起
+    assert "重新拉起" in out["messages"][0].content
+    assert "demo_tool" in mcp.session_tool_names(_WS, _SESSION)
+
+
+def test_reload_reports_reason_when_runtime_cannot_be_rebuilt(skills_dir, monkeypatch):
+    """重试仍失败 → 回的是**可行动的原因**（工具没登记），不是干巴巴的"已在加载中"。"""
+    mcp._reset_pools_for_tests()
+    _make_skill(skills_dir, "demo")
+    _fake_cfg(monkeypatch, {"demo_tool": "skills/demo"})
+    _fake_specs(monkeypatch, {"skills/demo": ["demo_tool"]})
+    _fake_settings(monkeypatch)
+    _load("demo")
+
+    mcp._EXTRA_TOOLS.clear()
+    _fake_cfg(monkeypatch, {})  # 工具登记被撤掉（等价于 tool.json 没登记）
+    out = _load("demo", ["demo"])
+
+    assert "tool.json" in out["messages"][0].content
+    assert "重新拉起" not in out["messages"][0].content
+
+
+# ---------------------- 依赖自检（skill.json 的 requirements） ----------------------
+
+
+def test_missing_requirement_is_refused_before_any_spawn(skills_dir, monkeypatch):
+    """声明了装不上的依赖 → 加载前就拒（**一次 schema 都没列过**），回执给 uv sync 出路。
+
+    这条之所以能零成本：技能依赖装在主 venv，技能 server 与 host 是同一个解释器，
+    所以 host 侧 `find_spec`（只定位、不执行）的结论就是子进程的结论。
+    """
+    mcp._reset_pools_for_tests()
+    skill_dir = _make_skill(skills_dir, "demo")
+    (skill_dir / "skill.json").write_text(
+        json.dumps({"requirements": ["这个包肯定不存在_xyz"]}), encoding="utf-8"
+    )
+    _fake_cfg(monkeypatch, {"demo_tool": "skills/demo"})
+    calls = _fake_specs(monkeypatch, {"skills/demo": ["demo_tool"]})
+    _fake_settings(monkeypatch)
+
+    out = _load("demo")
+
+    assert list(out) == ["messages"]  # 没写 loaded_skills
+    content = out["messages"][0].content
+    assert "这个包肯定不存在_xyz" in content
+    assert "uv sync" in content and "重新 get_skill" in content
+    assert calls == []  # 连 schema 都没列过 → 更没有起进程
+    assert mcp._WORKERS == {}
+
+
+def test_installed_requirement_does_not_block(skills_dir, monkeypatch):
+    """声明了**确实装着**的依赖（`mcp` 是第三方包，技能自己在用）→ 不拦，照常加载。"""
+    mcp._reset_pools_for_tests()
+    skill_dir = _make_skill(skills_dir, "demo")
+    (skill_dir / "skill.json").write_text(json.dumps({"requirements": ["mcp"]}), encoding="utf-8")
+    _fake_cfg(monkeypatch, {"demo_tool": "skills/demo"})
+    _fake_specs(monkeypatch, {"skills/demo": ["demo_tool"]})
+    _fake_settings(monkeypatch)
+
+    out = _load("demo")
+
+    assert out["loaded_skills"] == ["demo"]
+
+
+# ---------------------- 起不来时的回执 ----------------------
+
+
+def test_startup_failure_receipt_carries_child_traceback(monkeypatch, tmp_path):
+    """起不来时回执要带**子进程的真 traceback**，而不是 `ExceptionGroup` 黑箱。
+
+    真 spawn `python -m skills_pkg.broken.server`（fixture 在 import 期 import 一个不存在的模块）：
+    适配器只把 `ExceptionGroup → McpError: Connection closed` 交给 host，真正的原因只在子进程的
+    stderr 上——所以加载失败后要**重跑一次 import** 把它捞回来，否则模型拿着"配置问题请告知用户"
+    却说不出来是什么问题。
+    """
+    mcp._reset_pools_for_tests()
+    monkeypatch.setattr(skills, "SKILLS_DIR", _FIXTURE_ROOT / "skills_pkg")
+    monkeypatch.setattr(skills, "SKILLS_PACKAGE", "skills_pkg")
+    monkeypatch.setattr(
+        mcp_module, "PROJECT_ROOT", f"{_FIXTURE_ROOT}{os.pathsep}{mcp_module.PROJECT_ROOT}"
+    )
+    _fake_cfg(monkeypatch, {"broken_tool": "skills_pkg/broken"})
+    _fake_settings(monkeypatch)
+
+    out = asyncio.run(
+        get_skill.coroutine(
+            name="broken",
+            state={"session_id": _SESSION, "loaded_skills": []},
+            tool_call_id="c1",
+            workspace=str(tmp_path),
+        )
+    )
+
+    content = out["messages"][0].content
+    assert "起不来" in content
+    assert "imaginary_dependency_that_does_not_exist" in content  # ← 子进程的真原因
+    assert "告知用户" in content
+    assert "loaded_skills" not in out  # 失败即不写清单
+
+
+def test_startup_failure_falls_back_when_probe_says_fine(skills_dir, monkeypatch):
+    """探针说"import 没问题"时，回退到**展平后的异常**——不拿一段无关 traceback 误导模型。
+
+    （import 能过却起不来 = 协议层/超时那类，与"缺依赖、语法错"无关。）
+    """
+    mcp._reset_pools_for_tests()
+    _make_skill(skills_dir, "demo")
+    _fake_cfg(monkeypatch, {"demo_tool": "skills/demo"})
+    _fake_specs(monkeypatch, {"skills/demo": ["demo_tool"]})
+    _fake_settings(monkeypatch)
+    monkeypatch.setattr(tools_module, "_probe_skill_startup", lambda *a, **k: None)
+
+    async def boom(*args, **kwargs):
+        raise ExceptionGroup("unhandled errors in a TaskGroup", [RuntimeError("Connection closed")])
+
+    monkeypatch.setattr(mcp_module, "register_server", boom)
+
+    out = _load("demo")
+
+    content = out["messages"][0].content
+    assert "起不来" in content
+    assert "Connection closed" in content  # 展平后看得见，不再是"1 sub-exception"
+    assert "1 sub-exception" not in content
+
+
+# ---------------------- 加载时体检 ----------------------
+
+
+def _fake_preflight(monkeypatch, *, ok: bool, detail: str = "HTTP 200") -> list[str]:
+    """把体检端点与探针都换成假的；返回探针调用记录（只在声明了 preflight 的技能上才会被调）。"""
+    monkeypatch.setattr(
+        skills,
+        "read_preflight",
+        lambda meta: SkillPreflight(url="https://example.test/user", bearer_env="GITHUB_TOKEN"),
+    )
+    calls: list[str] = []
+
+    def probe(url: str, token: str):
+        calls.append(url)
+        return ok, detail
+
+    monkeypatch.setattr(tools_module, "_probe_skill_credential", probe)
+    return calls
+
+
+def test_preflight_line_lands_in_the_receipt(skills_dir, monkeypatch):
+    """体检结论随 `get_skill` 的回执给模型——这是它替掉 github_auth_status 那个工具的理由。"""
+    mcp._reset_pools_for_tests()
+    _make_skill(skills_dir, "demo", env=["GITHUB_TOKEN"])
+    _fake_cfg(monkeypatch, {"demo_tool": "skills/demo"})
+    _fake_specs(monkeypatch, {"skills/demo": ["demo_tool"]})
+    _fake_settings(monkeypatch)
+    calls = _fake_preflight(monkeypatch, ok=True)
+
+    out = _load("demo")
+
+    content = out["messages"][0].content
+    assert "凭证体检：GITHUB_TOKEN 可用" in content
+    assert calls == ["https://example.test/user"]  # 真去打了一次
+
+
+def test_preflight_failure_does_not_block_loading(skills_dir, monkeypatch):
+    """体检失败**不阻断加载**：正文/纪律在拿不到远端时照样有用，工具也照常注册。
+
+    但结论要醒目地报关（并点明"告知用户"）——否则模型会带着一个坏凭证一头撞进工具调用。
+    """
+    mcp._reset_pools_for_tests()
+    _make_skill(skills_dir, "demo", env=["GITHUB_TOKEN"])
+    _fake_cfg(monkeypatch, {"demo_tool": "skills/demo"})
+    _fake_specs(monkeypatch, {"skills/demo": ["demo_tool"]})
+    _fake_settings(monkeypatch)
+    _fake_preflight(monkeypatch, ok=False, detail="被拒（HTTP 401：令牌无效/过期，或权限不足）")
+
+    out = _load("demo")
+
+    assert out["loaded_skills"] == ["demo"]  # 仍然加载
+    assert mcp.registered_servers(_WS, _SESSION) == {"skills/demo"}  # 工具照常注册
+    content = out["messages"][0].content
+    assert "⚠️ 凭证体检失败" in content and "告知用户" in content
+    assert "HTTP 401" in content
+
+
+def test_preflight_not_run_for_knowledge_skill(skills_dir, monkeypatch):
+    """知识型既不起进程、也不该去打体检（它没有凭证那回事）。"""
+    mcp._reset_pools_for_tests()
+    _make_skill(skills_dir, "know", capability=False)
+    _fake_settings(monkeypatch)
+    calls = _fake_preflight(monkeypatch, ok=True)
+
+    out = _load("know")
+
+    assert out["loaded_skills"] == ["know"]
+    assert calls == []
+    assert "体检" not in out["messages"][0].content
+
+
 def test_knowledge_skill_registers_nothing(skills_dir, monkeypatch):
     """知识型（没有 server.py）只写名字——不动工具、不动版本，也不需要凭证。"""
     mcp._reset_pools_for_tests()
@@ -193,20 +424,52 @@ def test_missing_env_is_rejected_before_any_spawn(skills_dir, monkeypatch):
 
 
 def test_name_must_match_dir_for_capability(skills_dir, monkeypatch):
-    """能力型要求 frontmatter 的 name == 目录名（启动模块与 source 都按目录名走）。"""
+    """name 与目录名不一致的能力型：扫盘期就降级为知识型 → 按知识型加载（正文可用、工具不拉起）。
+
+    降级落在 `scan_skills`（见 tests/test_skills.py），所以模型看到的目录与加载行为一致：
+    **标 [带工具] 的技能一定加载得上**。加载期那道校验因此退化成安全网，由下一条用例直接
+    喂它一个构造出来的 meta 来覆盖。
+    """
     mcp._reset_pools_for_tests()
     skill_dir = _make_skill(skills_dir, "demo")
     (skill_dir / "SKILL.md").write_text(
         "---\nname: demo-v2\ndescription: 名字与目录不一致\n---\n\n正文", encoding="utf-8"
     )
     _fake_cfg(monkeypatch, {"demo_tool": "skills/demo"})
-    _fake_specs(monkeypatch, {"skills/demo": ["demo_tool"]})
+    calls = _fake_specs(monkeypatch, {"skills/demo": ["demo_tool"]})
     _fake_settings(monkeypatch)
+
+    out = _load("demo-v2")
+
+    assert out["loaded_skills"] == ["demo-v2"]  # 按知识型加载成功
+    assert calls == []  # 一次 schema 都没列过（没起过它的 server）
+
+
+def test_capability_meta_with_mismatched_dir_is_refused_by_loader(skills_dir, monkeypatch):
+    """安全网：即便拿到一个 capability=True 且 name != 目录名的 meta，加载期也必须拒绝。
+
+    正常路径上这种 meta 到不了这里（扫盘期就降级了，见上一条），所以用例直接把假扫描结果
+    喂进 `scan_skills`——守的是"校验即使退化也不许被删掉"。
+    """
+    mcp._reset_pools_for_tests()
+    skill_dir = _make_skill(skills_dir, "demo")
+    _fake_cfg(monkeypatch, {"demo_tool": "skills/demo"})
+    calls = _fake_specs(monkeypatch, {"skills/demo": ["demo_tool"]})
+    _fake_settings(monkeypatch)
+    meta = SkillMeta(
+        name="demo-v2",
+        description="名字与目录不一致",
+        dir_name="demo",
+        capability=True,
+        path=str(skill_dir / "SKILL.md"),
+    )
+    monkeypatch.setattr(skills, "scan_skills", lambda: {"demo-v2": meta})
 
     out = _load("demo-v2")
 
     assert list(out) == ["messages"]
     assert "目录名" in out["messages"][0].content
+    assert calls == []
 
 
 def test_clashing_tool_names_are_rejected(skills_dir, monkeypatch):
@@ -259,6 +522,36 @@ def test_reconcile_rebuilds_missing_runtime_once_and_is_idempotent(skills_dir, m
     assert len(calls) == 2  # 幂等：快乐路径纯内存，不再列 schema
 
 
+def test_reconcile_fast_path_never_rescans_for_knowledge_skill(skills_dir, monkeypatch):
+    """知识型技能在 loaded_skills 里时，对账仍必须是纯内存的（不许每轮重扫技能源）。
+
+    回归防线：`registered` 只含能力型运行体、`loaded` 含两型名字，两边**直接比较永远不相等**
+    ——若不把查实过的知识型记进 `SessionToolset._knowledge_only`，每个知识型技能都会让快路径
+    失效：LLMNode 与 ToolNode 每轮各扫一遍技能源（iterdir + 逐个读 SKILL.md）。
+    """
+    mcp._reset_pools_for_tests()
+    _make_skill(skills_dir, "know", capability=False)
+    scans: list[int] = []
+    real = skills.scan_skills
+
+    def counting():
+        scans.append(1)
+        return real()
+
+    monkeypatch.setattr(skills, "scan_skills", counting)
+
+    toolset = SessionToolset(_WS, [])
+    state = {"session_id": _SESSION, "loaded_skills": ["know"]}
+
+    asyncio.run(toolset.tools_and_version(state))
+    after_first = len(scans)
+    assert after_first == 1  # 第一次得读盘才知道它是知识型
+
+    asyncio.run(toolset.tools_and_version(state))  # 下一轮 LLMNode
+    asyncio.run(toolset.tools_map(state))  # 再过一次 ToolNode
+    assert len(scans) == after_first  # 之后一次盘都没再读
+
+
 def test_reconcile_unregisters_runtime_no_longer_in_state(skills_dir, monkeypatch):
     """反向对账：运行体在、state 里没有 → 注销。
 
@@ -281,22 +574,69 @@ def test_reconcile_unregisters_runtime_no_longer_in_state(skills_dir, monkeypatc
 
 
 def test_reconcile_failure_does_not_blow_up_the_turn(skills_dir, monkeypatch):
-    """对账炸了也不能炸整轮：沿用现状 + 告警。"""
+    """对账炸了也不能炸整轮：沿用现状 + 告警（且失败要退避，见下一条）。"""
     mcp._reset_pools_for_tests()
     _make_skill(skills_dir, "demo")
     _fake_settings(monkeypatch)
+    attempts: list[str] = []
 
     async def boom(workspace, server, connection):
+        attempts.append(server)
         raise RuntimeError("起不来")
 
     monkeypatch.setattr(mcp_module, "_server_specs", boom)
     toolset = SessionToolset(_WS, [])
+    state = {"session_id": _SESSION, "loaded_skills": ["demo"]}
 
-    tools, version = asyncio.run(
-        toolset.tools_and_version({"session_id": _SESSION, "loaded_skills": ["demo"]})
-    )
+    tools, version = asyncio.run(toolset.tools_and_version(state))
 
     assert tools == [] and version == 0  # 没炸，返回现状
+    assert len(attempts) == 1
+
+    asyncio.run(toolset.tools_and_version(state))  # 下一轮不许再试（server 起不来这种失败要退避）
+    asyncio.run(toolset.tools_map(state))
+    assert len(attempts) == 1
+
+
+def test_reconcile_failed_rebuild_backs_off(skills_dir, monkeypatch, caplog):
+    """重建失败必须**退避**：记进 `SessionToolset._register_failed` 后，后续轮次一次都不再试。
+
+    回归防线：失败不记的话，名字会一直留在 `missing` 里——LLMNode 与 ToolNode 每轮各重来一次，
+    而重试要重新列 schema（回滚路径已把该 server 的 schema 缓存丢掉）= **每轮真起两个临时会话**。
+    一个坏技能（server 起不来 / 新加的工具没在 tool.json 登记）会让整个会话每轮多起两个子进程，
+    日志也每轮响两遍。
+
+    "重开会话"是重试路径：备忘按实例存活，新实例会再试一次（`get_skill` 则从不查它）。
+    """
+    mcp._reset_pools_for_tests()
+    _make_skill(skills_dir, "demo")
+    monkeypatch.setattr(tools_module, "_tool_config", lambda: {})  # 工具没登记 → 必失败
+    calls: list[str] = []
+
+    async def fake(workspace, server, connection):
+        calls.append(server)
+        return [
+            MCPToolSpec(server=server, name="demo_tool", description="d", args_schema={}, metadata=None)
+        ]
+
+    monkeypatch.setattr(mcp_module, "_server_specs", fake)
+    _fake_settings(monkeypatch)
+
+    toolset = SessionToolset(_WS, [])
+    state = {"session_id": _SESSION, "loaded_skills": ["demo"]}
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(toolset.tools_and_version(state))  # 第 1 轮：试一次、失败、记住
+        for _ in range(3):  # 之后 3 轮
+            asyncio.run(toolset.tools_and_version(state))  # LLMNode
+            asyncio.run(toolset.tools_map(state))  # ToolNode
+
+    assert calls == ["skills/demo"]  # 只试过一次
+    assert caplog.text.count("重建失败") == 1  # 也只响过一次
+
+    fresh = SessionToolset(_WS, [])  # 重开会话 = 新实例
+    asyncio.run(fresh.tools_and_version(state))
+    assert len(calls) == 2  # 新会话真的重试
 
 
 # ---------------------- 动态 bind ----------------------

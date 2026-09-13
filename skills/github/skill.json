@@ -1,3 +1,8 @@
 {
-  "env": ["GITHUB_TOKEN"]
+  "env": ["GITHUB_TOKEN"],
+  "requirements": ["mcp"],
+  "preflight": {
+    "url": "https://api.github.com/user",
+    "bearer": "GITHUB_TOKEN"
+  }
 }

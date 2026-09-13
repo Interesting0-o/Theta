@@ -121,7 +121,7 @@ env 声明与白名单转发）——那是 §3.3/§3.4 那套，也是最重的
 
 **二期已落地（只读子集，2026-09-12）**：SKILL_DESIGN **§13 能力型**——技能可以带 `server.py`，
 `get_skill` 把它的工具拉进本会话、`drop_skill` 一并关掉（机制 = "技能就是按需加入的 server"，
-复用 §12 的运行体）。首个能力型技能 `skills/github/` 落了 **8 个只读工具**（stdlib HTTP，不引 PyGithub）。
+复用 §12 的运行体）。首个能力型技能 `skills/github/` 落了 **7 个只读工具**（stdlib HTTP，不引 PyGithub）+ 一次**加载时凭证体检**（`skill.json` 的 `preflight`，替代了原 `github_auth_status` 工具）。
 
 **未做**：GitHub 的**写操作**（开 PR / 推送 / 合并 / 评论）与若干只读工具；技能运行体的空闲回收
 （已定不做，只靠 `drop_skill`）；`/skills` 控制面命令。口径见 §13.9。

@@ -22,9 +22,13 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
+import urllib.error
+import urllib.request
 from datetime import date
 from functools import lru_cache
+from importlib.machinery import PathFinder
 from pathlib import Path
 from typing import Annotated, List
 
@@ -606,6 +610,10 @@ def _tool_config() -> dict[str, dict]:
 
     单独抽出来是为了给测试留缝：校验"技能的工具是否已登记"必须能注入假表，否则用例只能去改
     仓库里真的 tool.json。
+
+    ⚠️ 同一份文件在 `nodes.py::ReviewNode._tool_config` 还有一份**独立的** `lru_cache`
+    （那边要的是审批策略，这边要的是 source 登记，测试缝也各留各的）。两份都"读一次用一辈子"，
+    所以**改 tool.json（含给新技能登记工具）要重启进程**——不是只重启一处生效。
     """
     with _WORKER_TOOL_CONFIG.open("r", encoding="utf-8") as file:
         return json.load(file)
@@ -615,6 +623,144 @@ def _skill_server_name(meta_or_name) -> str:
     """技能运行体在 mcp 注册表里的 server 名：`skills/<目录名>`（= tool.json 的 source）。"""
     dir_name = getattr(meta_or_name, "dir_name", meta_or_name)
     return f"{skills.SKILLS_PACKAGE}/{dir_name}"
+
+
+# 加载时体检的超时（秒）。它是**附加信息**，不该让一次 get_skill 卡在网络上：超时按
+# "没做成"报关，不阻断加载（理由见 _skill_preflight_line）。
+_PREFLIGHT_TIMEOUT = 8
+
+
+def _probe_skill_credential(url: str, token: str) -> tuple[bool, str]:
+    """打一次只读端点验凭证，返回 (是否可用, 一行说明)。
+
+    只看 HTTP 层：能拿到响应 = 可用；401/403 = 被拒；网络失败 = 连不上。**不解析正文**——
+    "这个凭证行不行"是加载时该回答的全部；账号、配额那些是技能工具自己的事。
+    """
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}", "User-Agent": "theta-agent"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_PREFLIGHT_TIMEOUT) as response:
+            return True, f"HTTP {response.status}"
+    except urllib.error.HTTPError as exc:
+        return False, f"被拒（HTTP {exc.code}：令牌无效/过期，或权限不足）"
+    except urllib.error.URLError as exc:
+        return False, f"连不上（{exc.reason}）"
+
+
+async def _skill_preflight_line(meta: SkillMeta) -> str | None:
+    """按技能声明的 `preflight` 打一次体检，返回**一行结论**；没声明 → None（回执里不出现）。
+
+    为什么在 host 侧、而不是做成技能工具：凭证行不行是**加载那一刻就该知道**的配置事实。
+    做成工具等于指望模型想到去调它（它并不知道该调），而配置问题被推到"第一次真调用才炸"
+    正是要避免的那种发现方式；做在 host 侧还省下一条模型可见的工具表条目（2026-09-13 改：
+    `github_auth_status` 这个工具就是被这条替掉的）。
+
+    **失败不阻断加载**：技能的正文/纪律在拿不到远端时仍然有用（照它的规范写 PR 描述不需要
+    网络），所以结论只如实报关，让模型自己决定还动不动手；真调工具时另有 upstream_error 兜底。
+    """
+    spec = await asyncio.to_thread(skills.read_preflight, meta)
+    if spec is None:
+        return None
+    try:
+        env = skill_env(await asyncio.to_thread(skills.read_skill_env, meta))
+    except ConfigError as exc:
+        return f"⚠️ 凭证体检没做成：{exc}"
+    token = env.get(spec.bearer_env, "")
+    if not token:
+        return f"⚠️ 凭证体检没做成：{spec.bearer_env} 没有值"
+
+    ok, detail = await asyncio.to_thread(_probe_skill_credential, spec.url, token)
+    if ok:
+        return f"凭证体检：{spec.bearer_env} 可用（{detail}）。"
+    return (
+        f"⚠️ 凭证体检失败：{spec.bearer_env} {detail}——本技能的工具调用会同样失败。"
+        f"请把这条告知用户（多半是 .env 里的它过期或权限不够）；改好之后 drop_skill 再 "
+        f"get_skill 会重新体检。"
+    )
+
+
+def _missing_requirements(meta: SkillMeta, workspace: str) -> list[str]:
+    """技能声明的依赖里，当前环境**import 不到**的那些（按顶层包名）。
+
+    为什么可信：技能依赖装在主 venv（§5.1 已决不做隔离），技能 server 又是用 `sys.executable`
+    起的——**与 host 同一个解释器**，所以这里的结论就是子进程 import 时的结论。搜索路径照着子进程
+    的拼（`-m` 的 `sys.path[0]` 是工作区，再加 `PYTHONPATH=项目根`，然后才是 host 自己的 sys.path），
+    免得"工作区里恰好有一份同名包"这种边角被误判。
+
+    `find_spec` **只定位、不执行模块代码**：零副作用、不起进程——这正是它比"起一次 import 探针"
+    强的地方（后者会把技能的模块级代码多跑一遍）。`requirements` 里写 `a.b` 时只看顶层 `a`。
+    """
+    declared = skills.read_requirements(meta)
+    if not declared:
+        return []
+    search = [workspace, str(_PROJECT_ROOT), *sys.path]
+    missing: list[str] = []
+    for name in declared:
+        try:
+            found = PathFinder().find_spec(name.split(".")[0], search) is not None
+        except (ImportError, ValueError, AttributeError):
+            found = False
+        if not found:
+            missing.append(name)
+    return missing
+
+
+# 启动失败时"重跑一次 import 抓原因"的超时（秒）与回执里 traceback 的截断长度。
+# 这条只在**已经失败**之后跑，所以不给成功路径添任何开销。
+_STARTUP_PROBE_TIMEOUT = 15
+_STARTUP_PROBE_CHARS = 1200
+
+
+def _flatten_exception(exc: BaseException) -> str:
+    """把一个异常（可能是 ExceptionGroup）压成一行可读的类型 + 消息。
+
+    MCP 适配器把"子进程没起来"报成 `ExceptionGroup(...) → McpError: Connection closed`——
+    原样回给模型等于什么都没说。展平一层（最多取前 3 个）比那串判词有用。
+    """
+    subs = list(getattr(exc, "exceptions", ()) or ())[:3]
+    if not subs:
+        return f"{type(exc).__name__}: {exc}"
+    inner = "、".join(f"{type(sub).__name__}: {sub}" for sub in subs)
+    return f"{type(exc).__name__}（{inner}）"
+
+
+def _probe_skill_startup(meta: SkillMeta, workspace: str, env: dict[str, str]) -> str | None:
+    """重跑一次"能不能 import 这个 server"，把**子进程的 traceback** 带回来；问不出来 → None。
+
+    为什么需要它：能力型技能起不来时（缺依赖、语法错、server 自己抛 ConfigError…），MCP 适配器
+    只把 `ExceptionGroup → McpError: Connection closed` 交给 host——**真正的原因只打在子进程的
+    stderr 上**，模型拿到的是个黑箱，而"把配置问题告知用户"恰恰要求说得出是什么问题。
+
+    做法：用**与真启动完全同一套** command/cwd/env（直接取 `stdio_connection` 的产物，避免两处
+    漂移）跑 `python -c "import <module>"`，收回 stderr 尾部的 traceback。所以它只在失败路径上
+    多起一个进程——成功路径一次都不跑；而且 import 成功（returncode 0）时返回 None，因为那种
+    "起不来"另有原因（协议/超时），不该拿一段无关的 traceback 误导模型。
+    """
+    connection = mcp.stdio_connection(skills.server_module(meta), workspace, env)
+    command = [connection["command"], *connection["args"]]
+    import_cmd = [
+        command[0],  # 同一个解释器
+        "-c",
+        f"import {skills.server_module(meta)}",
+    ]
+    try:
+        done = subprocess.run(
+            import_cmd,
+            cwd=connection["cwd"],
+            env=connection["env"],
+            capture_output=True,
+            text=True,
+            timeout=_STARTUP_PROBE_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("技能 %s 的启动探针自身失败：%s", meta.name, exc)
+        return None
+    if done.returncode == 0:
+        return None
+    tail = (done.stderr or "").strip()[-_STARTUP_PROBE_CHARS:]
+    return tail or None
 
 
 async def _register_skill_runtime(
@@ -635,13 +781,27 @@ async def _register_skill_runtime(
         return (
             f"技能 {meta.name} 带 server.py，但它的目录名 {meta.dir_name!r} 与技能名不一致——"
             f"能力型要求两者相同（启动模块与工具登记都按目录名走）。"
-            f"请把 SKILL.md 的 name 改成目录名，或改目录名。"
+            f"请把 SKILL.md 的 name 改成目录名，或改目录名；改完**重开会话**再试"
+            f"（技能的目录条目录入在会话启动时完成）。"
+        )
+
+    missing = await asyncio.to_thread(_missing_requirements, meta, workspace)
+    if missing:
+        return (
+            f"技能 {meta.name} 声明的依赖当前环境里 import 不到：{missing}。"
+            f"请把它们加进项目根的 pyproject.toml 后执行 uv sync（技能依赖装在主 venv，不做隔离），"
+            f"然后**重新 get_skill 即可**，不必重启进程。"
+            f"**这是技能配置问题、不是你的调用方式问题**——请把这条回执告知用户，不要自己绕道。"
         )
 
     try:
         env = skill_env(await asyncio.to_thread(skills.read_skill_env, meta))
     except ConfigError as exc:
-        return f"技能 {meta.name} 需要的凭证没配好，已拒绝加载：{exc}"
+        return (
+            f"技能 {meta.name} 需要的凭证没配好，已拒绝加载：{exc}。"
+            f"请在 .env 里补上（键还要落在 app/config.py::SKILL_ENV_WHITELIST 里），"
+            f"改完**需要重启进程**（配置在启动时读入并缓存），再重新 get_skill。"
+        )
 
     connection = mcp.stdio_connection(skills.server_module(meta), workspace, env)
     existing_names = mcp.session_tool_names(workspace, session) | set(_ORCHESTRATE_TOOL_NAMES)
@@ -649,9 +809,18 @@ async def _register_skill_runtime(
     try:
         names = await mcp.register_server(workspace, session, server, connection)
     except Exception as exc:  # noqa: BLE001 —— 起不来就是加载失败，交给回执说清楚
+        # 重跑一次 import 把子进程的真 traceback 拿回来（失败路径才付这点代价）：
+        # 否则模型手里只有 ExceptionGroup → McpError，说不出"为什么起不来"
+        traceback_tail = await asyncio.to_thread(
+            _probe_skill_startup, meta, workspace, env
+        )
+        detail = traceback_tail or _flatten_exception(exc)
         return (
-            f"技能 {meta.name} 的 server 起不来或没列出工具，已拒绝加载："
-            f"{type(exc).__name__}: {exc}"
+            f"技能 {meta.name} 的 server 起不来或没列出工具，已拒绝加载"
+            f"（**装好依赖或改好代码之后，直接重新 get_skill 即可，不必重启进程**）。\n"
+            f"**这是技能自身的问题（缺依赖 / 代码报错 / 配置不对），不是你的调用方式问题**——"
+            f"请把下面这段告知用户，不要自己绕道：\n"
+            f"```\n{detail}\n```"
         )
 
     problem = _check_skill_tools(meta, server, names, existing_names)
@@ -673,7 +842,7 @@ def _check_skill_tools(
     if clash:
         return (
             f"技能 {meta.name} 的工具与已有工具重名：{clash}，已拒绝加载。"
-            f"请改名后重试（同名会让模型与审批策略都无法区分两者）。"
+            f"请改名后重新 get_skill（同名会让模型与审批策略都无法区分两者）。"
         )
 
     cfg = _tool_config()
@@ -681,8 +850,9 @@ def _check_skill_tools(
     if unregistered:
         return (
             f"技能 {meta.name} 的工具没有在 app/agent/tool.json 里按要求登记：{unregistered}。"
-            f'请在 tool.json 为每个工具加一行 {{"need_review": true/false, "source": "{server}"}} '
-            f"后重试。**这是技能配置问题、不是你的调用方式问题**——请把这条回执告知用户，"
+            f'请在 tool.json 为每个工具加一行 {{"need_review": true/false, "source": "{server}"}}，'
+            f"改完**需要重启进程**（它是进程内只读一次的），再重新 get_skill。"
+            f"**这是技能配置问题、不是你的调用方式问题**——请把这条回执告知用户，"
             f"不要自己绕道（例如改用 read_file 去读技能目录）。"
         )
     return None
@@ -709,10 +879,11 @@ async def get_skill(
         workspace: （系统自动注入，无需传入）当前工作区，能力型技能的 server 在它里面运行。
 
     Returns:
-        成功：回执（正文已进系统提示；能力型另注明工具数）。
-        失败：技能名不存在（附可用清单）/ 已在加载中 / 正文预算已满（附已加载清单，要求先
-        卸一个）/ 能力型加载失败（缺凭证、目录名与技能名不一致、工具未登记或重名、server
-        起不来）——**失败即拒绝加载**，正文与工具都不会生效。
+        成功：回执（正文已进系统提示；能力型另注明工具数）。名字已在清单里、但它的运行体不在
+        （对账重建失败被退避）时，这里会**重新拉起**并如实说明——那是本会话唯一的重试入口。
+        失败：技能名不存在（附可用清单）/ 已在加载中且运行体齐备 / 正文预算已满（附已加载
+        清单，要求先卸一个）/ 能力型加载失败（缺凭证、目录名与技能名不一致、工具未登记或
+        重名、server 起不来）——**失败即拒绝加载**，正文与工具都不会生效。
     """
     wanted = (name or "").strip()
     loaded = list(state.get("loaded_skills") or [])
@@ -726,6 +897,22 @@ async def get_skill(
         )
 
     if wanted in loaded:
+        # 例外：名字在 state 里、运行体却不在（对账重建失败被退避、或对账本身抛了异常）。
+        # 这时"已加载"是**假的**——正文在、工具没有，模型照 SKILL.md 去调工具只会撞
+        # unknown_tool；而那条回执恰恰让模型来这里。所以这里给它一条**真的重试路径**，
+        # 否则失败退避（见 `_register_failed`）会把"每轮自动重试"换成"整会话静默死路"。
+        if meta.capability and _skill_server_name(meta) not in mcp.registered_servers(
+            workspace, state.get("session_id")
+        ):
+            problem = await _register_skill_runtime(meta, workspace, state.get("session_id"))
+            if problem is not None:
+                return _tool_receipt("get_skill", tool_call_id, problem)
+            return _tool_receipt(
+                "get_skill",
+                tool_call_id,
+                f"技能 {wanted} 已在本会话加载中，但它此前缺失的工具运行体不在——"
+                f"已重新拉起，下次模型调用即可调用。",
+            )
         return _tool_receipt(
             "get_skill", tool_call_id, f"技能 {wanted} 已在本会话加载中，无需重复加载。"
         )
@@ -760,7 +947,12 @@ async def get_skill(
     content = f"已加载技能 {wanted}，其正文已进系统提示（下一次模型调用即可见）。"
     if meta.capability:
         content += "该技能带的工具也已加入本会话，下次模型调用即可调用。"
-    content += f"当前已加载：{'、'.join(loaded)}"
+        # 加载期体检（技能在 skill.json 里声明了 preflight 才有）：结论随回执给模型。
+        # 只在这条"真的加载了"的路径上打——幂等那条（已加载，无需重复）零成本，不探测。
+        note = await _skill_preflight_line(meta)
+        if note:
+            content += f"\n{note}"
+    content += f"\n当前已加载：{'、'.join(loaded)}"
     return {
         "loaded_skills": loaded,
         "messages": [
@@ -851,6 +1043,20 @@ class SessionToolset:
         # 静态工具（编排 / 笔记 / 派发 / 记忆 / 技能三件套）：它们不进 MCP 注册表，但**模型必须
         # 一直看得到**——动态绑定若只给 MCP 工具，连 get_skill 自己都会从模型眼前消失。
         self._static_tools = list(static_tools or [])
+        # 已经查实"不该有运行体"的技能名（知识型）。**对账快路径靠它**：`registered` 只含能力型，
+        # 而 `loaded` 含两型名字，光比两者**永远不会相等**（知识型永远只在 loaded 一侧），于是
+        # 每轮都要扫盘才能重新确认"差集里的都是知识型"。记下这些名字就回到纯内存比较。
+        # 能力型与否由**盘上有没有 server.py** 决定（与会话无关），所以这份备忘不需要分会话；
+        # 它按实例存活（一个图/会话一个），技能源类型变更属"重开会话生效"级别的事件，无需失效钩子。
+        self._knowledge_only: set[str] = set()
+        # 已经查实"**运行体重建不起来**"的技能名（server 起不来 / 工具没在 tool.json 登记 /
+        # 源已损坏）。**失败必须有退避**，否则这个名字会一直留在 `missing` 里：每轮（LLMNode +
+        # ToolNode 各一次）重新校验 + 重列 schema——而重列要真起一个临时会话（回滚路径已经把
+        # schema 缓存丢了），于是一个坏技能会让该会话**每轮多起两个子进程**，且日志每轮响两遍。
+        # 记下来即回到纯内存比较（与 `_knowledge_only` 同族：按名字、按实例存活）。
+        # 失效靠重开会话（新图 = 新实例）；模型若 drop_skill 后再 get_skill 也会**真的重试**
+        # ——`get_skill` 不查这份备忘，且失败时给的是可行动回执，比这里静默跳过有用得多。
+        self._register_failed: set[str] = set()
 
     async def tools_and_version(self, state: AgentState) -> tuple[list[BaseTool], int]:
         """给 LLMNode：当前工具表（静态 + MCP）+ 版本（版本变了才需要重新 `bind_tools`）。"""
@@ -886,15 +1092,21 @@ class SessionToolset:
     async def _reconcile(self, state: AgentState, session: str | None) -> None:
         """让"运行体"与 state 的 `loaded_skills` 对齐。
 
-        **快乐路径 = 一次内存集合比较**（两边一致就直接返回，不读盘、不起进程）——它每轮都会被调。
-        只在真不一致时才动手：
+        **快乐路径 = 一次内存集合比较**（两个方向都一致就直接返回，不读盘、不起进程）——它每轮
+        都会被调。只在真不一致时才动手：
 
         - 运行体在、state 里没有 → 注销。防的是"工具在、纪律不在"：注册成功但 state 没落
           （回执写回前回合被取消），模型手里就会有工具、却没读过那个领域的约束；
         - state 里有、运行体没有（进程重启、切会话转回来）→ 只重建**能力型**的那个。
 
-        ⚠️ 这里只有"只加不减"是不够的：两个方向都要对。**反向对账之所以安全，前提是运行体按
-        会话分片**（本设计如此）——若键退化成全局，双向对账会变成两个会话互相拆台。
+        ⚠️ 这里有两个容易踩的点：
+
+        - 只有"只加不减"是不够的：两个方向都要对。**反向对账之所以安全，前提是运行体按
+          会话分片**（本设计如此）——若键退化成全局，双向对账会变成两个会话互相拆台；
+        - `registered` 只含能力型，`loaded` 含两型名字，**两边直接比较永远不会相等**。所以
+          "该建"的那一侧要减去两份备忘录——`_knowledge_only`（查实过的知识型）与
+          `_register_failed`（查实过建不起来的）——否则它们会让快路径失效：前者每轮重扫一遍
+          技能源的全部 SKILL.md，后者更贵，每轮重列 schema（真起临时会话）。
         """
         loaded = {n.strip() for n in (state.get("loaded_skills") or []) if n and n.strip()}
         prefix = f"{skills.SKILLS_PACKAGE}/"
@@ -903,19 +1115,30 @@ class SessionToolset:
             for server in mcp.registered_servers(self.workspace, session)
             if server.startswith(prefix)
         }
-        if loaded == registered:
+        missing = loaded - registered - self._knowledge_only - self._register_failed
+        if not missing and not registered - loaded:
             return
 
         for extra in sorted(registered - loaded):
             await mcp.unregister_server(self.workspace, session, f"{prefix}{extra}")
 
-        for name in sorted(loaded - registered):
+        for name in sorted(missing):
             meta = await asyncio.to_thread(skills.get_meta, name)
-            if meta is None or not meta.capability:
-                continue  # 知识型没有运行体；源被删的名字由 skills_block 的告警提示模型卸下
+            if meta is None:
+                continue  # 源被删：正文侧由 skills_block 的告警提示模型卸下
+            if not meta.capability:
+                # 查实是知识型 → 记下来，往后这个技能不再触发任何读盘
+                self._knowledge_only.add(name)
+                continue
             problem = await _register_skill_runtime(meta, self.workspace, session)
             if problem is not None:
-                logger.warning("技能 %s 的运行体重建失败：%s", name, problem)
+                # 记下失败就不再逐轮重试（见 `_register_failed` 上的说明）。正文侧由 skills_block
+                # 正常注入——模型若真去调那个不存在的工具，会拿到 unknown_tool 回执并被引向
+                # get_skill 重载，那时它会拿到这条失败的**可行动原因**，比这里静默跳过有用。
+                self._register_failed.add(name)
+                logger.warning(
+                    "技能 %s 的运行体重建失败（本会话不再重试，重开会话可重来）：%s", name, problem
+                )
 
 
 def skill_tools_for() -> list[BaseTool]:

@@ -131,6 +131,10 @@
         "need_review":true,
         "source":"mcp_service/git"
     },
+    "git_push":{
+        "need_review":true,
+        "source":"mcp_service/git"
+    },
     "web_search":{
         "need_review":true,
         "source":"mcp_service/web_search"
@@ -170,10 +174,6 @@
     "drop_skill":{
         "need_review":false,
         "source":"skill"
-    },
-    "github_auth_status":{
-        "need_review":false,
-        "source":"skills/github"
     },
     "github_repo_view":{
         "need_review":false,

@@ -29,7 +29,7 @@
 
 缺的是中间一层：给模型一份**目录**（只有名字 + 一句话），它判断相关时再取回正文或拉起能力照做。即"渐进披露"的领域包。
 
-**典型例子 = GitHub**：推送 / 开 PR / 审 PR（**合并权留给人**）/ 不克隆就读远端代码 / 看 issue 与包 / 搜项目，外加一串约束（自主提交、先开分支、master 不能随便提）。这些能力**当前都没有**——`mcp_service/git.py` 只管**本地** git（status/diff/log/commit…，**没有推送**）。
+**典型例子 = GitHub**：推送 / 开 PR / 审 PR（**合并权留给人**）/ 不克隆就读远端代码 / 看 issue 与包 / 搜项目，外加一串约束（自主提交、先开分支、master 不能随便提）。这些能力**当前都没有**——`mcp_service/git.py` 只管**本地** git（status/diff/log/commit…，推送由 `git_push` 补上、仍是核心服务，见 §8.3）。
 
 ---
 
@@ -287,10 +287,17 @@ skills/<name>/
 
 ### 8.3 其余落点
 
-- **别和 `mcp_service/git.py` 重复**：那个管**本地** git（status/diff/log/add/commit/切分支）；GitHub skill 只管**平台侧**（PR / issue / review / 不克隆读远端代码 / 搜索）。"本地提交"永远走 `git_commit`。
+- **别和 `mcp_service/git.py` 重复**：那个管**本地** git（status/diff/log/add/commit/switch/列分支）；GitHub skill 只管**平台侧**（PR / issue / review / 推送 / 不克隆读远端代码 / 搜索）。"本地提交"永远走 `git_commit`。
+  **判据（2026-09-13 去重时钉下）**：① 动的是本地仓库还是远端？② 要不要本地仓库状态（当前分支 / 未推送提交 / remote 配置）？③ 语义对象是"提交·分支·工作树"还是"PR·issue·release"？按这三条，技能侧砍掉了 `github_branch_list`（`git_fetch` + `git_branches` 已能回答这件事）与"只建远端分支"（`git_switch` 建本地 + push 首推即建远端）；`github_pr_diff` / `github_pr_files` **保留**——它们管的是**区间** diff，`git_diff` 看不到区间、更看不到别人的 PR。
+  **推送（`git_push`）落在核心 git 服务（2026-09-13 定，含一次改口）**：
+  - **怎么做的**：参数是**远程仓库的完整地址**（`git push <url> <refspec>` 本就收 URL，不必有 remote 配置），凭证由**设备**给（credential helper / ssh-agent），带凭据的 http(s) 地址被**直接拒绝**；refspec 写 `refs/heads/<name>:refs/heads/<name>`（推的必须是你**本地的那个分支**，不是 HEAD），**不带 `-u`**——所以它不写 `.git/config`、不设上游、不动工作树（"本地状态只读"这条是结构性成立的）。
+  - **改口的理由（前一个决定是"push 归平台技能，因为凭证是平台的"）**：那个推理把两件事捆在了一起。push 确实要凭证，但**凭证不需要由 git 服务持有**——地址是调用方给的、认证在设备上，`git_push` 自己一个 token 都不认识。于是"凭证中立"与"能推送"并不冲突：**它对 github / gitee / 自建一视同仁**，将来加 gitee 技能时它一行都不用改。反过来若留在技能里，技能就得在子进程里自己拼 URL 与认证头，那才是把凭证处理散到每个平台技能里。
+  - ⚠️ **代价（如实记）**：**受保护分支的"工具内直接拒绝"没有落点了**——`git_push` 是平台无关的，它不认识 GitHub 的 protected branches 配置。**已定（2026-09-13）：这一条不做**，理由见 §13.9（保护分支是平台侧规则，服务端自己会拒；在平台无关的工具里再判一次既重复又判不准）。剩下的是"软约束 + 审批面板上可见 `url`/`branch`"。
+  - 另一条副作用：不带 `-u` 就不设上游，之后 `git_pull` 不知道该跟踪谁——这一条**如实写进了回执**（让模型知道要显式给 remote/branch），配置归人。
+  - **测试**：`tests/test_git_push.py`（8 例，真推到本地裸仓库、不联网）——成功推 + 不写 `.git/config`；带凭据的地址被拒；空地址 / 本地无此分支 / 游离 HEAD / 一行提交都没有的仓库各一例；**非快进被 git 拒绝且 stderr 回显**。
 - **`get_skill`**：`app/agent/tools.py`，作为新的编排工具组（或并入现有编排工具组），`source="skill"` 登记进 `tool.json` 并加进 `ReviewNode.ORCHESTRATE_SOURCES`。
   > **两种 source 是**有意的**、跟现有约定一致**：编排类用**单词类别名**（`plan` / `notes` / `dispatch` / `memory` / 新的 `skill`），普通工具用**路径式名**（`mcp_service/file_io`、新的 `skills/<name>`）。所以 `get_skill` 走 `skill`（→ 分流进 `OrchestrateNode`），而 GitHub 的各工具走 `skills/github`（**不命中** `ORCHESTRATE_SOURCES` → 进普通队列 → `ToolNode`）。这正是想要的：`get_skill` 是编排动作，它带来的工具不是。
-- **审批策略**：skill 的工具**预先登记进 `app/agent/tool.json`**（即使 server 没起）——保住"审批策略集中一处、可审计"。于是 **skill = 工具 + 它的 `tool.json` 登记行 + 指导文本**，三件套；加一个 skill 要动 `tool.json` 是**特性不是负担**。`skills/github/SKILL.md` §3 已经按这个格式把登记表先写好了。
+- **审批策略**：skill 的工具**预先登记进 `app/agent/tool.json`**（即使 server 没起）——保住"审批策略集中一处、可审计"。于是 **skill = 工具 + 它的 `tool.json` 登记行 + 指导文本**，三件套；加一个 skill 要动 `tool.json` 是**特性不是负担**。**登记表只在 `app/agent/tool.json` 一处**（2026-09-13 起）：技能正文不再抄一份——`SKILL.md` 只写**领域**内容（能力 + 纪律 + 凭证），项目侧的映射（哪个工具 `need_review`、`source` 是什么）不属它管，抄一份只会两处走散。
 - **知识型的注入**：与能力型**同一条通道**（§3.5）——目录（name + description）进 `get_skill` 的 docstring；正文由 `get_skill` 写 state、`LLMNode` 拼进系统提示。**不另走 `read_file`**：让模型自己去捞，正文会落在**对话历史**里（会被 compact 折掉、随轮次稀释）；进**系统提示**才每轮都在、模型无法忽略。扫描 / 解析落在新模块 `app/agent/skills.py`，与 `memory.py` 并列（同属"工作区内容 → 注入"的通道）。**独立成模块的判据**：消费者跨文件 >1 且自身逻辑成规模——`skills.py` 的消费者是 `tools.py`（`get_skill`/`drop_skill` 取目录与正文）、`nodes.py::LLMNode`（注入块）、构图期（目录烤进 docstring），跨三个文件，故独立；反例见下表 `profile.py` 那行。
 
 ---
@@ -329,7 +336,7 @@ skills/<name>/
 
 - ~~**一期切法：能力型优先，还是知识型优先？**（2026-09-12 记，(a) 被否决后新浮出来的）~~ → **已决（2026-09-12）：先做 `get_skill`（+ `drop_skill`）这套编排工具本身**，即两型**共用的那条通道**（§3.2 / §3.5），**不在两型之间二选一**。
   理由：`get_skill` 对两型是同一入口、同一套机制，差别只在能力型多一步"起 server + 注册工具"（§2.1）。先把工具与通道做出来，两型之差就退化成**一个可后加的分支**，而不是一期押注；**一期因此不带 §3.4 的会话级注册表**（设计里最重的一块）。
-  两个随之被**提前**的"须定"，都已解：① **frontmatter** → **自写最小解析**（见下条）；② **靶子** → **不需要另造**——`skills/github/` 没有 `server.py`，按 §2.1 的定义它**当前自动就是知识型**，扫描一接上就出现在目录里，可直接端到端验证（正文声明的那 20 个工具不存在，是二期的缺口，不是一期的）。
+  两个随之被**提前**的"须定"，都已解：① **frontmatter** → **自写最小解析**（见下条）；② **靶子** → **不需要另造**——`skills/github/` 没有 `server.py`，按 §2.1 的定义它**当前自动就是知识型**，扫描一接上就出现在目录里，可直接端到端验证（正文声明的那些工具当时不存在，是二期的缺口，不是一期的；清单 2026-09-13 与 `git.py` 去重后为 18 条，其中 8 条已落地）。
 - **worker 要不要能用**：worker 是只读资料收集器，让它调 GitHub 只读工具（看 issue / 搜项目）有价值；但给它就多一条加载路径、且它拿不到主 agent 的技能目录。**先不给**——而且这条**免费**：`worker_tools` 是按 `source` 白名单过滤的（`_WORKSPACE_SOURCES` / `_WEB_SOURCES`），skill 工具的 source 取 `skills/<name>`，**天然不命中 → 结构性地进不了 worker**，一行代码都不用写。（将来要开，也是"往白名单加一条"这种显式动作。）
 
 ---
@@ -361,7 +368,7 @@ skills/<name>/
 
 **测试**：`tests/test_skills.py`（扫描 / 解析 / **路径穿越被挡** / 预算 / 渲染与截断告警）、`tests/test_skill_tools.py`（登记与路由、加载 / 幂等 / 未知 / 预算拒绝、切片合并与同回合链式）、`tests/test_memory_injection.py` 补三例（注入位置、未加载不注入、独立于开关）。
 
-**已知错配**：`skills/github/SKILL.md` 正文声明的 20 个工具此刻并不存在——它是能力型的稿子，一期验证的是**通道**（目录 → 加载 → 注入 → 卸载），不是那些工具。
+**已知错配（一期当时）**：`skills/github/SKILL.md` 正文声明的工具此刻并不存在——它是能力型的稿子，一期验证的是**通道**（目录 → 加载 → 注入 → 卸载），不是那些工具。**二期已落地其中 8 条只读工具**（§13）；清单 2026-09-13 与 `git.py` 去重后为 **17 条**（8 ✅ + 5 ⏳ 只读 + 4 写——砍掉 `github_branch_list`、`github_branch_create`，并把 `github_push` 移进核心 git 服务，理由见 §8.3）。
 
 **二期（未做）**：能力型 `server.py` 生命周期、会话级工具注册表 + 动态 `bind_tools`、env 声明与白名单转发、`/skills` 控制面命令、§10 的 `PROMPT_COMMANDS` 收敛。**前置里程碑 §12（MCP 运行体常驻化）已落地（2026-09-12）**，二期设计见 §13——它骑在那批常驻运行体上。
 
@@ -492,7 +499,9 @@ async def _call(**kwargs):
 ### 12.5 常驻的后果与代价（用户可见，别当实现细节）
 
 1. **配置在启动时刻固化**：env / cwd / `WORKSPACE_PATH`（`mcp_service/file_io.py` 在 **import 时**校验）
-   都是建运行体时定的 → 改 `.env`（如换 `TAVILY_API_KEY`）需重开会话。
+   都是建运行体时定的 → 改 `.env`（如换 `TAVILY_API_KEY`）需重开会话。**补一句更准的**（2026-09-13 核）：
+   `get_settings()` 是**进程级 `lru_cache`**，全仓没有一处 `cache_clear` —— 所以 host 自己读到的
+   那份（含技能凭证、`SKILL_ENV_WHITELIST`）**要重启进程**才更新；"重开会话"只解决运行体那半边。
 2. **Windows 下"活着的 server"会让工作区删不掉**：server 的 cwd 就是工作区。所以 evaluation 里
    "先关池、再 rmtree"是**硬顺序**，不是优化。（`create_session` 的 teardown 会关 stdin、等进程退出、
    超时后 SIGKILL，故 `aclose` 返回即子进程已收。）
@@ -558,9 +567,10 @@ async def _call(**kwargs):
 | --- | --- |
 | `mcp.register_server` / `unregister_server` | 加/减一个 server 的工具，维护**工具集版本** |
 | `mcp.session_tools` / `session_tool_names` / `registered_servers` / `tools_version` | 取当前工具表 / 名字集合 / 已注册 server / 版本（**同步纯内存**，每轮都被调） |
-| `skills.server_module` / `read_skill_env` | 按**目录名**拼 import 路径 / 读 `skill.json` 的 env 声明 |
-| `tools.get_skill` / `drop_skill` | 加载期的四道校验 + 加/减；失败即回滚 |
-| `tools.SessionToolset` | 三节点共用的接线点（取工具 + **双向对账**） |
+| `skills.server_module` / `read_skill_env` / `read_preflight` | 按**目录名**拼 import 路径 / 读 `skill.json` 的 env 声明与加载时体检声明（三者都只做**解析**，不碰 settings、不发请求） |
+| `tools._skill_preflight_line` | 加载成功后按声明打一次只读端点验凭证（host 侧、`to_thread` + 8 秒超时），结论进 `get_skill` 回执；**不是工具**、失败也不阻断加载 |
+| `tools.get_skill` / `drop_skill` | 加载期的四道校验 + 加/减；失败即回滚。**名字已在 `loaded_skills` 里、运行体却不在**时（对账重建失败被退避、或对账本身抛了异常），`get_skill` 会重新拉起并如实说明——退避之后这是本会话**唯一的重试入口**，少了它"正文在、工具没有"就成静默死路（`unknown_tool` 的回执正是指模型来这里） |
+| `tools.SessionToolset` | 三节点共用的接线点（取工具 + **双向对账**，快路径靠实例上的**两份备忘**：`registered` 只含能力型、`loaded` 含两型，**直接比永远不相等**，得先记住 `_knowledge_only`（查实过的知识型）与 `_register_failed`（查实过建不起来的）才能回到纯内存比较。后者是 2026-09-13 补的：失败不退避的话，那名字每轮都会重新走一遍注册，而重列 schema 要真起临时会话——坏技能会让会话持续漏子进程，见该类 `_reconcile` 的 docstring） |
 
 **mcp.py 不认识"技能"**：它只知道"某会话多了一个 server"。技能的知识（目录名、`skill.json`、
 `tool.json` 的登记口径）全在 skills.py / tools.py 这一侧。
@@ -575,13 +585,30 @@ evaluation = `task.name`，关池用的也是它）；langgraph dev 零参 → `
 （"已加载"必须意味着正文与工具都到位）：
 
 1. **目录名**：要求 frontmatter 的 `name` == 目录名（启动模块与 `source` 都按目录名走），且目录名
-   是合法 Python identifier（不是 → `scan_skills` 直接把它降级为知识型，正文仍可用）；
+   是合法 Python identifier。**两半都在扫盘期处理**（2026-09-13 改）：`scan_skills` 任一不满足即
+   **降级为知识型** + 告警，正文仍可用。放在扫盘不是为了省事，是为了让**目录不撒谎**——
+   否则 `catalog_block` 标着 `[带工具]`、模型照着去 `get_skill` 却每次都撞拒绝（加载期才判）。
+   现在的不变量是：**目录里标 `[带工具]` 的技能一定加载得上**。加载期 `_register_skill_runtime`
+   的同名校验保留为安全网（正常路径已到不了那里）。
+   另外技能名**必须唯一**：两个目录声明同一个 `name` → 响亮跳过后者（静默覆盖会让目录与
+   `get_meta` 指向两个不同目录，其中一个再也取不到正文——§3.6 说的"装了却不可发现"）；
 2. **会话**：`state["session_id"]` 非空；
 3. **凭证**：`skill.json` 声明的键必须在 `app/config.py::SKILL_ENV_WHITELIST` 里、取值非空；
+   > 这四关是**加载闸门**。另外还有一道**不是闸门**的：`skill.json` 若声明了 `preflight`，加载成功后
+   > host 会打一次只读端点验凭证（§13.5 末），结论进回执——**失败不拒绝加载**（见那里的理由）。
 4. **工具名**：server 真暴露的每个工具都必须在 `tool.json` 登记、`source == skills/<目录名>`，
    **且不与核心工具 / 编排工具 / 其它已加载技能重名**（同名会让模型与审批策略都无法区分两者）。
 
 第 4 条同时是**未登记工具的防线**：旧行为里"未登记 = 免审"，对写操作等于静默放行。
+
+**起不来时要说得出原因（2026-09-13 修）**：`register_server` 失败时，MCP 适配器只把
+`ExceptionGroup → McpError: Connection closed` 交给 host——**真正的原因只在子进程的 stderr 上**
+（缺依赖、语法错、server 自己抛 `ConfigError`…）。回执若照搬那串判词，模型拿着"把配置问题告知
+用户"却说不出是什么问题，§13.3 承诺的"可行动回执"就落空了。所以失败路径会**重跑一次
+`python -c "import <server 模块>"`**（用与真启动同一套 command/cwd/env，直接取 `stdio_connection`
+的产物以免两处漂移），把 stderr 尾部的 traceback 带进回执——只在**已经失败之后**跑，成功路径零
+开销；探针自身说"import 没问题"时回退到**展平后的异常**（import 能过却起不来 = 协议/超时那类，
+不该拿无关 traceback 误导模型）。
 
 ### 13.4 动态 bind 与限定版 fail-closed
 
@@ -596,7 +623,7 @@ evaluation = `task.name`，关池用的也是它）；langgraph dev 零参 → `
 
 ### 13.5 env 声明与转发
 
-- 载体 = `skills/<name>/skill.json`（`{"env": ["GITHUB_TOKEN"]}`）——**不塞进 SKILL.md 的 frontmatter**
+- 载体 = `skills/<name>/skill.json`（`{"env": ["GITHUB_TOKEN"], "preflight": {"url": "...", "bearer": "GITHUB_TOKEN"}}`）——**不塞进 SKILL.md 的 frontmatter**
   （那里只认单行 `key: value`，列表要另写解析）。
 - 白名单落 `app/config.py::SKILL_ENV_WHITELIST`（env 键 → Settings 属性名）。**绝不通用透传**：技能
   配置若能任意点名 `${VAR}`，就能读走 `CHAT_MODEL_API_KEY`。
@@ -605,6 +632,48 @@ evaluation = `task.name`，关池用的也是它）；langgraph dev 零参 → `
 - `GITHUB_TOKEN` **带空默认**（`SecretStr("")`），**有意偏离**"所有字段无默认值"那条约定：技能是可
   插拔的，它的凭证缺失不该让核心起不来；空值 = 该技能拒绝加载。
 - 键不在白名单 / 值为空 → `skill_env` 抛 `ConfigError`（带键名），由 `get_skill` 翻成回执。
+- **依赖声明 `requirements`**（2026-09-13 加）：技能用的**第三方顶层包名**列表（`{"requirements": ["mcp"]}`）。
+  加载期在**起进程之前**用 `importlib.machinery.PathFinder().find_spec(name, [工作区, 项目根, *sys.path])`
+  查一遍——**不执行模块代码、不起进程**，因为技能依赖装在主 venv、技能 server 与 host 是同一个解释器
+  （§5.1 已决不做隔离），所以 host 侧查出来的结论就是子进程 import 时的结论。缺了 → 拒绝加载 +
+  回执给"加进 `pyproject.toml` 后 `uv sync`，再重新 `get_skill`"（**不用重启进程**）。
+  - 与"失败后的 import 探针"（§13.3 末）**不重叠**：`find_spec` 查不出语法错/模块级异常，探针说不清
+    该装哪个包。也**不要**把探针提到注册前——那会让技能模块级代码在成功路径上被跑两遍（副作用重复）。
+  - 没写 `requirements` 的技能少这层保护（退化成"报 traceback"），但不会因此加载不了。
+
+#### 13.5.1 加载时体检（`preflight`，2026-09-13 加，**替掉了 `github_auth_status` 工具**）
+
+**问题**：`skill_env` 那关只验"键有没有**值**"，验不出"值**对不对**"——token 过期 / 被撤销 /
+权限不够，都要等第一次真请求才暴露。原先 GitHub 技能为此专门做了一个只读工具
+`github_auth_status`，让模型自己想起来去调——**那正是坏的发现方式**：配置问题被推给"模型会不会
+想到查、查了会不会看懂"，而它并不知道该查。
+
+**做法**：`skill.json` 可声明一个探活端点：
+
+```json
+{"env": ["GITHUB_TOKEN"], "preflight": {"url": "https://api.github.com/user", "bearer": "GITHUB_TOKEN"}}
+```
+
+`get_skill` **真正加载成功后**用转发进来的那份凭证打一次这个只读端点，结论写进回执
+（`凭证体检：GITHUB_TOKEN 可用（HTTP 200）。` / `⚠️ 凭证体检失败：…被拒（HTTP 401…）`）。
+
+四条定下的口径：
+
+1. **在 host 侧、不是工具**——它是"加载那一刻 host 就该知道"的事实，不该占一条模型可见的工具表
+   条目，也不该指望模型主动查；
+2. **失败不阻断加载**——技能的正文/纪律在拿不到远端时照样有用（照它的规范写 PR 描述不需要网络），
+   所以只如实报关 + 让模型把这条告知用户；真去调工具时另有 `upstream_error` 兜底；
+3. **`bearer` 必须是该技能 `env` 里声明过的键**——否则等于让技能凭空读一个它没申请的凭据（这条
+   在 `read_preflight` 里挡，写错就按"没声明"处理并告警）。声明**只在 `skill.json` 里**，形状不对
+   一律降级为"没声明"——体检是锦上添花，不该因为它写错就让技能加载不了；
+4. **只报"凭证行不行"**：2xx = 可用 / 401·403 = 被拒 / 网络失败 = 连不上。不解析响应正文——
+   账号、配额那些是技能工具自己的事（这正是砍掉那个工具要付的代价：模型不再能主动问"我是谁、
+   配额还剩多少"；真需要时由技能工具自己提供，比如 Quartet 那种 `whoami` 风格的读工具）。
+   > 这条留个口子：若将来真需要"体检也报出账号/配额"，**不外乎**把响应 JSON 里的少数键写进声明
+   > （一个小语言），或者允许技能提供一个 host 侧可调用的探针模块——后者等于**技能代码进主进程**，
+   > 是本项目最硬的边界之一（技能代码至今只在子进程里跑），**不做**。
+5. 时序上：**只在"真的加载了"那条路径上打**（含重新拉起运行体那条）；幂等那条（已加载，无需重复）
+   保持零成本。想在会话中途重新体检 = `drop_skill` 再 `get_skill`（回执里就是这么提示的）。
 
 ### 13.6 卸载：**只有一条触发路径**（对 §3.4"两条都要"的改口）
 
@@ -618,13 +687,13 @@ evaluation = `task.name`，关池用的也是它）；langgraph dev 零参 → `
 | 落点 | 内容 |
 | --- | --- |
 | `app/schema/agent_schema.py` | `SkillMeta` 增 `dir_name` / `capability` |
-| `app/agent/skills.py` | `SKILLS_PACKAGE` / `SERVER_FILENAME` / `SKILL_CONFIG_FILENAME`；能力型判定（含 identifier 校验与降级）；`server_module` / `read_skill_env` / `get_meta` / `body_of`；`catalog_block` 标 `[带工具]`；`skills_block` 点名"已不可用的技能" |
+| `app/agent/skills.py` | `SKILLS_PACKAGE` / `SERVER_FILENAME` / `SKILL_CONFIG_FILENAME`；能力型判定（含 identifier 校验与降级）；`server_module` / `read_skill_env` / `read_requirements` / `read_preflight` / `get_meta` / `body_of`；`catalog_block` 标 `[带工具]`；`skills_block` 点名"已不可用的技能" |
 | `app/config.py` | `GITHUB_TOKEN`（可选带空默认）+ `SKILL_ENV_WHITELIST` + `skill_env` |
 | `app/agent/mcp.py` | `stdio_connection`（核心与技能共用）；**独立的 per-server schema 缓存**（见下）；`register_server` / `unregister_server` / `session_tools` / `session_tool_names` / `registered_servers` / `tools_version`；`close_session_pool` 一并清 extras 与版本 |
-| `app/agent/tools.py` | `get_skill` / `drop_skill`（加注入 workspace；drop 改 async）+ 四道校验 + `SessionToolset`（含双向对账）+ `_tool_config()` 校验缝 |
+| `app/agent/tools.py` | `get_skill` / `drop_skill`（加注入 workspace；drop 改 async）+ 四道校验 + `_skill_preflight_line`（加载时体检）+ `_probe_skill_startup`（起不来时捞真 traceback）+ `SessionToolset`（含双向对账）+ `_tool_config()` 校验缝 |
 | `app/agent/nodes.py` | `LLMNode` 动态 bind；`ToolNode` 动态查表 + 可行动 `unknown_tool` 文案；`ReviewNode` 限定版 fail-closed |
 | `app/agent/graph.py` | 主图装配 `SessionToolset(workspace, static_tools)`、model **不在此绑定**；worker 路径一行未改 |
-| `skills/github/` | `server.py`（8 个只读工具，stdlib HTTP）+ `skill.json` + `SKILL.md` 同步 |
+| `skills/github/` | `server.py`（7 个只读工具，stdlib HTTP）+ `skill.json`（env + preflight）+ `SKILL.md` 同步 |
 | `app/agent/tool.json` | 8 条 `skills/github` 登记（`need_review: false`） |
 
 **最硬的一处坑（写在这里防复发）**：`_TOOL_SPECS` 按**工作区**缓存"核心四件套"的 schema，内容是
@@ -642,7 +711,40 @@ evaluation = `task.name`，关池用的也是它）；langgraph dev 零参 → `
 - **端到端验收（实测通过）**：`load_mcp_tool` → `get_skill("github")` → 8 个 `github_*` 进表、核心 32 个
   **不受影响**、版本 +1；真调一次工具 → 运行体键出现（懒起）；`drop_skill` → 工具与运行体一起消失、
   版本再 +1；**另一会话的核心工具仍是完整 32 个**（锁住上面那颗雷）。
-- 全量 `python -m pytest`：**309 passed / 4 skipped**。
+- **`tests/test_github_skill.py`**（11 例，2026-09-13）：技能自带 server 的**收口行为**——render
+  抛 `_UpstreamError`（坏 base64）必须翻成 `upstream_error` 而不是被 `guard` 判成内部 bug；上游 HTTP
+  失败与成功截断各一例。打磨时又加了 7 例：**限流要按响应头认出来**（`X-RateLimit-Remaining: 0`
+  → "限流 + 恢复时刻 + 别重试"；429/secondary → 二级限流；**配额还有剩的 403 不许误报成限流**）、
+  `file_read` 对**子模块 / 符号链接**不许再说成"太大"、大文件那条 `download_url` 路径没被碰坏、
+  `github_tree` 超 300 条给可行动出路且**缺 path 的脏条目不再 KeyError**。不联网、不起子进程
+  （`_request` 换成假响应；测限流那三条打的是 `urlopen`——patch `_request` 会把被测的翻译逻辑绕过）。
+- **`tests/test_github_skill_e2e.py`**（1 例，2026-09-13 加）：**真技能**的端到端——用真 `skills/`
+  源与真 `tool.json`，真 spawn `python -m skills.github.server`（假 token 经**真 `skill_env`** 转发；
+  server 在 **import 期**就要 `GITHUB_TOKEN`，所以"加载成功"本身就是转发通了的证明）→ 断言它暴露的
+  工具名与 `tool.json` 的登记**逐字一致**（8 条）→ 真调 `github_repo_view` / `github_auth_status`
+  → 上游 200 / 401 / 404 三条路都按 `[upstream_error]` 分类回传 → 卸载后工具与子进程一起没了。
+  **不联网**：`GITHUB_API_URL` 指向进程内起的 stdlib HTTP 桩（技能 server 在子进程里，进程内
+  monkeypatch `_request` 打不到它）。它补的正是另两块的**中间段**：`test_github_skill.py` 有真实现
+  但不起进程，`test_skill_runtime.py` 真 spawn 的是 echo 夹具（无 env、无网络、无凭证）。
+- **`tests/test_skills.py`**（2026-09-13 加）：同名技能跳过、能力型因 `name != 目录名` 降级、
+  正常能力型不被误伤降级、目录名非 identifier 降级。
+- **`tests/test_skill_runtime.py`** 加两例对账快路径回归（2026-09-13）：知识型在 `loaded_skills` 里时
+  逐轮对账**一次盘都不读**；**重建失败只试一次**（server 起不来 / 工具没登记两种失败形态各钉一例，
+  并断言告警只响一次、**重开会话会重试**）。后者是审查揪出的真漏洞：失败若不退避，名字会一直留在
+  `missing` 里，而回滚已把该 server 的 schema 缓存丢掉 → 每轮（LLMNode + ToolNode 各一次）重列
+  schema = **真起两个临时会话**，一个坏技能就让整个会话每轮多起两个子进程。
+  同批还加了两例：**运行体缺失时 `get_skill` 会重新拉起**（退避后的唯一重试入口），以及重试仍
+  失败时回的是**可行动的原因**（"工具没在 tool.json 登记"）而不是干巴巴的"已在加载中"。
+- **起不来时的回执（§13.3 末）**：`tests/test_skill_runtime.py` 加 2 例——**真 spawn**
+  `tests/fixtures/skills_pkg/broken/`（那个 fixture 在 import 期 import 一个不存在的模块），断言回执里
+  出现**子进程的真 traceback**（模块名逐字在）；以及探针说"import 没问题"时回退到展平后的异常
+  （`Connection closed` 看得见，不再是 `1 sub-exception`）。
+- **加载时体检（§13.5.1）**：`tests/test_skills.py` 加 5 例（声明解析：合法 / 未声明 / 缺 url 或
+  bearer / **bearer 不在本技能声明的 env 里** / skill.json 坏形状）；`tests/test_skill_runtime.py`
+  加 3 例（结论进 `get_skill` 回执 / **体检失败不阻断加载**且工具照常注册 / 知识型不体检）；
+  `tests/test_github_skill_e2e.py` 把体检端点也指到本地桩并断言回执里有"凭证体检：…可用"
+  ——**这条是端到端的**：host 侧真拿转发进来的假 token 打了桩一次。
+- 全量 `python -m pytest`：**353 passed / 4 skipped**。
 
 ### 13.9 待定 / 未做（本期边界）
 
@@ -652,9 +754,29 @@ evaluation = `task.name`，关池用的也是它）；langgraph dev 零参 → `
 - **技能运行体的空闲回收**：已定不做（§13.6）。
 - **`/skills` 控制面命令**：注意它得读 **checkpoint 里的 `loaded_skills`**（注册表只反映本进程、不代表
   状态），照 `app/platform/commands/session.py` 的 saver 读法。
-- **`ReviewNode._tool_config` 是 `lru_cache`**：改 `tool.json` 要重启进程才生效（装技能同理）。
+- **`tool.json` 有两份 `lru_cache`**（`tools._tool_config` 管 source 登记、`ReviewNode._tool_config`
+  管审批策略，各自的测试缝是有意的）：两份都"读一次用一辈子"，**改 `tool.json`（含给新技能登记
+  工具）要重启进程**才生效——不是只重启一处。
+- **技能改用"进程内热改"的边界**（2026-09-13 定）：`unregister_server` 会一并丢掉该 (工作区, server)
+  的 **schema 缓存**，所以"改 `server.py` → `drop_skill` → 再 `get_skill`"能拿到新代码**与新工具表**
+  （此前会新代码配旧 schema：新增/改名的工具看不见）。但**目录条目录入（构图期烤进 docstring）与
+  `tool.json` 的 lru_cache 仍是重启级**——真正干净的换法是重开会话 + 重启进程。
 - **技能的 `sys.path` 面**：技能 server 的 `sys.path[0]` 是工作区（cwd），工作区里的同名模块可以
   shadow 技能 server 的 import——核心 server 早有这个面，但技能把"可插拔任意代码"引进来，记在案。
+- **`GITHUB_API_URL` 目前只有测试用得上**（2026-09-13 加）：host 只转发 `skill.json` 里**声明过**
+  的键，而声明它会让它变成"必须非空"——默认（官方 API）那条路径反而加载不上。所以要让用户真能
+  指向 GitHub Enterprise，得先给 env 机制加"**可选键 + 默认值**"（§13.5 现在只有"声明了就必须
+  非空"这一种）。在此之前这个 env 是**测试缝**：E2E 用它把请求指到本地桩。
+- **受保护分支不做工具内拦截**（2026-09-13 定，`git_push` 移进核心服务之后）：`git_push` 是
+  **平台无关**的（它只认地址），不认识 GitHub 的 protected branches 配置。**决定：不做。** 理由：
+  ① 保护分支**本来就是平台侧的规则**，服务端自己会拒（"Restrict who can push" / 要求走 PR），
+  拒绝原因会随 push 的 stderr 回来——在工具里再判一次既重复、又因为拿不到平台配置而判不准；
+  ② 要在核心工具里做，就得让它认识"某个平台的某个仓库配了哪些保护规则"，那是把平台知识灌进平台
+  无关的组件。剩下的是**软约束（`SKILL.md` §2.1）+ 审批面板**（`url` 与 `branch` 都可见），
+  与 terminal 的任意命令同一档（"知情审批"）。
+  > 真要有那一天（比如自建 Git 服务上没有任何保护规则、而模型又容易手滑），最小形态是给
+  > `git_push` 加一个**平台无关的保守默认**：推 `main`/`master` 直接拒，除非调用方显式传
+  > `allow_protected=true`——那个参数会显示在审批面板上，等于"它请求推主干"被人看见。
 - **evaluation 与能力型**：带外依赖（token / 网络）会让评估结果不确定；评估任务要用技能得自己想清楚。
 
 
@@ -664,8 +786,8 @@ evaluation = `task.name`，关池用的也是它）；langgraph dev 零参 → `
 
 | 模块 | 关系 |
 | --- | --- |
-| `mcp_service/`（file_io / terminal / git / web_search） | **内置核心能力**，skill 与它并列而不混入（§8.1）；`terminal.py::_deny_sudo` 是"结构性拒绝"的样板 |
-| `skills/<name>/`（顶层库） | 一个技能一个目录：`SKILL.md` + 可选 `server.py`（能力型）+ 可选 `skill.json`（env 声明）。首个 = `skills/github/`（2026-09-12 起带 server.py，含 8 个只读工具） |
+| `mcp_service/`（file_io / terminal / git / web_search） | **内置核心能力**，skill 与它并列而不混入（§8.1）；`terminal.py::_deny_sudo` 是"结构性拒绝"的样板；`git.py::git_push` 收远程仓库地址（§8.3），核心服务因此**不持有任何平台凭证** |
+| `skills/<name>/`（顶层库） | 一个技能一个目录：`SKILL.md` + 可选 `server.py`（能力型）+ 可选 `skill.json`（env 声明 + 加载时体检 `preflight`）。首个 = `skills/github/`（2026-09-12 起带 server.py，含 7 个只读工具 + 加载时体检） |
 | `mcp_service/sub_agent.py` + `app/agent/graph.py::get_sub_agent_graph` + `app/agent/tools.py::worker_tools` | **fork 执行的现成骨架**（独立上下文 / 工具子集 / 跨进程审批回流）——§6 要复用它 |
 | `app/agent/mcp.py` | **§12 已落地**：现在同时承载连接配置、工具加载（**不绑会话的 shim**）与运行体常驻（`_ServerWorker` + `get_worker` + `close_session_pool`）。`load_mcp_tool(workspace, session_id)` 增加会话参量；`get_resources` 管道一期不做（§9 已决）——软约束由 host 读 `SKILL.md` |
 | `mcp_service/terminal.py` | **§12 顺带修好了它的跨调用进程管理**（改造前 `start_process` 起的进程下次调用就认不到，实测）——池化后自动恢复，**本文件一行没改** |

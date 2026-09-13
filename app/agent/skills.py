@@ -36,7 +36,7 @@ import json
 import logging
 from pathlib import Path
 
-from app.schema.agent_schema import SkillMeta
+from app.schema.agent_schema import SkillMeta, SkillPreflight
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,19 @@ def scan_skills() -> dict[str, SkillMeta]:
             logger.warning("技能 %s 缺 description（%s），已跳过", name, skill_md)
             continue
 
+        existing = found.get(name)
+        if existing is not None:
+            # 技能名**必须唯一**：两个目录声明同一个 name 时若让后者覆盖前者，是静默的
+            # "装了却不可发现"（§3.6 里最坏的失败形态）——模型看到的目录与 get_skill 查到的
+            # 元信息会指向**两个不同的目录**，且其中一个再也取不到正文。响亮跳过后者。
+            logger.warning(
+                "技能名 %s 重复：目录 %r 与 %r 都声明了它，已跳过后一个（技能名必须唯一）",
+                name,
+                existing.dir_name,
+                entry.name,
+            )
+            continue
+
         capability = (entry / SERVER_FILENAME).is_file()
         if capability and not entry.name.isidentifier():
             # 目录名要用来拼 `python -m skills.<dir>.server` 与 `source: skills/<dir>`，
@@ -146,6 +159,17 @@ def scan_skills() -> dict[str, SkillMeta]:
             # 正文仍然有价值，只是它的工具不可用（能力型要求 name == 目录名，见 get_skill 的校验）。
             logger.warning(
                 "技能 %s 的目录名 %r 不是合法 Python identifier，降级为知识型（其 server.py 不会被拉起）",
+                name,
+                entry.name,
+            )
+            capability = False
+        elif capability and name != entry.name:
+            # 同一条纪律的另一半（与上面那半一起，让"目录里标 [带工具] 的技能一定加载得上"
+            # 成为不变量）：启动模块与 tool.json 的 source 都按**目录名**走，name 与目录名
+            # 不一致的能力型**永远过不了加载校验**——留在目录里就是谎报能力。
+            # 同样降级为知识型而非跳过：正文仍然是可用的那一半。
+            logger.warning(
+                "技能 %s 的 name 与目录名 %r 不一致，降级为知识型（其 server.py 不会被拉起）",
                 name,
                 entry.name,
             )
@@ -171,6 +195,25 @@ def server_module(meta: SkillMeta) -> str:
     return f"{SKILLS_PACKAGE}.{meta.dir_name}.server"
 
 
+def _read_skill_config(meta: SkillMeta) -> dict:
+    """读技能目录里的 `skill.json`（可选）；不存在 / 读不动 / 不是 JSON 对象 → 空 dict + 告警。
+
+    `read_skill_env` 与 `read_preflight` 共用这一次读盘——两者看的是同一份配置的两个键。
+    """
+    config_path = SKILLS_DIR / meta.dir_name / SKILL_CONFIG_FILENAME
+    if not config_path.is_file():
+        return {}
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("技能 %s 的 %s 读取失败，按未声明处理：%s", meta.name, config_path, exc)
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("技能 %s 的 skill.json 不是 JSON 对象，已忽略：%r", meta.name, raw)
+        return {}
+    return raw
+
+
 def read_skill_env(meta: SkillMeta) -> list[str]:
     """读技能声明的 env 键（`skill.json` 的 `env: [...]`）；没有配置文件 / 读取失败 → 空表。
 
@@ -178,22 +221,66 @@ def read_skill_env(meta: SkillMeta) -> list[str]:
     坏配置（非法 JSON、`env` 不是字符串列表）告警并按"没有声明"处理——那会让 server 起不来时
     由启动失败兜住，而不是在这里静默放行一个空凭证。
     """
-    config_path = SKILLS_DIR / meta.dir_name / SKILL_CONFIG_FILENAME
-    if not config_path.is_file():
-        return []
-    try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("技能 %s 的 %s 读取失败，按未声明 env 处理：%s", meta.name, config_path, exc)
-        return []
-
-    declared = raw.get("env") if isinstance(raw, dict) else None
+    declared = _read_skill_config(meta).get("env")
     if declared is None:
         return []
     if not isinstance(declared, list) or not all(isinstance(k, str) for k in declared):
         logger.warning("技能 %s 的 skill.json 里 env 不是字符串列表，已忽略：%r", meta.name, declared)
         return []
     return declared
+
+
+def read_requirements(meta: SkillMeta) -> list[str]:
+    """读技能声明的第三方依赖（`skill.json` 的 `requirements: [...]`，**顶层 import 名**）；无声明 → 空表。
+
+    只做**解析**（同 `read_skill_env`）。校验落在 `app/agent/tools.py::_missing_requirements`，那里
+    能这么做的前提是：技能依赖装在**主 venv**（§5.1 已决不做隔离），而技能 server 用
+    `sys.executable` 起——**与 host 同一个解释器**，所以"装没装"在 host 侧就能回答。
+
+    坏声明（不是字符串列表）告警 + 按"没声明"处理：少一层保护，但不会因此让技能加载不了。
+    """
+    declared = _read_skill_config(meta).get("requirements")
+    if declared is None:
+        return []
+    if not isinstance(declared, list) or not all(isinstance(k, str) for k in declared):
+        logger.warning(
+            "技能 %s 的 skill.json 里 requirements 不是字符串列表，已忽略：%r", meta.name, declared
+        )
+        return []
+    return [name.strip() for name in declared if name.strip()]
+
+
+def read_preflight(meta: SkillMeta) -> SkillPreflight | None:
+    """读技能声明的**加载时体检**（`skill.json` 的 `preflight`）；未声明 / 形状不对 → None。
+
+    只做**解析**（同 `read_skill_env`）：真去打那次请求是 host 动作，落在
+    `app/agent/tools.py::_skill_preflight_line`。坏声明一律告警 + 按"没声明"处理——
+    体检是锦上添花，不该因为它写错就让技能加载不了。
+    """
+    raw = _read_skill_config(meta).get("preflight")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        logger.warning("技能 %s 的 preflight 不是对象，已忽略：%r", meta.name, raw)
+        return None
+
+    url = str(raw.get("url") or "").strip()
+    bearer_env = str(raw.get("bearer") or "").strip()
+    if not url or not bearer_env:
+        logger.warning(
+            "技能 %s 的 preflight 缺 url 或 bearer，已忽略：%r", meta.name, raw
+        )
+        return None
+    if bearer_env not in read_skill_env(meta):
+        # 体检用的键必须是本技能**声明过**的凭证键——否则等于让技能凭空读一个它没申请的凭据
+        logger.warning(
+            "技能 %s 的 preflight.bearer=%s 不在它声明的 env %r 里，已忽略",
+            meta.name,
+            bearer_env,
+            read_skill_env(meta),
+        )
+        return None
+    return SkillPreflight(url=url, bearer_env=bearer_env)
 
 
 def body_of(meta: SkillMeta) -> str | None:

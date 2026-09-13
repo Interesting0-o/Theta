@@ -113,3 +113,21 @@ class SkillMeta:
     dir_name: str
     capability: bool
     path: str
+
+
+@dataclass(frozen=True)
+class SkillPreflight:
+    """技能声明的**加载时体检**（`skill.json` 的 `preflight`，可选）。
+
+    **为什么要有它**：能力型技能的凭证在 `skill_env` 那关只验"键有没有值"，验不出"值对不对"
+    ——过期 / 被撤销 / 权限不足都要等第一次真请求才暴露。把这件事做成 MCP 工具，等于让模型自己
+    想到去查（而它并不知道该查）；而这是**加载那一刻 host 就该知道**的事实：所以由 host 在
+    `get_skill` 里打一次只读端点，结论随回执给出（不是工具，不进模型可见的工具表）。
+
+    - url：探活的**绝对 URL**。应当是"只读、廉价、且能证明凭证有效"的端点（GitHub 是 `/user`）；
+    - bearer_env：用哪个 env 键的取值作为 `Authorization: Bearer` 头。必须是该技能 `env` 里
+      **声明过**的键——否则就是让技能凭空读一个它没申请的凭证。
+    """
+
+    url: str
+    bearer_env: str

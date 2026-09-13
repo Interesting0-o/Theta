@@ -489,6 +489,10 @@ async def unregister_server(workspace: str, session: str | None, server: str) ->
 
     顺序：先摘 shim（纯内存）→ 再关运行体（投哨兵 + 等 owner，跨 Task 调用是安全的）→ 最后 +1 版本。
     没登记过（也没运行体）就什么都不做、**不**动版本——免得白让 LLMNode 重绑一次。
+
+    也丢掉该 (工作区, server) 的 schema 缓存：它是**列一次用一辈子**的，留着会让"改技能 →
+    drop_skill 再 get_skill"拿到**新代码 + 旧工具表**（新增/改名的工具看不见）。代价是下次
+    加载重新列一次（本来就要起一次临时会话），而热改技能是低频事件。
     """
     workspace = await asyncio.to_thread(_normalize_workspace, workspace)
     key = (workspace, session)
@@ -499,6 +503,7 @@ async def unregister_server(workspace: str, session: str | None, server: str) ->
 
     had_worker = (workspace, session, server) in _WORKERS
     await _shutdown((workspace, session, server))
+    _SERVER_SPECS.pop((workspace, server), None)
 
     if had_tools or had_worker:
         _VERSIONS[key] = _VERSIONS.get(key, 0) + 1
@@ -518,7 +523,6 @@ def session_tools(workspace: str, session: str | None) -> list[BaseTool]:
     调用点（构图期的 `get_main_agent_graph`、`SessionToolset`、`get_skill` 的注入 workspace）
     拿到的都是 `_resolve_workspace` 的结果，天然一致。
     """
-    key = (workspace, session)
     key = (workspace, session)
     core = _MCP_TOOLS_CACHE.get(key)
     if core is None:
