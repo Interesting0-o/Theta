@@ -9,7 +9,9 @@ start_process 常驻与启动期探测 / process_wait/read/kill/list / 未知进
 import asyncio
 import os
 import re
+import subprocess
 
+from mcp_service import terminal
 from mcp_service.terminal import (
     process_kill,
     process_list,
@@ -174,3 +176,23 @@ def test_process_unknown_id_is_invalid_argument():
     res = asyncio.run(_scenario())
     assert res.success is False
     assert res.error_type == "invalid_argument"
+
+
+def test_spawned_commands_must_not_inherit_stdin():
+    """命令的 stdin 必须是 DEVNULL——**不能继承 MCP 服务器的 stdin**。
+
+    回归防线（2026-09-13 实测揪出）：terminal server 的 stdin 就是主程序连过来的 **JSON-RPC
+    管道**，没人写、也**永不 EOF**。命令若继承它，凡启动时读一下 stdin 的程序就永远等下去——
+    现场是 `git --version` 挂满 `run_command` 的 300 秒超时，而 `uv --version` 不读 stdin 所以
+    秒回，表象成了"只有 git 执行不了"（用户看到的是"补环境老是补不全"）。更坏的一种可能是命令
+    读到协议字节、把 MCP 会话搞乱。
+
+    这里直接断言 spawn 参数（而不是跑一条"读 stdin"的命令）：pytest 进程自己的 stdin 通常已经是
+    EOF，跑命令**测不出**回归——只有断言参数才真的守得住。
+    （GitPython 起 git 时显式设了 `stdin=(istream or DEVNULL)`，所以漏的只有本模块这一处。）
+    """
+    kwargs = terminal._build_spawn_kwargs(None)
+
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["stdout"] is subprocess.PIPE
+    assert kwargs["stderr"] is subprocess.PIPE

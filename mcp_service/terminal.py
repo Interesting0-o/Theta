@@ -143,7 +143,16 @@ def _resolve_cwd(cwd: str) -> str | None:
 
 
 def _build_spawn_kwargs(cwd: str | None) -> dict:
-    kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+    # ⚠️ `stdin` **必须显式给 DEVNULL**：不给的话命令会**继承 MCP 服务器的 stdin**——那是主程序连
+    # 过来的 **JSON-RPC 管道**（没人写、也永不 EOF）。凡启动时读一下 stdin 的程序就永远等下去：
+    # 实测（2026-09-13）`git --version` 会一直挂到 run_command 的超时（300 秒），而 `uv --version`
+    # 不读 stdin 所以秒回——表象就成"只有 git 坏了"。更坏的一种可能：命令读到协议字节，把 MCP
+    # 会话搞乱。GitPython 那边显式设了 `stdin=(istream or DEVNULL)`，漏的只有这里。
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
     if cwd:
         kwargs["cwd"] = cwd#type: ignore
     if os.name == "nt":
