@@ -73,6 +73,87 @@
 - 相关背景：`docs/MULTI_AGENT.md` §6「统一审批视图」（marker/payload 语义要同步扩）、
   `app/platform/ui.py`（UI 协议）、`app/tui/panels.py`（选项渲染）、`app/platform/approvals.py`。
 
+## [ ] 工具面缺口：一次真实运行的实测（2026-09-13）
+
+**样本**：一个会话、3 轮用户请求（克隆 Luna-Agent → uv 补环境 → 查/拉分支），共 **55 次**工具调用。
+
+| 工具 | 次数 |
+| --- | --- |
+| `run_command` | **30（55%）** |
+| `read_file` | 7 |
+| `update_plan_step` | 6 |
+| `list_dir` / `write_memory` | 各 2 |
+| `get_directory_tree` / `create_plan` / `clear_plan` / `create_file` | 各 1 |
+| `git_clone` / `git_branches` / `git_status` / `git_switch` | 各 1（**clone 与 switch 都失败过**） |
+| `github_*`（整个技能） | **0** |
+
+**三条结构性原因**（不是"模型不听话"）：
+
+1. **第一步就脱轨**：本机 github 被 Watt Toolkit 劫持到 127.0.0.1，git 的 schannel 证书吊销检查
+   失败 → `git_clone` 失败；绕过要 `-c http.sslVerify=false`，而**那个开关只能敲在 shell 里**（工具
+   不收 git 配置）→ 此后所有 git 操作都走 shell（路径依赖）。
+2. **工具参数面太窄**：`--depth` / `--unshallow` / `--track` / `-B` / `ls-remote` / `for-each-ref` /
+   `reflog` / `diff --cached` / `config` —— 一个都不支持。该会话第三轮的 12 次 `run_command`
+   **全部**是这类。
+3. **github skill 结构性地插不上手**：它只有 7 个**只读平台**工具，没有克隆/分支/拉取——那些在核心
+   `git_*` 里，而 `git_*` 又不支持上面那些参数。**模型没加载它是对的**（"克隆+补环境"本来就不是
+   GitHub 平台操作）。
+
+**收敛清单（按日志频次排序）**：
+
+- `git_clone` 加 `depth`（浅克隆；日志里它直接用了 `--depth 1`）；
+- `git_switch` 支持"从远端建跟踪分支"（`--track` / `-B` / `-u`；日志里试了三次才绕过去）；
+- **远端分支清单**（`ls-remote` 语义）独立成只读工具、或给 `git_branches` 一个开关 —— 浅克隆下
+  本地只有默认分支的跟踪引用，日志里连着两轮都在找它；
+- `git_fetch` 支持 refspec / `--unshallow`。
+
+**不要做**：给 `git_clone` 透传 `-c`——那等于给模型一个正式"关掉证书校验"的开关（MITM 面）。
+
+**审批摩擦（同一份实测）**：全程 **33 次人工 y**，其中 **30 次是 shell 命令**。"一次路由调用了多个
+工具"的实际开销是**人的**：图里 `review_node` 逐条 drain（`review_node → review_node`，排空才去
+执行），**模型每轮只调一次**，所以 N 个 tool_call ≠ N 次模型调用，但 = N 次审批（需审的那些）+ N 条
+ToolMessage 进 history（token，由 compact 折叠兜底）。实测里还有**模型自己的重复劳动**：一条复合
+命令（`uv --version; python --version; git --version`）批准执行之后，它又把三条**分别重跑了一遍**
+——4 次审批换一份信息。
+
+## [ ] 工作区语义：克隆下来的项目落在工作区**子目录**里（2026-09-13 实测）
+
+**现象**：用户新建一个空目录当工作区、让 agent 克隆 + 补环境，落点是 `工作区/Luna-Agent/`——于是
+**工作区 ≠ 项目根**。后果全在"以工作区为界"的东西上：项目画像 `AGENT.md` 写在外层；长期记忆按外层
+分（同一外层下克隆的第二个项目会**共享一份记忆**）；终端每条命令都得自己 `cd`（实测 30 次
+`run_command` 里 **19 次带 `cd Luna-Agent && …`**，其中还有用 `&` 而非 `&&` 的——cmd 里 `&` 是
+**无条件**分隔符，`cd` 失败也照跑，`checkout -B`/`reset` 这类写操作会落到错目录）。
+
+**待拍板（两条，二选一或都要）**：
+
+- **① 克隆落点**：`git_clone` 的 `dest` 改成**必填**（审批面板必须看得见落点——现在 `dest` 可空时
+  人只看到 `url`），docstring 写清"**工作区是空的 → 传 `.`**（工作区即项目根：之后每条命令都不必
+  `cd`，画像/记忆/沙箱也都在对的地方）；**工作区已有内容 → 给子目录名**"，回执再点明"这是不是工作区
+  根"。`dest="."` 已验证可用（工作区非空时会被"目标非空"拒掉，回执教它改用子目录名）。
+- **② 更根本**：空工作区**默认**落根（零操作，但面板看不到落点）；或加 `/workspace <path>` **切换
+  工作区**（工作区是"项目容器"时用它；要动基座：关旧运行体 → 换 `ws_key` → 重建图与库），后者顺带
+  解决"TUI 起在了错的目录"。
+
+**副作用（记在案）**：工作区=项目根时，`/init` 写的 `AGENT.md` 会落进**克隆下来的那个仓库**，成为
+它的未跟踪文件。这跟"在一个项目里起 agent"的常态一样（想不提交就 gitignore），只是值得知道。
+
+## [x] 终端命令继承了 MCP 的 stdin（挂死；2026-09-13 修）
+
+**现象**（真实会话实测）：`run_command("uv --version && git --version && python --version")` 永不返回
+——`git --version` 挂满 `run_command` 的 300 秒超时；同一条链里的 `uv --version` 却 0.1 秒返回，
+表象成了"只有 git 命令执行不了"。用户侧的感受是"**克隆下来项目、补环境老是补不全**"。
+
+**根因**：`mcp_service/terminal.py::_build_spawn_kwargs` 只设了 stdout/stderr，**`stdin` 没设 → 继承**；
+而 terminal server 自己的 stdin 是主程序连过来的 **JSON-RPC 管道**（没人写、也永不 EOF）。凡启动时
+读一下 stdin 的程序就永远等下去。定位过程（都可复核）：`git --version < NUL` 秒过；同一解释器跑
+`git --version` 单独正常；换绝对路径调同一个 `git.exe` 照样挂——**只差 stdin**。顺手排除了环境
+（PATH/COMSPEC/SYSTEMROOT 都在，MCP SDK 会补默认环境）与 git 本身两个假设。
+GitPython 起 git 时显式设了 `stdin=(istream or DEVNULL)`，所以**只有 terminal 这一处漏**。
+
+**修法**：`stdin=subprocess.DEVNULL`；回归测试**直接断言 spawn 参数**（跑一条"读 stdin 的命令"
+测不出来——pytest 进程自己的 stdin 通常已是 EOF）。**顺带挡住一种更坏的形态**：命令读到协议字节，
+把 MCP 会话搞乱。
+
 ## [x] TUI markdown 渲染：模型答复不再满是 `**` 与 `###`
 
 **动机**（2026-09-10 记）：`TerminalUI.emit` 现在直接 `print(event.text)`，模型的 markdown 原样
@@ -99,7 +180,7 @@
 - 可测性：用 `Console(file=StringIO())` 捕获输出断言；Windows 老终端（conhost）会降级，需实测。
 - 相关背景：`app/tui/ui.py`（`emit`）、`app/tui/panels.py`、`docs/ARCHITECTURE.md` §3（前端职责）。
 
-## [~] 技能（skill）：按需加载的"领域包"——**一期已落地，能力型待做**
+## [~] 技能（skill）：按需加载的"领域包"——**两期均已落地**（见 docs/SKILL_DESIGN.md）
 
 > **设计已独立成文** → [[docs/SKILL_DESIGN]]。本条只留指针与当前状态，**别再往这里堆内容**。
 
@@ -123,8 +204,14 @@ env 声明与白名单转发）——那是 §3.3/§3.4 那套，也是最重的
 `get_skill` 把它的工具拉进本会话、`drop_skill` 一并关掉（机制 = "技能就是按需加入的 server"，
 复用 §12 的运行体）。首个能力型技能 `skills/github/` 落了 **7 个只读工具**（stdlib HTTP，不引 PyGithub）+ 一次**加载时凭证体检**（`skill.json` 的 `preflight`，替代了原 `github_auth_status` 工具）。
 
-**未做**：GitHub 的**写操作**（开 PR / 推送 / 合并 / 评论）与若干只读工具；技能运行体的空闲回收
-（已定不做，只靠 `drop_skill`）；`/skills` 控制面命令。口径见 §13.9。
+**三期已落地（2026-09-14，见 SKILL_DESIGN §13.10）**：`skills/github/` 从 7 个只读工具长到
+**12 只读 + 3 写**（`github_pr_create` / `github_pr_review` / `github_issue_comment`，都要人批）。
+越权动作在工具内**结构性拒绝**：`github_pr_review` 的 `event` 白名单不含 `APPROVE`；**"合并"连工具
+都没有**（"合并权留给人"最彻底的落点是这个动作压根不存在，与"APPROVE 被拒"同构）。同批修掉了
+`server.py` 的 8 处审计问题与 `skills.py` 两处真 bug（坏编码的 `SKILL.md` 会拖垮整次扫描；目录名是
+Python 关键字时被误标 `[带工具]`）。
+
+**未做**：技能运行体的空闲回收（已定不做，只靠 `drop_skill`）；`/skills` 控制面命令。口径见 §13.9。
 
 **与本文其它条目的关系**：SKILL_DESIGN §6 与上面的「反思节点」打通——skill fork 到隔离子 agent 执行，
 本身即一次结构性反思，且 `mcp_service/sub_agent.py` 那套骨架已经在了；但它卡在
