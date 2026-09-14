@@ -14,8 +14,14 @@ class Settings(BaseSettings):
 
     #聊天模型配置
     CHAT_MODEL_API_KEY:SecretStr
-    CHAT_MODEL_URL:str 
+    CHAT_MODEL_URL:str
     CHAT_MODEL_NAME:str
+
+    # 思考模式（可选，三态）：`enabled` = 强制思考 / `disabled` = 不思考 / **留空 = 不下发该参数**、
+    # 完全交给服务端默认（当前智谱 GLM-4.7 系列默认就开思考）。
+    # 与 GITHUB_TOKEN 同理带空默认：它是**可选的厂商参数**，不是"必须配的东西"——不填时行为与
+    # 没有这个键完全一样。取值 → `extra_body` 的映射单点在 app/agent/model.py::thinking_extra_body。
+    CHAT_THINKING: str = ""
 
     #词嵌入模型配置
     EMBEDDING_MODEL_API_KEY:SecretStr

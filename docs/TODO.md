@@ -180,6 +180,42 @@ GitPython 起 git 时显式设了 `stdin=(istream or DEVNULL)`，所以**只有 
 - 可测性：用 `Console(file=StringIO())` 捕获输出断言；Windows 老终端（conhost）会降级，需实测。
 - 相关背景：`app/tui/ui.py`（`emit`）、`app/tui/panels.py`、`docs/ARCHITECTURE.md` §3（前端职责）。
 
+## [x] 思考模式：配置化 + "思考不进 messages"（2026-09-14）
+
+**动机**：厂商的思考（reasoning/thinking）此前既没有开关、也没有任何观测点——当前 `.env` 指向的
+智谱 GLM-4.7 系列**默认就开思考**，代码里却既无参数也无痕迹，等于"花了钱却不知道"。
+
+**落地**：
+
+- **配置三态**：`app/config.py::CHAT_THINKING`（`enabled` / `disabled` / 留空 = **不下发该参数**、
+  交给服务端默认）→ `app/agent/model.py::thinking_extra_body()`（**provider 映射的单点**）→
+  当 `extra_body=` 传给 `ChatOpenAI`（它是一等字段，不走"未知 kwargs → model_kwargs"那条带警告的路）。
+  **默认留空 ⇒ 行为与现状完全一致**。`.env.example` 有分区说明。
+- **"思考不进 messages" 天然成立，故不写剥离代码**：`langchain-openai` 的响应转换是白名单式的，
+  `reasoning_content` 压根没被提取进 `AIMessage`（实测：把带该字段的假响应喂真实转换路径，
+  `additional_kwargs` 是空的）。但这条**依赖库的行为**，所以用一条**契约用例**钉住
+  （`tests/test_thinking_config.py`）——库哪天开始提取，用例会红，那时在 `LLMNode` 的唯一写回点补剥离
+  （那里有注释指向该文件）。
+- **实调用验证**：同文件一条 opt-in 用例（设 `THETA_LIVE_THINKING=1` 才跑，默认 skip），真打一次 API
+  断言"厂端确实返回思考 + 正文非空 + 我们这边拿不到思考"。端点限流/网络不通时 **skip 而非 fail**
+  （环境问题不是被测代码的缺陷）。
+
+**实测记录（2026-09-14，`glm-4.7-flash` / 智谱 BigModel，同一问题只改参数）**：
+
+| 配置 | `content` | `reasoning` | reasoning_tokens / completion |
+| --- | --- | --- | --- |
+| `enabled` + `max_tokens=300` | **空** | 509 字 | 299 / **300** |
+| `enabled` + 不传 `max_tokens`（= 本仓库现状） | 正常 | 1547 字 | 865 / 889 |
+| `disabled` + `max_tokens=200` | 正常 | 0 字 | 0 / **26** |
+
+⚠️ **思考 token 计入 `completion_tokens`，因此也计入 `max_tokens`**：给少了会"想完没话说"（第一行）。
+本仓库不设 `max_tokens` 所以安全，但哪天要设，必须把思考的额度算进去。
+
+**没做**：不显示思考（`ui_schema` 只有 5 种事件、`TurnFinished` 只带正文）；不做 `/think` 会话级开关
+（本期按环境级走）；不碰 `clear_thinking`（服务端默认 `true` = 历史思考不随上下文给模型，正是
+"不进 messages"的对应语义）。**"跨轮保留思考"是另一件事**：它要求把思考**逐字原样回传**，
+与"不占历史"直接冲突，要做得重新拍板。
+
 ## [~] 技能（skill）：按需加载的"领域包"——**两期均已落地**（见 docs/SKILL_DESIGN.md）
 
 > **设计已独立成文** → [[docs/SKILL_DESIGN]]。本条只留指针与当前状态，**别再往这里堆内容**。
@@ -216,6 +252,54 @@ Python 关键字时被误标 `[带工具]`）。
 **与本文其它条目的关系**：SKILL_DESIGN §6 与上面的「反思节点」打通——skill fork 到隔离子 agent 执行，
 本身即一次结构性反思，且 `mcp_service/sub_agent.py` 那套骨架已经在了；但它卡在
 `docs/MULTI_AGENT.md` §6「子 agent 写权限下放」这个里程碑上。
+
+## [ ] 图像输入：@路径 附图通道已落地；工具返回图仍无通路（2026-09-14）
+
+**用户通路已落地（本期）**：消息里写 `@路径`（相对工作区或绝对路径；带空格用 `@"…"`），
+`LLMNode` 构造请求体副本时把图**临时**附上——**base64 从不进 messages/checkpoint**：state 里的
+消息始终是带 @路径 的纯文本（本身就是"看过哪张图"的日志），轮末没有"剔除"这回事。机制收在
+`LLMNode.attach_images_to_payload` 一个静态方法里（解析/读盘/拼接/记账，单一生产消费者）；
+记账 = state 的 `attached_images`（`ImageRef` 元数据，单调追加）→ 同轮不重发（**首次-only**，
+重启后重读盘即得）。宽进策略（议定）：扩展名不像图片的 @token 是普通文本、原样放行；失败不炸
+turn，处置（未找到 / 过大>5MB / 超 4 张 / 读取失败）写进正文让模型转告用户。worker
+`attach_images=False`：dispatch prompt 不认 @，杜绝模型借 worker 附带本地文件（结构性排除）。
+机制测试 `tests/test_image_attach.py`（13 例无网络；真调用 opt-in，见该文件尾）。
+
+**模型层事实**（此前已通，`tests/test_vision_input.py` 固化）：
+
+| 路径 | 工具绑定 | 结果 |
+| --- | --- | --- |
+| base64（LangChain 规范块 `{"type":"image","base64":…}`） | 无 | ✅ 认出一张左红右蓝的 64×64 图 |
+| base64（`image_url` + data URI） | **有**（`bind_tools`） | ✅ 答对颜色 + 吐出规范 `tool_calls` |
+| http URL（`image_url`） | 无 | ✅ 认出百度 logo（**厂端自己抓的图**） |
+
+三条结论：
+
+- **唯一前提是模型**：当前 `glm-4.7-flash` 硬拒图片（`400 / code 1210 / messages.content.type
+  参数非法，取值范围 ['text']`）；实测可用的是 `glm-4.6v-flash`（base64 与 URL 都行，**且能同时挂
+  工具**）；免费层的 `glm-4v-flash` 只吃 URL、不吃 base64。附图真调用曾持续 429（1305 访问量
+  过大）——免费端点负载问题，非通道缺陷，限流缓解后跑 `-k apple` 即验。
+- **库侧零障碍**：`ChatOpenAI` 原样透传 `image_url`，并把 LangChain 的规范图块**自动翻译**成
+  `data:<mime>;base64,…`；`ToolMessage` 带图也被端点接受。
+- **两条路各有代价**：base64 自包含（本地图直接给）但体积 +33%；URL 便宜但要求图在公网。
+  用户通路选 base64（本地文件）；URL 留给公网图源。
+
+**原勘察的拦路石，处置如下**（1/2/4 被通道设计整体绕开，3 未动）：
+
+1. ~~预算与折叠对 base64 失控~~：base64 不进 messages，`needs_compact` 永远看不到它。
+2. ~~块列表撞"按 str 消费"的老代码~~：state 消息保持 str，`TurnFinished` / `/list session` /
+   `CompactNode._tm_status` 全部照旧。
+3. **工具返回图的通路仍是断的（未动）**：`format_tool_result`/`_join_block_texts` 丢非文本块
+   （`app/agent/utils.py:22-33`，**已被 `tests/test_format_tool_result.py:65-70` 钉住**），且
+   `ToolResult.content: str`（`app/schema/agent_schema.py:9`）是硬墙——模型还不能把工具读到的图
+   送进对话。要做时另开一期。
+4. ~~一批测试会红~~：str 断言测试全部照旧（全量回归 401 passed）。
+
+**顺带的独立缺陷已修（2026-09-14）**：`read_file` 读二进制时 `UnicodeDecodeError`（非 `OSError`
+子类）曾冒到 `@guard` 被误判成 `internal_error`——现已改为字节读 + NUL 探测（`_is_binary`，
+与 `search_content` 共享同一口径）+ 魔数猜类型，二进制/非 UTF-8 文本都给"它是什么 + 多大"的
+可预期回执（success=True，不进错误分类）；行尾显式保持旧文本模式的 universal newlines 行为
+（`\r\n`→`\n`），编辑锚定不受影响。`tests/test_file_io.py` 二进制回执一节共 5 例。
 
 ## 相关但未立项（讨论过，待显式拍板再单列）
 
