@@ -1,6 +1,6 @@
 ---
 name: github
-description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜仓库）。当任务涉及 GitHub 上的仓库——查看 issue、开或审 PR、读远端代码、搜项目——时使用。本地仓库操作（status / diff / commit / 切分支 / 推送）走 git_* 系列工具，不要用本技能。
+description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜仓库）。当任务涉及 GitHub 上的仓库——查看 issue、开或审 PR、读远端代码、搜项目——时使用。本地仓库操作（status / diff / commit / 切分支 / 克隆 / 推送）走 git_* 系列工具，不要用本技能。
 ---
 
 # GitHub 技能
@@ -14,37 +14,45 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
 
 ## 1. 能力清单
 
-### 1.1 只读（免审批）
+### 1.1 平台侧读取（免审批）
 
-| 工具 | 作用 | 状态 |
-| --- | --- | --- |
-| `github_repo_view` | 仓库元信息：描述 / 默认分支 / 语言 / star / 开放 issue 数 | ✅ |
-| `github_tree` | 列**远端**目录树（`ref` 可指分支/tag/commit）——**不克隆** | ✅ |
-| `github_file_read` | 读**远端**单个文件（或列目录）——**不克隆** | ✅ |
-| `github_search_repos` | 按关键词搜仓库 | ✅ |
-| `github_search_code` | 搜代码（可限 `repo` / `language`） | ✅ |
-| `github_issue_view` | 读单个 issue（含正文 / 标签 / 评论数） | ✅ |
-| `github_pr_view` | 读单个 PR（状态 / 分支 / 增删行数 / 正文） | ✅ |
-| `github_issue_list` | 列 issue | ⏳ 未实现 |
-| `github_pr_list` | 列 PR | ⏳ 未实现 |
-| `github_pr_diff` / `github_pr_files` | 读 PR 的**区间** diff / 改动文件清单 | ⏳ 未实现 |
-| `github_release_list` | 列 release / 版本（"这个库现在什么版本"） | ⏳ 未实现 |
+| 工具 | 作用 |
+| --- | --- |
+| `github_repo_view` | 仓库元信息：描述 / 默认分支 / 语言 / star / 开放 issue 数 |
+| `github_tree` | 列**远端**目录树（`ref` 可指分支/tag/commit）——**不克隆** |
+| `github_file_read` | 读**远端**单个文件（或列目录）——**不克隆** |
+| `github_search_repos` | 按关键词搜仓库 |
+| `github_search_code` | 搜代码（可限 `repo` / `language`） |
+| `github_issue_view` | 读单个 issue（含正文 / 标签 / 评论数） |
+| `github_pr_view` | 读单个 PR（状态 / 分支 / 增删行数 / 正文） |
+| `github_issue_list` | 列 issue（**已替你滤掉 PR**；可按 `state` / 标签过滤，可翻页） |
+| `github_pr_list` | 列 PR（按最近更新；"有哪些在等我审"先看它） |
+| `github_pr_diff` | 读**整个 PR 的区间 diff** |
+| `github_pr_files` | 列 PR 改了哪些文件、各增删多少行（带 patch 片段） |
+| `github_release_list` | 列 release / 版本（"这库现在什么版本"） |
 
 > **`github_tree` + `github_file_read` 是"不克隆读代码"的主力**：只想看一个文件、一层目录时用它们，
 > 不要为了看一眼就把整个仓库克隆下来（慢、占地方、还要过审批）。
-> 标 ⏳ 的还没实现——**不要照着名字硬调**，用之前先看一眼当前可用的工具表。
+>
+> **`github_pr_diff` / `github_pr_files` 管的是 PR 的区间 diff**：本地 `git_diff` 只知道你自己的
+> 工作树，看不到 `main…feature` 这样的区间，更看不到别人的 PR。
 
-### 1.2 写 / 远端改动（需人工审批）
+### 1.2 平台侧改动（**需人工审批**）
 
-| 工具 | 作用 | 审批 |
-| --- | --- | --- |
-| `github_pr_create` | 开 PR | 需审 |
-| `github_pr_review` | 提交评审意见 | 需审（且见 §2.1 的事件白名单） |
-| `github_pr_merge` | 合并 PR | 需审——**合并权留给人** |
-| `github_issue_comment` | 在 issue / PR 下留言 | 需审 |
+| 工具 | 作用 |
+| --- | --- |
+| `github_pr_create` | 开 PR（`head` 必须是你**已经推上去**的分支；描述**必填**） |
+| `github_pr_review` | 提交评审意见——只接受 `COMMENT` / `REQUEST_CHANGES` |
+| `github_issue_comment` | 在 issue / PR 下留言 |
 
-> **推送不在本技能里**：用 `git_push`，参数是**远程仓库的完整地址**（如
-> `https://github.com/owner/repo.git`）。地址由用户给（拿不准就问），**不要**把 token 写进地址。
+> **"批准"与"合并"都不在本技能的工具面上**：`github_pr_review` 传 `APPROVE` 会被**直接拒绝**；
+> **合并没有对应的工具**（不是藏在别处——别猜名字、也别绕道 shell），这两件事都是人的权力。
+> `github_pr_view` 会告诉你"可自动合并：true / false"，把它和开 PR 回执里的链接一起交给用户即可。
+>
+> **推送也不在这里**：用 `git_push`（参数是**远程仓库的完整地址**，地址由用户给；不要用
+> `run_command` + `git push` 绕开审批）。
+>
+> **别绕道**：用 `run_command` + `gh` / `curl` 去改远端，既没有审批粒度，错误也只剩一坨文本。
 
 ### 1.3 不归本技能的事（别用本技能重复实现）
 
@@ -55,9 +63,9 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
     `github_branch_list`（同一件事不两处维护）。
   - **建分支** → `git_switch` 建本地的；远端那条同名分支在你第一次 `git_push` 时一并创建。
   - **推送** → `git_push`（**地址要来自用户**；不要用 `run_command` + `git push` 绕开审批）。
-  - **看自己未提交的改动** → `git_diff`。`github_pr_diff` / `github_pr_files` 管的是 **PR 的区间
-    diff**：`git_diff` 看不到"`main`…`feature`"的区间，更看不到别人的 PR。
-- **克隆仓库** → 优先用 §1.1 的远端读工具；确实要克隆时用 `run_command` 的 `git clone`。
+  - **看自己未提交的改动** → `git_diff`。
+- **克隆仓库** → 优先用 §1.1 的远端读工具（看一眼不需要一份工作树）；确实要克隆时用 `git_clone`
+  （目标目录必须在**工作区内**，且要人批）。
 - **用 `curl` 之类的命令直接打 GitHub API** → 用本技能的工具（否则既没有审批粒度，错误也只剩一坨文本）。
 
 ---
@@ -68,10 +76,9 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
 
 | 约束 | 说明 |
 | --- | --- |
-| ⚠️ **不许直接推受保护分支**（`main` / `master` / 仓库配置的 protected branches） | 改动进主干**只能**经"开分支 → 推分支 → 开 PR → 人合并"。这条**不由工具拦**——保护分支是平台侧的规则，服务端自己会拒（真推上去你会看到失败与平台的拒绝原因，那不算事故，是护栏起作用了）。**仓库若没配保护规则，你就是唯一那道闸** |
-| **合并 PR 必须人批** | 你可以**建议**合并，但按下合并键的必须是人 |
-| **你不得"批准"PR** | `github_pr_review` 只接受 `COMMENT` / `REQUEST_CHANGES`；`APPROVE` 会被直接拒绝——"批准"与"合并"一样是人的权力，不是你的 |
-| **推送 / 开 PR / 评审 / 留言都要人批** | 每个远端改动都过一次审批；**不要在一轮里批量做**（见 §4） |
+| ⚠️ **不许直接推受保护分支**（`main` / `master` / 仓库配置的 protected branches） | 改动进主干**只能**经"开分支 → 推分支 → 人合并"。这条**不由工具拦**——保护分支是平台侧的规则，服务端自己会拒（真推上去你会看到失败与平台的拒绝原因，那不算事故，是护栏起作用了）。**仓库若没配保护规则，你就是唯一那道闸** |
+| **开 PR / 评审 / 留言 / 推送都要人批** | 每个写操作在真正执行前都会挂起等批准；**不要在一轮里批量做**（见 §4） |
+| **批准与合并不是你的动作** | `github_pr_review` 只认 `COMMENT` / `REQUEST_CHANGES`——传 `APPROVE` 会被工具**直接拒绝**（不问你、也不放行）；**合并没有对应的工具**。需要人做决定时，说清状况并把链接给用户 |
 
 ### 2.2 软约束（行动指导——应当遵守）
 
@@ -91,9 +98,9 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
 
 5. **PR 描述必须写清三件事**：① 改动的动机（解决什么问题）；② 怎么验证的（跑了什么命令、结果
    如何）；③ 遗留事项 / 需要 reviewer 特别看的地方。**空描述的 PR 等于把成本转嫁给 reviewer。**
-6. **开 PR 前先自查 diff**（`git_diff`，或 `github_pr_diff` 看区间）：有没有夹带调试代码、临时
-   文件、密钥。
-7. **review 要具体。** 用 `github_pr_review` 留意见时指向文件与行，说清"这里为什么有问题"，
+6. **要开 PR 前先自查 diff**（自己的改动用 `git_diff`，别人的 PR 用 `github_pr_diff` 看区间）：
+   有没有夹带调试代码、临时文件、密钥。
+7. **评审意见要具体。** 用 `github_pr_review` 留意见时指向文件与行，说清"这里为什么有问题"，
    不要只写"看起来不错"。
 8. **不要催合并。** 合并时机是人决定的；你只负责把改动做到可合并、把信息给全。
 
@@ -102,6 +109,8 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
 9. **读远端优先用 `github_tree` / `github_file_read`**，别为了看一眼就克隆。
 10. **拿不准仓库的实际状态时先读再动**：`github_repo_view` 看默认分支，`git_fetch` + `git_branches`
     看分支现状——凭印象推送是事故之源。
+11. **要摸清"这个仓库在忙什么"**：`github_issue_list` / `github_pr_list` 看开放项，版本问题看
+    `github_release_list`——比逐个猜编号快得多。
 
 ---
 
@@ -122,9 +131,10 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
 
 ## 4. 这个技能不干什么
 
-- **不替人做决定**：不合并、不批准、不代替 reviewer 下结论（§2.1）。
+- **不替人做决定**：不代替人合并、批准或下 reviewer 结论——这些是人的权力。工具面上也照此收窄：
+  只有"留意见 / 要求修改"，**没有"批准"与"合并"**。
 - **不碰别的平台**：GitLab / Gitea 等不在本技能范围。本技能只管 PR / issue 这些平台对象。
 - **不做本地仓库的活**（§1.3）：`status` / `diff` / `log` / `add` / `commit` / 切分支 / 列分支 /
-  推送，一律走 `git_*` 系列工具。
+  克隆 / 推送，一律走 `git_*` 系列工具。
 - **不做"自动提交马拉松"**：不要在一轮里连续推送多个分支、批量开 PR。每个远端改动都过一次审批，
   批量操作会变成审批轰炸——**做一步、验一步、报一步**。

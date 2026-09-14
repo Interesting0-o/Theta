@@ -1,4 +1,4 @@
-"""`get_skill("github")` 的端到端：**真拉起** `skills/github/server.py` → 8 个工具进本会话 → 真调用。
+"""`get_skill("github")` 的端到端：**真拉起** `skills/github/server.py` → 15 个工具进本会话 → 真调用。
 
 三块测试的分工（少一块就有一段链路没人验证）：
 
@@ -9,7 +9,7 @@
 - **本文件**补中间那段**真技能**的链路：真 spawn 子进程 → 凭证经 `skill_env` 转发进子进程
   （server 在 **import 期**就要求 `GITHUB_TOKEN`，缺了它进程直接起不来——所以"加载成功"本身
   就是"凭证转发通了"的证明）→ server 真暴露的工具名与 `app/agent/tool.json` 的登记**逐字一致**
-  → 工具真能经 shim 取到数据、上游失败真被分类成 `upstream_error` 回传给模型。
+  → 工具真能经 shim 取到数据、上游失败真被分类成 `upstream_error` 回传给模型、写工具真发得出 POST。
 
 **不联网**：`GITHUB_API_URL` 与体检端点都指向本进程起的 stdlib HTTP 桩。技能 server 在**子进程**里，进程内
 monkeypatch `_request` 打不到它（那正是上面第一条测试走的另一条路），所以只能从"地址"这一侧
@@ -75,6 +75,20 @@ def github_api():
                 self._send(200, json.dumps({"login": "octo-bot", "type": "User"}))
             else:
                 self._send(404, '{"message":"Not Found"}')
+
+        def do_POST(self):  # noqa: N802
+            """写工具的端点。**桩自己校验 method/路径/请求体**：对不上就回 422。
+
+            这样"POST 真的发出去了、body 真的是工具填的那份"就成了回执成功与否的一部分，
+            不必再往夹具外面递请求日志（夹具的返回值是个地址字符串，别为一条断言改它的形状）。
+            """
+            path = self.path.split("?", 1)[0]
+            length = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            if path == "/repos/octo/demo/issues/9/comments" and payload.get("body") == "e2e 留言":
+                self._send(201, json.dumps({"html_url": "https://example.test/octo/demo/issues/9#c1"}))
+            else:
+                self._send(422, json.dumps({"message": "unexpected write request"}))
 
         def _send(self, code: int, body: str) -> None:
             data = body.encode("utf-8")
@@ -144,11 +158,11 @@ def test_get_skill_github_spawns_real_server_and_serves_tools(github_api, tmp_pa
             receipt = out["messages"][0].content
             assert "凭证体检" in receipt and "可用" in receipt, receipt
 
-            # ① 技能真暴露的工具名 == tool.json 的登记（§13.3 第 4 关的端到端版本：
+            # ① 技能真暴露的工具名 == tool.json 的登记（§13.3 最后一关"工具名"的端到端版本：
             #    加工具忘了登记、或登记了不存在的工具，都在这里红）
             loaded_names = {n for n in mcp.session_tool_names(workspace, _SESSION) if n.startswith("github_")}
             assert loaded_names == _expected_github_tools()
-            assert len(loaded_names) == 7
+            assert len(loaded_names) == 15
 
             tools = {t.name: t for t in mcp.session_tools(workspace, _SESSION)}
 
@@ -170,6 +184,16 @@ def test_get_skill_github_spawns_real_server_and_serves_tools(github_api, tmp_pa
             )
             assert denied.startswith("[upstream_error] "), denied
             assert "401" in denied
+
+            # ⑤ 写工具：真发一次 POST。桩只在"路径 + 请求体都对"时才回 201，所以这一条同时
+            #    验了"方法真是 POST、body 真是工具拼的那份、回执渲染了响应里的 URL"。
+            comment = format_tool_result(
+                await tools["github_issue_comment"].ainvoke(
+                    {"owner": "octo", "repo": "demo", "number": 9, "body": "e2e 留言"}
+                )
+            )
+            assert not comment.startswith("["), comment
+            assert "example.test/octo/demo/issues/9" in comment
 
             worker_key = (mcp._normalize_workspace(workspace), _SESSION, "skills/github")
             assert worker_key in mcp._WORKERS  # 懒起：首次真调用才建运行体

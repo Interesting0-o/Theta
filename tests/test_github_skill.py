@@ -37,7 +37,7 @@ def test_render_failure_is_upstream_error(gh, monkeypatch):
     `guard` 认不出它是上游问题，按"内部 bug"处理：模型收到 `internal_error` +
     "工具内部错误（非输入问题），无需重试"，而正确动作恰恰是换个参数/路径再取。
     """
-    monkeypatch.setattr(gh, "_request", lambda path, params=None: ({}, {}))
+    monkeypatch.setattr(gh, "_request", lambda path, params=None, **_kw: ({}, {}))
 
     def boom(_data):
         raise gh._UpstreamError("解码失败")
@@ -54,7 +54,7 @@ def test_file_read_with_broken_base64_reports_upstream_error(gh, monkeypatch):
     monkeypatch.setattr(
         gh,
         "_request",
-        lambda path, params=None: (
+        lambda path, params=None, **_kw: (
             {
                 "type": "file",
                 "encoding": "base64",
@@ -74,7 +74,7 @@ def test_file_read_with_broken_base64_reports_upstream_error(gh, monkeypatch):
 
 def test_upstream_http_error_keeps_error_type(gh, monkeypatch):
     """上游 HTTP 失败（404 等）依旧是 upstream_error——`_translate` 那套分类没被上面的改动碰坏。"""
-    def not_found(path, params=None):
+    def not_found(path, params=None, **_kw):
         raise gh._UpstreamError("GitHub 说没有这个东西（404）")
 
     monkeypatch.setattr(gh, "_request", not_found)
@@ -88,7 +88,7 @@ def test_upstream_http_error_keeps_error_type(gh, monkeypatch):
 
 def test_successful_fetch_still_clips(gh, monkeypatch):
     """成功路径不受影响：正文照旧按 _MAX_CHARS 截断并注明。"""
-    monkeypatch.setattr(gh, "_request", lambda path, params=None: ({}, {}))
+    monkeypatch.setattr(gh, "_request", lambda path, params=None, **_kw: ({}, {}))
 
     out = gh._fetch("/x", lambda _d: "x" * (gh._MAX_CHARS + 10))
 
@@ -194,7 +194,7 @@ def test_submodule_is_not_reported_as_too_large(gh, monkeypatch):
     monkeypatch.setattr(
         gh,
         "_request",
-        lambda path, params=None: (
+        lambda path, params=None, **_kw: (
             {
                 "type": "submodule",
                 "path": "vendor/lib",
@@ -219,7 +219,7 @@ def test_symlink_is_reported_as_symlink(gh, monkeypatch):
     monkeypatch.setattr(
         gh,
         "_request",
-        lambda path, params=None: (
+        lambda path, params=None, **_kw: (
             {"type": "symlink", "path": "link.py", "target": "real/file.py", "size": 12},
             {},
         ),
@@ -237,7 +237,7 @@ def test_large_file_still_points_at_download_url(gh, monkeypatch):
     monkeypatch.setattr(
         gh,
         "_request",
-        lambda path, params=None: (
+        lambda path, params=None, **_kw: (
             {
                 "type": "file",
                 "path": "big.bin",
@@ -265,7 +265,7 @@ def test_tree_truncation_hint_and_dirty_entries(gh, monkeypatch):
     tree.append({"type": "blob"})  # 缺 path：曾经 item["path"] 会 KeyError → internal_error
     tree.append({"type": "tree", "path": "src"})  # 目录不该出现在文件列表里
     monkeypatch.setattr(
-        gh, "_request", lambda path, params=None: ({"tree": tree, "truncated": False}, {})
+        gh, "_request", lambda path, params=None, **_kw: ({"tree": tree, "truncated": False}, {})
     )
 
     out = gh.github_tree("octo", "demo")
@@ -274,3 +274,298 @@ def test_tree_truncation_hint_and_dirty_entries(gh, monkeypatch):
     assert "共 305 个文件" in out.content
     assert "用 path 缩小" in out.content
     assert "- src" not in out.content
+
+
+def test_tree_default_branch_lookup_failure_is_upstream_error(gh, monkeypatch):
+    """`ref` 留空时要先问一次默认分支——那一步失败同样得是 `upstream_error`。
+
+    回归防线：`_UpstreamError.error_type` 那个死参删掉后，这一处残留的 `exc.error_type` 会抛
+    AttributeError，被 guard 认成"内部 bug（无需重试）"——而事实是上游读不到，换个 ref 或稍后
+    重试才有意义。
+    """
+
+    def boom(path, params=None, **_kw):
+        raise gh._UpstreamError("GitHub 说没有这个东西（404）")
+
+    monkeypatch.setattr(gh, "_request", boom)
+
+    out = gh.github_tree("octo", "demo")
+
+    assert out.success is False
+    assert out.error_type == "upstream_error"
+    assert "404" in out.content
+
+
+# ---------------------- 列表族：PR 过滤、翻页提示、脏数据 ----------------------
+
+
+def test_issue_list_filters_out_pull_requests(gh, monkeypatch):
+    """GitHub 的 issues 接口会把 **PR 一起返回**——不滤掉的话模型会把 PR 当 issue 数错。"""
+    monkeypatch.setattr(
+        gh,
+        "_request",
+        lambda path, params=None, **_kw: (
+            [
+                {
+                    "number": 1,
+                    "title": "真 issue",
+                    "state": "open",
+                    "user": {"login": "octo"},
+                    "comments": 0,
+                },
+                {"number": 2, "title": "其实是 PR", "pull_request": {"url": "x"}},
+            ],
+            {},
+        ),
+    )
+
+    out = gh.github_issue_list("octo", "demo")
+
+    assert out.success is True
+    assert "真 issue" in out.content
+    assert "其实是 PR" not in out.content
+    assert "1 条 PR 已略去" in out.content
+
+
+def test_list_tool_hints_at_the_next_page(gh, monkeypatch):
+    """本页条数正好装满 limit → 必须提示还有下一页，否则等于悄悄截断。"""
+    items = [
+        {"number": i, "title": f"t{i}", "state": "open", "user": {"login": "a"}, "comments": 0}
+        for i in range(2)
+    ]
+    monkeypatch.setattr(gh, "_request", lambda path, params=None, **_kw: (items, {}))
+
+    out = gh.github_pr_list("octo", "demo", limit=2)
+
+    assert out.success is True
+    assert "page=2" in out.content
+
+
+def test_issue_list_survives_missing_upstream_fields(gh, monkeypatch):
+    """上游缺字段（没有 labels / 没有 user）不许变成 KeyError → internal_error。"""
+    monkeypatch.setattr(
+        gh, "_request", lambda path, params=None, **_kw: ([{"number": 3, "title": "裸 issue"}], {})
+    )
+
+    out = gh.github_issue_list("octo", "demo")
+
+    assert out.success is True
+    assert "裸 issue" in out.content
+
+
+# ---------------------- 参数校验：非法输入是 invalid_argument，不是 internal_error ----------------------
+
+
+def test_non_numeric_limit_is_invalid_argument(gh):
+    """`limit="abc"` 曾经抛裸 ValueError → guard 判成 internal_error（"无需重试"），与纪律相反。"""
+    out = gh.github_search_repos("x", limit="abc")
+
+    assert out.success is False
+    assert out.error_type == "invalid_argument"
+
+
+def test_non_numeric_number_is_invalid_argument(gh):
+    out = gh.github_pr_view("octo", "demo", "abc")
+
+    assert out.success is False
+    assert out.error_type == "invalid_argument"
+
+
+def test_owner_must_be_a_name_not_a_url(gh):
+    """把整条 URL 当 owner 传是最常见的错法——要当场点破，而不是拼条坏 URL 去撞 404。"""
+    out = gh.github_repo_view("https://github.com/octo", "demo")
+
+    assert out.success is False
+    assert out.error_type == "invalid_argument"
+    assert "不要给整条 URL" in out.content
+
+
+def test_branch_name_with_slash_is_escaped_in_tree_path(gh, monkeypatch):
+    """分支名 `feature/foo` 要整体转义成**一个**路径段——`quote(ref)` 默认不转义 `/`，会把 URL 拆开。"""
+    seen: list[str] = []
+    monkeypatch.setattr(
+        gh, "_request", lambda path, params=None, **_kw: (seen.append(path), {"tree": []})[1]
+    )
+
+    gh.github_tree("octo", "demo", ref="feature/foo")
+
+    assert seen[0].endswith("/git/trees/feature%2Ffoo")
+
+
+# ---------------------- PR diff / files ----------------------
+
+
+def test_pr_diff_goes_through_the_raw_text_channel(gh, monkeypatch):
+    """diff 不是 JSON：必须走原文通道，并带上 `v3.diff` 的 Accept（硬 json.loads 会炸）。"""
+    seen: list[dict] = []
+    monkeypatch.setattr(
+        gh,
+        "_request",
+        lambda path, params=None, **kw: (seen.append(kw), ("diff --git a/x b/x\n+1", {}))[1],
+    )
+
+    out = gh.github_pr_diff("octo", "demo", 3)
+
+    assert out.success is True
+    assert seen[0]["raw"] is True
+    assert seen[0]["accept"] == gh._DIFF_ACCEPT
+    assert "diff --git" in out.content
+
+
+def test_pr_files_clips_each_patch(gh, monkeypatch):
+    """单个文件的 patch 太长只留开头一段——否则第一个文件就能吃掉整个回执预算。"""
+    long_patch = "\n".join(f"+line {i}" for i in range(200))
+    monkeypatch.setattr(
+        gh,
+        "_request",
+        lambda path, params=None, **_kw: (
+            [
+                {
+                    "filename": "a.py",
+                    "additions": 200,
+                    "deletions": 0,
+                    "status": "modified",
+                    "patch": long_patch,
+                },
+                {
+                    "filename": "b.py",
+                    "additions": 1,
+                    "deletions": 1,
+                    "status": "modified",
+                    "patch": "+x\n-y",
+                },
+            ],
+            {},
+        ),
+    )
+
+    out = gh.github_pr_files("octo", "demo", 5)
+
+    assert out.success is True
+    assert "a.py" in out.content and "b.py" in out.content
+    assert "已截断" in out.content
+
+
+# ---------------------- 写工具：结构性拒绝、回执、上游翻译 ----------------------
+
+
+def test_review_refuses_approve_without_sending_anything(gh, monkeypatch):
+    """APPROVE 是 §4 的**结构性拒绝**：压根不该发请求（不是"发了再等人拒"）。"""
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        gh, "_request", lambda path, params=None, **kw: (calls.append(kw), ({}, {}))[1]
+    )
+
+    out = gh.github_pr_review("octo", "demo", 7, "看着不错", event="APPROVE")
+
+    assert out.success is False
+    assert out.error_type == "invalid_argument"
+    assert "批准" in out.content
+    assert calls == []
+
+
+def test_review_posts_body_and_event(gh, monkeypatch):
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        gh,
+        "_request",
+        lambda path, params=None, **kw: (
+            calls.append({"path": path, **kw}),
+            ({"state": "CHANGES_REQUESTED", "html_url": "https://github.com/octo/demo/pull/7"}, {}),
+        )[1],
+    )
+
+    out = gh.github_pr_review("octo", "demo", 7, "第 12 行缺边界检查", event="REQUEST_CHANGES")
+
+    assert out.success is True
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["path"] == "/repos/octo/demo/pulls/7/reviews"
+    assert calls[0]["body"] == {"body": "第 12 行缺边界检查", "event": "REQUEST_CHANGES"}
+
+
+def test_pr_create_requires_a_body(gh):
+    """空描述 PR 由工具结构性挡掉（§2.2 #5），不靠提示词。"""
+    out = gh.github_pr_create("octo", "demo", "标题", "fix/x", "main", body="   ")
+
+    assert out.success is False
+    assert out.error_type == "invalid_argument"
+    assert "body" in out.content
+
+
+def test_pr_create_receipt_carries_number_and_url(gh, monkeypatch):
+    """回执要带 PR 号与 URL——人得拿它去点合并。"""
+    monkeypatch.setattr(
+        gh,
+        "_request",
+        lambda path, params=None, **_kw: (
+            {
+                "number": 12,
+                "title": "修登录",
+                "html_url": "https://github.com/octo/demo/pull/12",
+                "head": {"label": "fix/login"},
+                "base": {"label": "main"},
+                "state": "open",
+                "draft": False,
+            },
+            {},
+        ),
+    )
+
+    out = gh.github_pr_create("octo", "demo", "修登录", "fix/login", "main", body="动机：…")
+
+    assert out.success is True
+    assert "#12" in out.content
+    assert "https://github.com/octo/demo/pull/12" in out.content
+    assert "合并由人来做" in out.content
+
+
+def test_draft_switched_off_as_a_string_stays_off(gh, monkeypatch):
+    """MCP 层可能把 `"false"` 当字符串递进来——`bool("false")` 是 True，草稿开关会被悄悄打开。"""
+    seen: list[dict] = []
+    monkeypatch.setattr(
+        gh,
+        "_request",
+        lambda path, params=None, **kw: (
+            seen.append(kw["body"]),
+            ({"number": 1, "html_url": "u", "state": "open"}, {}),
+        )[1],
+    )
+
+    gh.github_pr_create("octo", "demo", "t", "b1", "main", body="动机", draft="false")
+
+    assert seen[0]["draft"] is False
+
+
+def test_write_422_is_translated_into_an_actionable_message(gh, monkeypatch):
+    """写操作的 422 与读操作的失败**下一步不同**：要说清"参数或目标状态不允许"。"""
+    monkeypatch.setattr(
+        gh.urllib.request,
+        "urlopen",
+        _urlopen_raising(_http_error(422, '{"message":"Validation Failed"}')),
+    )
+
+    out = gh.github_issue_comment("octo", "demo", 9, "看这里")
+
+    assert out.success is False
+    assert out.error_type == "upstream_error"
+    assert "422" in out.content
+    assert "不接受这次改动" in out.content
+
+
+def test_write_403_mentions_protected_branch_not_just_bad_token(gh, monkeypatch):
+    """写操作的 403 还可能是"分支受保护 / 没推送权限"——只提 token 会把模型引向错方向。"""
+    monkeypatch.setattr(
+        gh.urllib.request,
+        "urlopen",
+        _urlopen_raising(
+            _http_error(
+                403, '{"message":"protected branch"}', {"X-RateLimit-Remaining": "4999"}
+            )
+        ),
+    )
+
+    out = gh.github_issue_comment("octo", "demo", 9, "看这里")
+
+    assert out.success is False
+    assert "受保护" in out.content
+    assert "限流" not in out.content

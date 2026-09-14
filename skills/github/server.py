@@ -1,13 +1,17 @@
-"""GitHub 技能的**能力侧**：只读工具（仓库 / 目录树 / 文件 / 搜索 / issue / PR）。
+"""GitHub 技能的**能力侧**：12 个只读工具 + 3 个写工具（仓库 / 目录树 / 文件 / 搜索 / issue / PR）。
 
 由 `get_skill("github")` 按需拉起（`python -m skills.github.server`），不由模型直接执行。
 本文件**不读 `SKILL.md`**（§2.2 的不变量）：正文永远由 host 侧读、注入系统提示；server 只管工具。
 约束里"软"的那半（什么时候用、怎么写 PR 描述）在 `../SKILL.md`；"硬"的那半（哪些要审批、
 哪些直接拒）在 `app/agent/tool.json` 与本文件的实现里。
 
-**写操作（开 PR / 推送 / 合并 / 评论）尚未实现**——`SKILL.md` §1.2 列了它们，属下一期。
+写工具是 `github_pr_create` / `github_pr_review` / `github_issue_comment`（都要人批），越权的
+动作在工具内**结构性拒绝**（`github_pr_review` 不接受 `APPROVE`）。
+**没有"合并 PR"这个工具**：合并权留给人，最彻底的落点就是这个动作压根不存在——`github_pr_view`
+回的"可自动合并：true/false"够模型说清状况。**推送**也不在这里，那是核心的 `git_push`
+（平台无关、不持有任何凭证，理由见 docs/SKILL_DESIGN.md §8.3）。
 
-用 stdlib 的 `urllib.request` 而不是 PyGithub：只读 GET 用不上 SDK，而多一个三方依赖就要动
+用 stdlib 的 `urllib.request` 而不是 PyGithub：读写都只是现成的 REST 端点，多一个三方依赖就要动
 主 `pyproject.toml`（§9 已决：技能依赖进主 venv，不做隔离）——能不加就不加。
 """
 import base64
@@ -42,6 +46,10 @@ _USER_AGENT = "theta-agent"
 # 单次返回给模型的正文字符上限：GitHub 的 diff / 文件 / 目录树动辄几十 KB，
 # 整份塞进上下文既贵又没用（要更多可以再调一次、换参数）。
 _MAX_CHARS = 6000
+# 响应格式：默认走 JSON（`+json` 是 GitHub 推荐的稳定媒体类型）；PR 的区间 diff 是例外——
+# 它要 `v3.diff` 的**纯文本** patch，硬 `json.loads` 会炸，所以走 `_fetch_text`。
+_JSON_ACCEPT = "application/vnd.github+json"
+_DIFF_ACCEPT = "application/vnd.github.v3.diff"
 
 
 class _UpstreamError(Exception):
@@ -50,10 +58,6 @@ class _UpstreamError(Exception):
     单独一个异常类型是为了让"参数非法"（`InvalidArgumentError`，调用方自己造成的）与
     "上游不给"（令牌过期、限流、仓库不存在）在回执里区分得开——两者的下一步动作完全不同。
     """
-
-    def __init__(self, message: str, error_type: str = "upstream_error") -> None:
-        super().__init__(message)
-        self.error_type = error_type
 
 
 def _rate_limited_reason(exc: urllib.error.HTTPError, detail: str) -> str | None:
@@ -81,44 +85,83 @@ def _rate_limited_reason(exc: urllib.error.HTTPError, detail: str) -> str | None
     )
 
 
-def _request(path: str, params: dict | None = None, *, accept: str = "application/vnd.github+json"):
-    """发一次 GET，返回 (解析后的 JSON, 响应头)。"""
+def _http_error_message(exc: urllib.error.HTTPError, path: str, method: str) -> str:
+    """把上游 HTTP 错误翻成"下一步该干什么"的说明。
+
+    写操作（`method != "GET"`）多两种失败形态，且**下一步动作完全不同**，别混成一句"失败了"：
+    403 还可能是"分支受保护 / 没有推送权限"，422 是"参数或目标状态不允许"（base 分支不存在、
+    PR 已存在、issue 已关闭之类）。
+    """
+    detail = exc.read().decode("utf-8", errors="replace")[:200]
+    if exc.code == 404:
+        return f"GitHub 说没有这个东西（404）：{path} {detail}"
+    limited = _rate_limited_reason(exc, detail)
+    if limited is not None:
+        return limited
+    if exc.code in (401, 403):
+        reason = (
+            "令牌无效 / 过期，或权限不足（例如读私有仓库需要 repo 权限）"
+            if method == "GET"
+            else "令牌没有这个写权限，或目标分支受保护，或你没有推送权限"
+        )
+        return f"GitHub 拒绝了这次请求（{exc.code}，多半是{reason}）：{detail}"
+    if exc.code == 422 and method != "GET":
+        return (
+            f"GitHub 不接受这次改动（422，参数或目标状态不允许——例如目标分支不存在、"
+            f"同名 PR 已存在、issue 已关闭）：{detail}"
+        )
+    return f"GitHub 返回 {exc.code}：{detail}"
+
+
+def _request(
+    path: str,
+    params: dict | None = None,
+    *,
+    accept: str = _JSON_ACCEPT,
+    method: str = "GET",
+    body: dict | None = None,
+    raw: bool = False,
+):
+    """发一次 HTTP 请求，返回 (响应体, 响应头)。
+
+    - `body` 非空 → 带 JSON 请求体，`method` 默认该给 `POST`（写操作用 `_submit`）。
+    - `raw=True` → 响应体是**原文**（PR 的 diff 不是 JSON）；否则解析成 JSON。
+    """
     url = f"{_API}{path}"
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
-            "Accept": accept,
-            "User-Agent": _USER_AGENT,
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
+    payload = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": accept,
+        "User-Agent": _USER_AGENT,
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=payload, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=_TIMEOUT_SECONDS) as response:
-            body = response.read().decode("utf-8", errors="replace")
-            headers = dict(response.headers)
+            text = response.read().decode("utf-8", errors="replace")
+            status = getattr(response, "status", 200)
+            response_headers = dict(response.headers)
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:200]
-        if exc.code == 404:
-            raise _UpstreamError(f"GitHub 说没有这个东西（404）：{path} {detail}") from exc
-        limited = _rate_limited_reason(exc, detail)
-        if limited is not None:
-            raise _UpstreamError(limited) from exc
-        if exc.code in (401, 403):
-            raise _UpstreamError(
-                f"GitHub 拒绝了这次请求（{exc.code}，多半是令牌无效 / 过期，或权限不足"
-                f"——例如读私有仓库需要 repo 权限）：{detail}"
-            ) from exc
-        raise _UpstreamError(f"GitHub 返回 {exc.code}：{detail}") from exc
+        raise _UpstreamError(_http_error_message(exc, path, method)) from exc
     except urllib.error.URLError as exc:
         raise _UpstreamError(f"连不上 GitHub（网络问题）：{exc.reason}") from exc
 
+    if raw:
+        return text, response_headers
     try:
-        return json.loads(body), headers
+        return json.loads(text), response_headers
     except json.JSONDecodeError as exc:
-        raise _UpstreamError(f"GitHub 返回了非 JSON 内容（前 200 字）：{body[:200]}") from exc
+        if not text.strip():
+            raise _UpstreamError(
+                f"GitHub 返回了空响应体（HTTP {status}），没有内容可解析。"
+            ) from exc
+        raise _UpstreamError(
+            f"GitHub 返回了非 JSON 内容（HTTP {status}，前 200 字）：{text[:200]}"
+        ) from exc
 
 
 def _clip(text: str, limit: int = _MAX_CHARS) -> str:
@@ -128,20 +171,47 @@ def _clip(text: str, limit: int = _MAX_CHARS) -> str:
     return f"{text[:limit]}\n…（已截断，完整内容共 {len(text)} 字符；可用参数缩小范围再取）"
 
 
-def _fetch(path: str, render, params: dict | None = None) -> ToolResult:
-    """统一的"取一次 + 渲染"：上游/网络失败翻成 ToolResult，成功交给 render 出正文。
+def _dispatch(
+    path: str,
+    render,
+    params: dict | None = None,
+    *,
+    method: str = "GET",
+    body: dict | None = None,
+    accept: str = _JSON_ACCEPT,
+    raw: bool = False,
+) -> ToolResult:
+    """统一的"发一次 + 渲染"：上游/网络失败翻成 ToolResult，成功交给 render 出正文。
 
     **`render` 必须在 try 内调用**：它也会抛 `_UpstreamError`（如 `github_file_read` 撞上
-    解不开的 base64）。漏到 `_fetch` 外面就没人认得出这是上游问题——`guard` 会按"内部 bug"
+    解不开的 base64）。漏到这里外面就没人认得出这是上游问题——`guard` 会按"内部 bug"
     处理，模型收到的是 `internal_error` + "无需重试"，而事实恰恰相反（这个文件取不到，换参数
     或换个路径才有意义）。
     """
     try:
-        data, _headers = _request(path, params)
+        data, _headers = _request(path, params, accept=accept, method=method, body=body, raw=raw)
         content = render(data)
     except _UpstreamError as exc:
-        return ToolResult(success=False, error_type=exc.error_type, content=str(exc))
+        return ToolResult(success=False, error_type="upstream_error", content=str(exc))
     return ToolResult(success=True, content=_clip(content))
+
+
+def _fetch(path: str, render, params: dict | None = None) -> ToolResult:
+    """只读 GET + JSON 响应——只读工具都走这里。"""
+    return _dispatch(path, render, params)
+
+
+def _fetch_text(path: str, render, params: dict | None = None, *, accept: str) -> ToolResult:
+    """只读 GET + **原文**响应：PR 的区间 diff 是 patch 文本，不是 JSON。"""
+    return _dispatch(path, render, params, accept=accept, raw=True)
+
+
+def _submit(path: str, render, body: dict, *, method: str = "POST") -> ToolResult:
+    """写操作：发一次带 JSON 请求体的请求，把响应渲染成回执。
+
+    走到这里说明人已经批过了（写工具在 `tool.json` 里全是 `need_review: true`）。
+    """
+    return _dispatch(path, render, body=body, method=method)
 
 
 def _require(value: str, what: str) -> str:
@@ -153,6 +223,119 @@ def _require(value: str, what: str) -> str:
     if not text:
         raise InvalidArgumentError(f"{what} 不能为空")
     return text
+
+
+def _require_slug(value: str, what: str) -> str:
+    """`owner` / `repo` 这类**路径段**参数：非空，且不含 `/` 与空白。
+
+    它们会被拼进 API 路径（`/repos/{owner}/{repo}`），含 `/` 就把路径段拆开、请求会指到别处。
+    模型常见的错法是把整条 URL 当 owner 传（`https://github.com/octo`）——报错要直接点破这件事，
+    否则它只会看到一个莫名其妙的 404。
+    """
+    text = _require(value, what)
+    if "/" in text or any(char.isspace() for char in text):
+        raise InvalidArgumentError(
+            f"{what} 只能是名字本身（如 octo / demo），不能含 / 或空格——"
+            f"不要给整条 URL。收到的是 {text!r}"
+        )
+    return text
+
+
+def _one_of(value: str, what: str, allowed: tuple[str, ...], default: str, *, why: str = "") -> str:
+    """枚举参数校验（`state` / `event` 这类）：只接受白名单里的值，其余一律 `InvalidArgumentError`。
+
+    白名单不只是"替模型改错字"——`github_pr_review` 的 `event` 白名单就是 §4 的**结构性拒绝**：
+    越权的动作（`APPROVE`）压根不该发生，所以这里直接拒、不问人。`why` 用来说清理由。
+    """
+    text = (value or default).strip() or default
+    if text not in allowed:
+        raise InvalidArgumentError(
+            f"{what} 只能是 {' / '.join(allowed)}，收到的是 {text!r}。{why}".rstrip()
+        )
+    return text
+
+
+def _as_int(value, what: str, default: int, *, low: int, high: int) -> int:
+    """整数参数校验：解析失败 → `InvalidArgumentError`；越界**夹到**边界（上限是上游的限制）。
+
+    别用裸 `int()`：它抛的 `ValueError` 会被 guard 当成**内部 bug**（模型收到的是"无需重试"），
+    而这里明明是调用方参数不对、改一下就能重试。
+    """
+    if value is None or value == "":
+        return default
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise InvalidArgumentError(f"{what} 要是整数，收到的是 {value!r}") from exc
+    return max(low, min(number, high))
+
+
+def _positive_int(value, what: str) -> int:
+    """编号类参数（issue / PR 编号）：必须是正整数。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise InvalidArgumentError(f"{what} 必须是正整数，收到的是 {value!r}") from exc
+    if number <= 0:
+        raise InvalidArgumentError(f"{what} 必须是正整数（issue / PR 编号），收到的是 {number}")
+    return number
+
+
+def _page(value) -> int:
+    """页码（从 1 开始）。"""
+    return _as_int(value, "page", 1, low=1, high=100)
+
+
+def _as_bool(value, what: str, default: bool = False) -> bool:
+    """布尔参数校验。
+
+    别写 `bool(value)`：MCP 层可能把 `"false"` 当字符串递进来，而 `bool("false")` 是 **True**
+    ——那会把"开成草稿 PR"这类开关悄悄反过来。
+    """
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("true", "1", "yes"):
+        return True
+    if text in ("false", "0", "no"):
+        return False
+    raise InvalidArgumentError(f"{what} 要是 true / false，收到的是 {value!r}")
+
+
+def _more_hint(count: int, limit: int, page: int) -> str:
+    """本页条数**恰好等于** limit 时补一句翻页提示。
+
+    不提示的话模型会默认"就这些"——列表只给一页却不说还有下一页，等于悄悄截断。
+    """
+    if count < limit:
+        return ""
+    return f"\n（本页正好 {limit} 条，可能还有更多：用 page={page + 1} 接着看）"
+
+
+def _label_names(labels) -> str:
+    """把 issue / PR 的标签数组渲染成 `a、b`；没有标签 → `（无）`。
+
+    上游缺字段时不留 `None`（旧写法 `t['name']` 缺字段会 KeyError → 被 guard 当成内部 bug）。
+    """
+    names = [
+        ((label.get("name") if isinstance(label, dict) else str(label)) or "").strip()
+        for label in (labels or [])
+    ]
+    return "、".join(name for name in names if name) or "（无）"
+
+
+def _patch_excerpt(patch: str, limit_lines: int = 40) -> str:
+    """单个文件的 patch 片段（最多 limit_lines 行）。
+
+    整份 PR 的 patch 动辄上千行，每个文件都全带会把回执挤爆（`_clip` 只会从后面一刀切）——
+    所以每个文件只留开头一段，剩下的靠 `github_pr_diff` 取。
+    """
+    lines = patch.splitlines()
+    if len(lines) <= limit_lines:
+        return patch
+    return "\n".join(lines[:limit_lines]) + f"\n…（这个文件的 patch 共 {len(lines)} 行，已截断）"
 
 
 mcp = FastMCP("GitHub")
@@ -171,7 +354,7 @@ def github_repo_view(owner: str, repo: str) -> ToolResult:
         owner: 仓库属主（用户或组织名），如 `octo`。**不要**给整条 URL。
         repo: 仓库名，如 `demo`。与 owner 合成 `octo/demo`。
     """
-    owner, repo = _require(owner, "owner"), _require(repo, "repo")
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
 
     def render(data) -> str:
         return (
@@ -198,14 +381,15 @@ def github_tree(owner: str, repo: str, ref: str = "", path: str = "") -> ToolRes
         ref: 可选，看哪个版本：分支名 / tag / commit SHA 都行。留空 = 仓库的默认分支。
         path: 可选，只看某个子目录（相对仓库根的路径，如 `src/agent`）。留空 = 整棵树。
     """
-    owner, repo = _require(owner, "owner"), _require(repo, "repo")
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
     ref = (ref or "").strip()
 
     if not ref:
+        # 先问一次默认分支（同 `_dispatch` 的收口口径：上游失败一律 upstream_error）。
         try:
             repo_data, _headers = _request(f"/repos/{owner}/{repo}")
         except _UpstreamError as exc:
-            return ToolResult(success=False, error_type=exc.error_type, content=str(exc))
+            return ToolResult(success=False, error_type="upstream_error", content=str(exc))
         ref = repo_data.get("default_branch") or "HEAD"
 
     def render(data) -> str:
@@ -230,22 +414,29 @@ def github_tree(owner: str, repo: str, ref: str = "", path: str = "") -> ToolRes
         truncated = "\n（GitHub 提示这棵树被截断了，内容可能不全）" if data.get("truncated") else ""
         return f"{owner}/{repo}@{ref} 的文件（{len(paths)} 个）：\n{head}{more}{truncated}"
 
-    return _fetch(f"/repos/{owner}/{repo}/git/trees/{urllib.parse.quote(ref)}", render, {"recursive": 1})
+    # ref 是**一个路径段**（分支名常含 `/`，如 feature/foo）：必须 safe="" 转义掉，
+    # 否则 URL 会被拆成多段、指到别的端点上。下面 file_read 那处的 quote 保留 `/` 是对的
+    # ——path 本来就是多段路径。
+    return _fetch(
+        f"/repos/{owner}/{repo}/git/trees/{urllib.parse.quote(ref, safe='')}",
+        render,
+        {"recursive": 1},
+    )
 
 
 @mcp.tool()
 @guard
 def github_file_read(owner: str, repo: str, path: str, ref: str = "") -> ToolResult:
     """
-    **不克隆就读远端单个文件的正文**（走 contents 接口）。大文件（>1MB）GitHub 不给正文，
-    会回一个可直接下载的地址；子模块 / 符号链接会如实说明它是什么（不是文件读不到）。
+    **不克隆就读远端单个文件的正文**（走 contents 接口）。大文件（1–100MB）GitHub 不给正文、
+    只回一个下载地址（超过 100MB 直接报错）；子模块 / 符号链接会如实说明它是什么（不是文件读不到）。
     Args:
         owner: 仓库属主（用户或组织名），如 `octo`。
         repo: 仓库名，如 `demo`。
         path: 文件路径（相对仓库根，如 `src/agent/graph.py`）。给目录会退化成"列这一层目录"。
         ref: 可选，读哪个版本：分支名 / tag / commit SHA。留空 = 默认分支。
     """
-    owner, repo = _require(owner, "owner"), _require(repo, "repo")
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
     path = _require(path, "path").strip("/")
     ref = (ref or "").strip()
 
@@ -273,10 +464,12 @@ def github_file_read(owner: str, repo: str, path: str, ref: str = "") -> ToolRes
                 f"要读内容请直接读那个目标路径。"
             )
         if data.get("encoding") == "none":
-            # 大文件：GitHub 不给 base64（encoding=none），但给了一个可直接下载的地址
+            # 大文件：GitHub 不给 base64（encoding=none）。它通常会给一个可直接下载的地址，
+            # 但那个字段**可能缺席**——旧写法会把 None 打进正文，模型就照着去取一个 "None"。
+            where = data.get("download_url")
+            hint = f"可用下面这个地址取：{where}" if where else "换个 ref，或用本地的 git 拿它。"
             return (
-                f"{data.get('path')} 太大，API 不返回正文（{data.get('size')} 字节）。\n"
-                f"可用下面这个地址取：{data.get('download_url')}"
+                f"{data.get('path')} 太大，API 不返回正文（{data.get('size')} 字节）。{hint}"
             )
         return (
             f"{data.get('path')} 读不到正文：GitHub 返回的条目类型是 {kind!r}（不是普通文件）。\n"
@@ -297,14 +490,14 @@ def github_search_repos(query: str, limit: int = 10) -> ToolResult:
         limit: 最多列几条，1–30（超出会被夹到 30）。
     """
     query = _require(query, "query")
-    limit = max(1, min(int(limit or 10), 30))
+    limit = _as_int(limit, "limit", 10, low=1, high=30)
 
     def render(data) -> str:
         items = data.get("items") or []
         if not items:
             return f"没有搜到匹配 {query!r} 的仓库"
         lines = [
-            f"- {item['full_name']}（★{item['stargazers_count']}）："
+            f"- {item.get('full_name')}（★{item.get('stargazers_count')}）："
             f"{(item.get('description') or '').strip()[:100]}"
             for item in items[:limit]
         ]
@@ -324,14 +517,15 @@ def github_search_code(query: str, limit: int = 10) -> ToolResult:
         limit: 最多列几条，1–30（超出会被夹到 30）。
     """
     query = _require(query, "query")
-    limit = max(1, min(int(limit or 10), 30))
+    limit = _as_int(limit, "limit", 10, low=1, high=30)
 
     def render(data) -> str:
         items = data.get("items") or []
         if not items:
             return f"没有搜到匹配 {query!r} 的代码"
         lines = [
-            f"- {item['repository']['full_name']}: {item['path']}" for item in items[:limit]
+            f"- {(item.get('repository') or {}).get('full_name')}: {item.get('path')}"
+            for item in items[:limit]
         ]
         return f"搜到 {data.get('total_count')} 处代码，前 {len(lines)} 处：\n" + "\n".join(lines)
 
@@ -349,10 +543,8 @@ def github_issue_view(owner: str, repo: str, number: int) -> ToolResult:
         repo: 仓库名，如 `demo`。
         number: issue 编号（正整数），如 `42`。
     """
-    owner, repo = _require(owner, "owner"), _require(repo, "repo")
-    number = int(number or 0)
-    if number <= 0:
-        raise InvalidArgumentError("number 必须是正整数（issue / PR 编号）")
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
+    number = _positive_int(number, "number")
 
     def render(data) -> str:
         body = (data.get("body") or "").strip()
@@ -360,7 +552,7 @@ def github_issue_view(owner: str, repo: str, number: int) -> ToolResult:
             f"#{data.get('number')} {data.get('title')}　[{data.get('state')}]\n"
             f"作者：{(data.get('user') or {}).get('login')}　评论：{data.get('comments')}　"
             f"更新：{data.get('updated_at')}\n"
-            f"标签：{'、'.join(t['name'] for t in data.get('labels') or []) or '（无）'}\n\n{body}"
+            f"标签：{_label_names(data.get('labels'))}\n\n{body}"
         )
 
     return _fetch(f"/repos/{owner}/{repo}/issues/{number}", render)
@@ -376,10 +568,8 @@ def github_pr_view(owner: str, repo: str, number: int) -> ToolResult:
         repo: 仓库名，如 `demo`。
         number: PR 编号（正整数）。
     """
-    owner, repo = _require(owner, "owner"), _require(repo, "repo")
-    number = int(number or 0)
-    if number <= 0:
-        raise InvalidArgumentError("number 必须是正整数（PR 编号）")
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
+    number = _positive_int(number, "number")
 
     def render(data) -> str:
         head = data.get("head") or {}
@@ -397,6 +587,341 @@ def github_pr_view(owner: str, repo: str, number: int) -> ToolResult:
         )
 
     return _fetch(f"/repos/{owner}/{repo}/pulls/{number}", render)
+
+
+# ---------------------- 只读：列表族（SKILL.md §1.1；全部免审批） ----------------------
+
+
+@mcp.tool()
+@guard
+def github_issue_list(
+    owner: str,
+    repo: str,
+    state: str = "open",
+    labels: str = "",
+    limit: int = 20,
+    page: int = 1,
+) -> ToolResult:
+    """
+    列一个仓库的 issue，按最近更新排序。
+    ⚠️ GitHub 的这个接口会把 **PR 也当成 issue 一起返回**——本工具已经替你滤掉了，你看到的就是
+    纯 issue；要找 PR 请用 `github_pr_list`。
+    Args:
+        owner: 仓库属主（用户或组织名），如 `octo`。
+        repo: 仓库名，如 `demo`。
+        state: `open` / `closed` / `all`，默认 `open`。
+        labels: 可选，按标签过滤，多个用逗号分隔（如 `bug,help wanted`）。
+        limit: 一页最多几条，1–100（默认 20）。
+        page: 第几页，从 1 开始；本页正好装满时回执会提示还有下一页。
+    """
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
+    state = _one_of(state, "state", ("open", "closed", "all"), "open")
+    limit = _as_int(limit, "limit", 20, low=1, high=100)
+    page = _page(page)
+    labels = (labels or "").strip()
+
+    def render(data) -> str:
+        raw = data if isinstance(data, list) else []
+        items = [item for item in raw if "pull_request" not in item]
+        hidden = len(raw) - len(items)
+        note = f"，另有 {hidden} 条 PR 已略去（要 PR 用 github_pr_list）" if hidden else ""
+        if not items:
+            return f"{owner}/{repo} 没有 {state} 状态的 issue{note}"
+        lines = []
+        for item in items:
+            labels_txt = _label_names(item.get("labels"))
+            tag = f"　标签：{labels_txt}" if labels_txt != "（无）" else ""
+            lines.append(
+                f"- #{item.get('number')} {item.get('title')}　[{item.get('state')}]　"
+                f"{(item.get('user') or {}).get('login')}　评论 {item.get('comments')}　"
+                f"更新 {item.get('updated_at')}{tag}"
+            )
+        return (
+            f"{owner}/{repo} 的 {state} issue（本页 {len(items)} 条{note}）：\n"
+            + "\n".join(lines)
+            + _more_hint(len(raw), limit, page)
+        )
+
+    params = {"state": state, "per_page": limit, "page": page}
+    if labels:
+        params["labels"] = labels
+    return _fetch(f"/repos/{owner}/{repo}/issues", render, params)
+
+
+@mcp.tool()
+@guard
+def github_pr_list(
+    owner: str, repo: str, state: str = "open", limit: int = 20, page: int = 1
+) -> ToolResult:
+    """
+    列一个仓库的 PR，按最近更新排序（"有哪些在等我审 / 谁还在等合并"先看它）。
+    Args:
+        owner: 仓库属主（用户或组织名），如 `octo`。
+        repo: 仓库名，如 `demo`。
+        state: `open` / `closed` / `all`，默认 `open`。
+        limit: 一页最多几条，1–100（默认 20）。
+        page: 第几页，从 1 开始。
+    """
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
+    state = _one_of(state, "state", ("open", "closed", "all"), "open")
+    limit = _as_int(limit, "limit", 20, low=1, high=100)
+    page = _page(page)
+
+    def render(data) -> str:
+        items = data if isinstance(data, list) else []
+        if not items:
+            return f"{owner}/{repo} 没有 {state} 状态的 PR"
+        lines = [
+            f"- #{item.get('number')} {item.get('title')}　[{item.get('state')}"
+            f"{'，草稿' if item.get('draft') else ''}]　"
+            f"{(item.get('head') or {}).get('label')} → {(item.get('base') or {}).get('label')}　"
+            f"{(item.get('user') or {}).get('login')}　更新 {item.get('updated_at')}"
+            for item in items
+        ]
+        return (
+            f"{owner}/{repo} 的 {state} PR（本页 {len(items)} 条）：\n"
+            + "\n".join(lines)
+            + _more_hint(len(items), limit, page)
+        )
+
+    return _fetch(
+        f"/repos/{owner}/{repo}/pulls",
+        render,
+        {"state": state, "per_page": limit, "page": page},
+    )
+
+
+@mcp.tool()
+@guard
+def github_pr_diff(owner: str, repo: str, number: int) -> ToolResult:
+    """
+    看一个 PR 的**完整 diff**（`base…head` 区间、所有改动文件）。
+    这是本地 `git_diff` 给不了的：它只知道你自己的工作树，看不到两个分支之间的**区间**，
+    更看不到别人的 PR。正文太长会被截断；只想先知道"动了哪些文件、各增删几行"用
+    `github_pr_files` 更省。
+    Args:
+        owner: 仓库属主（用户或组织名），如 `octo`。
+        repo: 仓库名，如 `demo`。
+        number: PR 编号（正整数）。
+    """
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
+    number = _positive_int(number, "number")
+
+    def render(text: str) -> str:
+        if not text.strip():
+            return f"PR #{number} 的 diff 是空的（两个分支内容相同，或这个 PR 没有改动）"
+        return f"PR #{number} 的 diff（{owner}/{repo}）：\n\n{text}"
+
+    return _fetch_text(f"/repos/{owner}/{repo}/pulls/{number}", render, accept=_DIFF_ACCEPT)
+
+
+@mcp.tool()
+@guard
+def github_pr_files(
+    owner: str, repo: str, number: int, limit: int = 20, page: int = 1
+) -> ToolResult:
+    """
+    列一个 PR 改了哪些文件、各增删多少行，并附每个文件 patch 的开头一段。
+    想知道"这个 PR 动了什么"先看它；要看完整 diff 用 `github_pr_diff`。
+    Args:
+        owner: 仓库属主（用户或组织名），如 `octo`。
+        repo: 仓库名，如 `demo`。
+        number: PR 编号（正整数）。
+        limit: 一页最多几个文件，1–100（默认 20）。
+        page: 第几页，从 1 开始。
+    """
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
+    number = _positive_int(number, "number")
+    limit = _as_int(limit, "limit", 20, low=1, high=100)
+    page = _page(page)
+
+    def render(data) -> str:
+        items = data if isinstance(data, list) else []
+        if not items:
+            return f"PR #{number} 没有改动文件（或这一页没有更多了）"
+        lines: list[str] = []
+        for item in items:
+            lines.append(
+                f"- {item.get('filename')}（+{item.get('additions')} / -{item.get('deletions')}，"
+                f"{item.get('status')}）"
+            )
+            patch = (item.get("patch") or "").strip()
+            if patch:
+                excerpt = _patch_excerpt(patch).replace("\n", "\n    ")
+                lines.append(f"    ```diff\n    {excerpt}\n    ```")
+        return (
+            f"PR #{number} 改了 {len(items)} 个文件：\n"
+            + "\n".join(lines)
+            + _more_hint(len(items), limit, page)
+        )
+
+    return _fetch(
+        f"/repos/{owner}/{repo}/pulls/{number}/files",
+        render,
+        {"per_page": limit, "page": page},
+    )
+
+
+@mcp.tool()
+@guard
+def github_release_list(owner: str, repo: str, limit: int = 10, page: int = 1) -> ToolResult:
+    """
+    列一个仓库的 release（"这库现在什么版本、最近发了什么"），从新到旧。
+    Args:
+        owner: 仓库属主（用户或组织名），如 `octo`。
+        repo: 仓库名，如 `demo`。
+        limit: 一页最多几条，1–100（默认 10）。
+        page: 第几页，从 1 开始。
+    """
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
+    limit = _as_int(limit, "limit", 10, low=1, high=100)
+    page = _page(page)
+
+    def render(data) -> str:
+        items = data if isinstance(data, list) else []
+        if not items:
+            return f"{owner}/{repo} 还没有发布 release"
+        lines = []
+        for item in items:
+            kind = "草稿" if item.get("draft") else ("预发布" if item.get("prerelease") else "正式")
+            lines.append(
+                f"- {item.get('tag_name')}　{item.get('name') or '（无标题）'}　[{kind}]　"
+                f"发布 {item.get('published_at') or item.get('created_at')}"
+            )
+        return (
+            f"{owner}/{repo} 的 release（本页 {len(items)} 条）：\n"
+            + "\n".join(lines)
+            + _more_hint(len(items), limit, page)
+        )
+
+    return _fetch(f"/repos/{owner}/{repo}/releases", render, {"per_page": limit, "page": page})
+
+
+# ---------------------- 写工具（SKILL.md §1.2；全部 need_review: true） ----------------------
+#
+# §4 的**结构性拒绝**（最硬的那类：压根不问人）落在这里：
+# - `github_pr_review` 的 event 只认 COMMENT / REQUEST_CHANGES——APPROVE 是人的权力；
+# - **没有"合并 PR"这个工具**——合并权留给人，最彻底的落点是这个动作压根不存在。
+# 审批闸门（第二类）在 app/agent/tool.json：三个都是 need_review: true。
+
+
+_ALLOWED_REVIEW_EVENTS = ("COMMENT", "REQUEST_CHANGES")
+
+
+@mcp.tool()
+@guard
+def github_pr_create(
+    owner: str,
+    repo: str,
+    title: str,
+    head: str,
+    base: str,
+    body: str,
+    draft: bool = False,
+) -> ToolResult:
+    """
+    开一个 PR（**写操作，需人工审批**）。`head` 必须是你**已经推上去**的分支（先 `git_push`），
+    `base` 是要合进的目标分支（通常是默认分支，用 `github_repo_view` 确认）。
+    `body` **必填**：空描述的 PR 等于把成本转嫁给 reviewer——写清 ① 改动的动机
+    ② 怎么验证的（跑了什么、结果如何）③ 遗留事项 / 要 reviewer 特别看的地方。
+    一轮里只做一个远端改动（做一步、验一步、报一步），别批量开 PR。
+    Args:
+        owner: 仓库属主（用户或组织名），如 `octo`。
+        repo: 仓库名，如 `demo`。
+        title: PR 标题（一行说清改了什么）。
+        head: 源分支名（远端已有的那个，如 `fix/login`；不要写成 `owner:branch`）。
+        base: 目标分支名（如 `main`）。
+        body: PR 描述（必填，见上）。
+        draft: 是否开成草稿 PR，默认 False。
+    """
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
+    title = _require(title, "title")
+    head = _require(head, "head")
+    base = _require(base, "base")
+    body = (body or "").strip()
+    if not body:
+        raise InvalidArgumentError(
+            "body 不能为空：PR 描述要写清 ① 动机 ② 怎么验证的 ③ 遗留事项——"
+            "空描述的 PR 把成本转嫁给了 reviewer。真只是占位就先别开 PR。"
+        )
+    if head == base:
+        raise InvalidArgumentError("head 与 base 不能是同一个分支——PR 得有可比的改动")
+    draft = _as_bool(draft, "draft")
+
+    def render(data) -> str:
+        return (
+            f"已开 PR #{data.get('number')}：{data.get('title')}\n"
+            f"{data.get('html_url')}\n"
+            f"{(data.get('head') or {}).get('label')} → {(data.get('base') or {}).get('label')}　"
+            f"状态 {data.get('state')}{'（草稿）' if data.get('draft') else ''}\n"
+            f"合并由人来做——把这个链接给用户，别自己去合。"
+        )
+
+    payload = {"title": title, "head": head, "base": base, "body": body, "draft": draft}
+    return _submit(f"/repos/{owner}/{repo}/pulls", render, payload)
+
+
+@mcp.tool()
+@guard
+def github_pr_review(
+    owner: str, repo: str, number: int, body: str, event: str = "COMMENT"
+) -> ToolResult:
+    """
+    给一个 PR 提交评审意见（**写操作，需人工审批**）。
+    `event` 只能是 `COMMENT`（留意见）或 `REQUEST_CHANGES`（要求修改）——**"批准"（APPROVE）
+    不在本工具的能力范围内**：批准与合并一样是人的权力，传 APPROVE 会被直接拒绝。
+    意见要具体：指到文件与行、说清"这里为什么有问题"，别只写"看起来不错"。
+    Args:
+        owner: 仓库属主（用户或组织名），如 `octo`。
+        repo: 仓库名，如 `demo`。
+        number: PR 编号（正整数）。
+        body: 评审意见正文。
+        event: `COMMENT` / `REQUEST_CHANGES`，默认 `COMMENT`。
+    """
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
+    number = _positive_int(number, "number")
+    event = _one_of(
+        event,
+        "event",
+        _ALLOWED_REVIEW_EVENTS,
+        "COMMENT",
+        why="批准是人的权力——APPROVE 不在本工具的能力范围内，也别绕道用别的工具去批。",
+    )
+    body = _require(body, "body")
+
+    def render(data) -> str:
+        return (
+            f"已在 PR #{number} 留下评审意见（{data.get('state') or event}）："
+            f"{data.get('html_url')}\n这只是意见——能不能合并由人决定。"
+        )
+
+    return _submit(
+        f"/repos/{owner}/{repo}/pulls/{number}/reviews",
+        render,
+        {"body": body, "event": event},
+    )
+
+
+@mcp.tool()
+@guard
+def github_issue_comment(owner: str, repo: str, number: int, body: str) -> ToolResult:
+    """
+    在 issue 或 PR 下留言（**写操作，需人工审批**）。GitHub 里 PR 就是 issue，所以给 PR 留言
+    也走这个工具；但要指出"哪一行有什么问题"的**评审意见**请用 `github_pr_review`。
+    Args:
+        owner: 仓库属主（用户或组织名），如 `octo`。
+        repo: 仓库名，如 `demo`。
+        number: issue / PR 编号（正整数）。
+        body: 留言正文。说清"为什么"，别做"我看看"这种没有信息量的回复。
+    """
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
+    number = _positive_int(number, "number")
+    body = _require(body, "body")
+
+    def render(data) -> str:
+        return f"已留言（{data.get('html_url')}）：\n{body}"
+
+    return _submit(f"/repos/{owner}/{repo}/issues/{number}/comments", render, {"body": body})
 
 
 if __name__ == "__main__":
