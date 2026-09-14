@@ -135,6 +135,10 @@
         "need_review":true,
         "source":"mcp_service/git"
     },
+    "git_clone":{
+        "need_review":true,
+        "source":"mcp_service/git"
+    },
     "web_search":{
         "need_review":true,
         "source":"mcp_service/web_search"

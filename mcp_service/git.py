@@ -16,6 +16,10 @@ git 仓库——工作区可能是一个"项目集合"目录，仓库散落在�
   追加 Co-authored-by: Theta 合作者尾注）
 - git_switch   切换当前分支（写操作，需审批）
 - git_pull     从远程拉取并合并到当前分支（写操作，需审批）
+- git_push     把本地分支推到**远程仓库地址**（写操作，需审批；地址作参数、凭证走设备、
+  不带 -u 所以不写 .git/config）
+- git_clone    把远程仓库克隆到**工作区内**（写操作，需审批；目标目录经沙箱校验，
+  且会在成功后刷新"已知仓库"缓存）
 
 查找规则：
 - 从工作区根向下遍历，含 .git 条目的目录即视为一个仓库（.git 是文件也认，
@@ -501,6 +505,121 @@ async def git_push(repo_path: str, url: str, branch: str = "") -> ToolResult:
             f"注意：本次推送**不设置上游跟踪**——之后要拉取请给 git_pull 显式的 remote/branch，"
             f"或让人手动执行一次 git push -u。"
         ),
+    )
+
+
+# clone 的超时比其它同步操作长得多：它是**从零拉整棵树**，大仓库动辄几分钟
+# （pull / fetch 只拉增量，60 秒够用；clone 不够）。
+_CLONE_TIMEOUT = 300
+
+
+def _clone_dir_name(url: str) -> str:
+    """从地址推一个默认的目标目录名：取最后一段、去掉 `.git`。推不出来 → 空串。
+
+    `https://host/owner/repo.git` 与 `git@host:owner/repo.git` 都给 `repo`。
+    """
+    name = url.rstrip("/").rsplit("/", 1)[-1]
+    name = name.rsplit(":", 1)[-1]  # scp 语法 git@host:owner/repo
+    return name.removesuffix(".git").strip()
+
+
+def _resolve_clone_target(dest: str) -> Path:
+    """把克隆的目标目录解析成**工作区内**的绝对路径；越界/空 → InvalidArgumentError。
+
+    ⚠️ 这条沙箱校验必须在这里自己做：git.py 其它工具都作用在**已存在**的仓库上，靠
+    `_ensure_known_repo` 兜住了"必须落在我扫到的仓库里"；clone 是第一个**创建新目录**的工具，
+    没有这层就是一条"往工作区外面写文件"的通路。
+    """
+    raw = (dest or "").strip()
+    if not raw:
+        raise InvalidArgumentError("目标目录为空，也没能从地址推出目录名——请显式给 dest")
+    path = Path(raw).expanduser()
+    target = (path if path.is_absolute() else WORKSPACE_PATH / path).resolve()
+    if not target.is_relative_to(WORKSPACE_PATH.resolve()):
+        raise InvalidArgumentError(
+            f"目标目录 {target} 不在工作区 {WORKSPACE_PATH} 内——不能把仓库克隆到工作区外面"
+        )
+    return target
+
+
+@mcp.tool()
+@guard
+async def git_clone(url: str, dest: str = "") -> ToolResult:
+    """
+    把一个远程仓库克隆到工作区里（写操作，需人工审批）。
+
+    **先想一下要不要克隆**：只想看一眼代码/某个文件时，用远端读工具（`github_tree` /
+    `github_file_read`，需先加载对应的平台技能）比克隆快得多、也不占地方。克隆适合"要在这里改
+    代码、跑测试"那种确实要一份完整工作树的情况。
+    Args:
+        url: 远程仓库的**完整地址**（https 或 ssh），如 `https://github.com/owner/repo.git`。
+            地址里**不要写 token / 密码**（会被直接拒绝）：认证交给设备上的凭据
+            （credential helper / ssh 密钥），缺凭据会快速失败并回显原因。
+        dest: 克隆到哪个目录——**工作区内**的相对路径（或工作区内的绝对路径）；必须是空目录或
+            尚不存在。留空 = 用地址里的仓库名（`https://host/owner/repo.git` → `repo`）。
+    """
+    target_url = (url or "").strip()
+    if not target_url:
+        raise InvalidArgumentError(
+            "url 不能为空：要给远程仓库的完整地址（如 https://github.com/owner/repo.git）"
+        )
+    _reject_credentials_in_url(target_url)
+
+    target = _resolve_clone_target(dest or _clone_dir_name(target_url))
+    if target.exists() and any(target.iterdir()):
+        return ToolResult(
+            success=False,
+            content=f"{target} 已存在且非空，未克隆（git clone 也只在空目录或新目录上工作）。",
+        )
+
+    try:
+        repo = await asyncio.wait_for(
+            asyncio.to_thread(git.Repo.clone_from, target_url, str(target)),
+            timeout=_CLONE_TIMEOUT,
+        )
+    except TimeoutError:
+        return ToolResult(
+            success=False,
+            content=(
+                f"clone 超时（{_CLONE_TIMEOUT} 秒）——仓库较大或网络慢，后台可能仍在下载，"
+                f"{target} 里可能留下半个仓库；确认后再决定重试还是删掉。"
+            ),
+        )
+    except GitCommandError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else str(exc)
+        return ToolResult(success=False, content=f"clone 失败：{stderr}")
+
+    # 刷新"已知仓库"缓存（它只在未命中时才重扫）：不刷的话 list_repos 要到某次未命中才认得新仓库
+    _get_repos(refresh=True)
+    _REPOS_CACHE[str(target)] = repo
+
+    def _after() -> str:
+        if not repo.head.is_valid():
+            # 两种可能，别混为一谈：
+            # ① 远端确实一条提交都没有 → 空仓库；
+            # ② 远端**有**提交，但它的 HEAD 指向一个不存在的分支（裸仓库 `git init` 后没设默认
+            #    分支就是这样）——那时 git 克隆会成功却**不检出**，工作树是空的，只在 stderr
+            #    里丢一句 warning。说成"空仓库"是错的，模型会白跑一趟。所以列出远端真实分支。
+            heads = sorted(
+                ref.name.split("/", 1)[-1]
+                for ref in repo.remotes.origin.refs
+                if ref.name.split("/", 1)[-1] != "HEAD"
+            )
+            if not heads:
+                return "远端还没有任何提交（克隆到的是一个空仓库）"
+            return (
+                f"⚠️ 克隆下来了，但远端 HEAD 指向的分支不存在（远端没设默认分支），"
+                f"所以工作树是空的。远端实际有这些分支：{'、'.join(heads)}——"
+                f"用 git_switch 切到一个分支就能看到内容。"
+            )
+        if repo.head.is_detached:
+            return f"当前处于游离 HEAD（{repo.head.commit.hexsha[:8]}）"
+        commit = repo.head.commit
+        return f"当前分支 {repo.active_branch.name}，最新提交 {commit.hexsha[:8]} {commit.summary}"
+
+    return ToolResult(
+        success=True,
+        content=f"已克隆到 {target}（来自 {target_url}）。{await asyncio.to_thread(_after)}",
     )
 
 
