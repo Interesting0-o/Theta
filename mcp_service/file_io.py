@@ -64,6 +64,44 @@ def _is_in_workspace(path: Path) -> None:
     if not path.is_relative_to(WORKSPACE_PATH):
         raise WorkspaceViolationError(str(path), str(WORKSPACE_PATH))
 
+#----------------------二进制探测----------------------
+
+def _is_binary(data: bytes) -> bool:
+    """粗略二进制探测：头部 4KB 里出现 NUL 字节即按二进制处理。
+
+    原 search_content 的内联判定；read_file 也要用（同一语义），故提取成共享函数——
+    两处口径必须一致，改一处漏一处就会出现"搜索跳过、read_file 炸掉"的分裂行为。
+    """
+    return b"\x00" in data[:4096]
+
+
+# 常见二进制格式的魔数前缀（给回执一句"它是什么"的粗提示；只求可读不求精确）。
+# 会被 NUL 探测放行的"真文本"到不了这里，所以 BM/MZ 这类宽松前缀不会误伤文本文件。
+_MAGIC_PREFIXES: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "PNG 图片"),
+    (b"\xff\xd8\xff", "JPEG 图片"),
+    (b"GIF87a", "GIF 图片"),
+    (b"GIF89a", "GIF 图片"),
+    (b"BM", "BMP 图片"),
+    (b"%PDF", "PDF 文档"),
+    (b"PK\x03\x04", "ZIP 压缩包"),
+    (b"\x1f\x8b", "GZip 压缩包"),
+    (b"\x7fELF", "ELF 可执行文件"),
+    (b"MZ", "Windows 可执行文件"),
+    (b"\x00\x00\x01\x00", "ICO 图标"),
+)
+
+
+def _binary_kind(head: bytes) -> str:
+    """从文件头部魔数猜二进制类型；猜不出给"未知类型"（WebP 是 RIFF 容器，单独判）。"""
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "WebP 图片"
+    for prefix, kind in _MAGIC_PREFIXES:
+        if head.startswith(prefix):
+            return kind
+    return "未知类型"
+
+
 #---------------------MCP服务------------------------#
 
 mcp = FastMCP("FileIO")
@@ -274,6 +312,7 @@ def read_file(
 ) -> ToolResult:
     """
     读取指定路径的文件，可选只读某段行区间，避免大文件整段塞满上下文。
+    二进制文件（图片/压缩包等）与非 UTF-8 文本不会报错，返回说明性回执（类型 + 大小）。
     Args:
         path: 需要读取文件的路径。
         start_line: 可选，起始行号（从 1 计、含）；只传它则从该行读到文件尾。
@@ -292,11 +331,37 @@ def read_file(
     file_path = _resolve_path(path)  # 解析路径
     _is_in_workspace(file_path)  # 读取同样受工作区沙箱约束
 
+    # 先以字节探测，不再直接按文本打开：UnicodeDecodeError 不是 OSError 子类，旧实现里它会
+    # 冒到 guard 被误判成 internal_error（回执还是"无需重试"），模型读一张 PNG 会得出误导结论。
+    # 二进制只读头部 + stat 拿大小，不整读（几 GB 的文件也不怕）；NUL 探测放行的再整读解码。
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
+        with open(file_path, "rb") as f:
+            head = f.read(4096)
+        if _is_binary(head):
+            kind = _binary_kind(head)
+            size = file_path.stat().st_size
+            return ToolResult(
+                success=True,
+                content=f"{path} 是二进制文件（疑似 {kind}），大小 {size} 字节，无法作为文本读取",
+            )
+        with open(file_path, "rb") as f:
+            data = f.read()
+        # 旧实现按文本模式打开，universal newlines 会把 \r\n / \r 翻成 \n——编辑锚定与既有的
+        # 行号逻辑都建立在它上面，这里显式保持同一行为，别让字节读悄悄改掉行尾。
+        content = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     except OSError as e:
         return ToolResult(success=False, error_type="io_error", content=f"读取文件失败: {e}")
+    except UnicodeDecodeError:
+        # 没过 NUL 探测但解不开 UTF-8：多半是 GBK 等本地编码的文本。同样给可预期回执
+        # （要内容可走终端命令转码），不装作读到了、也不当内部错误。
+        size = file_path.stat().st_size
+        return ToolResult(
+            success=True,
+            content=(
+                f"{path} 不是 UTF-8 编码的文本（可能是 GBK/latin-1 等编码），"
+                f"大小 {size} 字节，无法按文本读取；如需内容可用终端命令转码"
+            ),
+        )
 
     # 未指定行区间：整文件原样返回（保持原有行为，不附加行号标题，避免污染编辑锚定）
     if start_line is None and end_line is None:
@@ -635,7 +700,7 @@ def search_content(
                 data = real.read_bytes()
             except OSError:
                 continue
-            if b"\x00" in data[:4096]:  # 粗略二进制探测，跳过
+            if _is_binary(data):  # 粗略二进制探测，跳过（口径与 read_file 共享）
                 continue
             text = data.decode("utf-8", errors="replace")
             text_lines = text.splitlines()

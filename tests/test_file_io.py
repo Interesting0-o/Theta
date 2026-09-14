@@ -261,6 +261,65 @@ def test_read_file_range_out_of_bounds_reports_empty(tmp_path):
     assert "共 5 行" in result.content
 
 
+# ---------------- read_file 二进制 / 非 UTF-8 的可预期回执 ----------------
+
+
+def test_read_file_binary_png_returns_receipt(tmp_path):
+    """读 PNG 给可预期回执（二进制 + 类型 + 大小），不再让 UnicodeDecodeError 冒成 internal_error。"""
+    target = tmp_path / "pic.png"
+    payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    target.write_bytes(payload)
+
+    result = read_file(str(target))
+
+    assert result.success is True
+    assert "二进制文件" in result.content and "PNG" in result.content
+    assert str(len(payload)) in result.content
+
+
+def test_read_file_unknown_binary_receipt(tmp_path):
+    target = tmp_path / "blob.bin"
+    target.write_bytes(b"abc" + b"\x00" * 8)
+
+    result = read_file(str(target))
+
+    assert result.success is True
+    assert "二进制文件" in result.content and "未知类型" in result.content
+
+
+def test_read_file_non_utf8_text_receipt(tmp_path):
+    """GBK 文本（无 NUL、NUL 探测放行）：给"不是 UTF-8"的回执而非 internal_error。"""
+    target = tmp_path / "gbk.txt"
+    target.write_bytes("你好，世界".encode("gbk"))
+
+    result = read_file(str(target))
+
+    assert result.success is True
+    assert "不是 UTF-8" in result.content
+
+
+def test_read_file_utf8_text_unaffected(tmp_path):
+    """修复不得波及正常路径：UTF-8 文本原样返回（编辑锚定依赖原文）。"""
+    target = tmp_path / "a.txt"
+    target.write_text("hello\nworld\n", encoding="utf-8")
+
+    result = read_file(str(target))
+
+    assert result.success is True
+    assert result.content == "hello\nworld\n"
+
+
+def test_read_file_binary_with_line_range_still_receipt(tmp_path):
+    """对二进制传行区间同样拿到回执（行区间对二进制无意义，不该走行逻辑）。"""
+    target = tmp_path / "pic.png"
+    target.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+
+    result = read_file(str(target), start_line=1, end_line=2)
+
+    assert result.success is True
+    assert "二进制文件" in result.content
+
+
 def test_read_file_invalid_bounds_are_invalid_argument(tmp_path):
     target = tmp_path / "x.txt"
     _write_5_lines(target)
