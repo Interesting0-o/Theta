@@ -340,6 +340,35 @@ def _patch_excerpt(patch: str, limit_lines: int = 40) -> str:
 
 mcp = FastMCP("GitHub")
 
+# ---------------------- 远端二进制探测（与本地 read_file 同款防线） ----------------------
+
+# 与 mcp_service/file_io.py::_MAGIC_PREFIXES 同一套魔数。**不能 import 它**：file_io 在 import 期
+# 就校验 WORKSPACE_PATH（技能子进程没有这个 env，import 即炸），所以这里复制一份——两处口径
+# 必须保持一致（本地与远端对"二进制"的判定若不同，模型会看到两套世界）。
+_MAGIC_PREFIXES: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "PNG 图片"),
+    (b"\xff\xd8\xff", "JPEG 图片"),
+    (b"GIF87a", "GIF 图片"),
+    (b"GIF89a", "GIF 图片"),
+    (b"BM", "BMP 图片"),
+    (b"%PDF", "PDF 文档"),
+    (b"PK\x03\x04", "ZIP 压缩包"),
+    (b"\x1f\x8b", "GZip 压缩包"),
+    (b"\x7fELF", "ELF 可执行文件"),
+    (b"MZ", "Windows 可执行文件"),
+    (b"\x00\x00\x01\x00", "ICO 图标"),
+)
+
+
+def _binary_kind(head: bytes) -> str:
+    """从文件头部魔数猜二进制类型；猜不出给"未知类型"（WebP 是 RIFF 容器，单独判）。"""
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "WebP 图片"
+    for prefix, kind in _MAGIC_PREFIXES:
+        if head.startswith(prefix):
+            return kind
+    return "未知类型"
+
 
 # ---------------------- 只读工具（SKILL.md §1.1；全部免审批） ----------------------
 
@@ -447,9 +476,17 @@ def github_file_read(owner: str, repo: str, path: str, ref: str = "") -> ToolRes
         kind = data.get("type")
         if kind == "file" and data.get("encoding") == "base64":
             try:
-                content = base64.b64decode(data.get("content") or "").decode("utf-8", errors="replace")
+                raw = base64.b64decode(data.get("content") or "")
             except (ValueError, TypeError) as exc:
                 raise _UpstreamError(f"文件内容解不开（base64 解码失败）：{exc}") from exc
+            # 二进制不能用 errors="replace" 硬解——那会把 PNG 变成一坨替换字符喂给模型（本地
+            # read_file 2026-09-14 修过同款缺陷，这里是远端孪生）。NUL 嗅探口径与之一致。
+            if b"\x00" in raw[:4096]:
+                return (
+                    f"{data.get('path')} 是二进制文件（疑似 {_binary_kind(raw[:4096])}），"
+                    f"大小 {data.get('size')} 字节，无法作为文本读取"
+                )
+            content = raw.decode("utf-8", errors="replace")
             return f"{data.get('path')}（{data.get('size')} 字节）：\n\n{content}"
         if kind == "submodule":
             # 曾经这里一律回"太大"——submodule 不是文件，那句话是错的，还会给一个 None 的下载地址
@@ -587,6 +624,93 @@ def github_pr_view(owner: str, repo: str, number: int) -> ToolResult:
         )
 
     return _fetch(f"/repos/{owner}/{repo}/pulls/{number}", render)
+
+
+@mcp.tool()
+@guard
+def github_issue_comments(
+    owner: str, repo: str, number: int, limit: int = 20, page: int = 1
+) -> ToolResult:
+    """
+    读一个 issue / PR 下的**对话楼层**（每条评论的作者、时间与正文）——issue 与 PR 共用
+    编号空间。挂在具体代码行上的评审评论不在这里；评审结论用 `github_pr_reviews`。
+    Args:
+        owner: 仓库属主（用户或组织名），如 `octo`。
+        repo: 仓库名，如 `demo`。
+        number: issue / PR 编号（正整数）。
+        limit: 一页最多几条，1–100（默认 20）。
+        page: 第几页，从 1 开始；本页正好装满时回执会提示还有下一页。
+    """
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
+    number = _positive_int(number, "number")
+    limit = _as_int(limit, "limit", 20, low=1, high=100)
+    page = _page(page)
+
+    def render(data) -> str:
+        items = data if isinstance(data, list) else []
+        if not items:
+            return f"#{number} 下没有对话评论（issue/PR 本身的正文用 github_issue_view / github_pr_view）"
+        lines = []
+        for offset, item in enumerate(items):
+            floor = (page - 1) * limit + offset + 1
+            lines.append(
+                f"【楼层 {floor}】{(item.get('user') or {}).get('login')}　{item.get('created_at')}\n"
+                f"{(item.get('body') or '').strip()}"
+            )
+        return "\n\n".join(lines) + _more_hint(len(items), limit, page)
+
+    params = {"per_page": limit, "page": page}
+    return _fetch(f"/repos/{owner}/{repo}/issues/{number}/comments", render, params)
+
+
+@mcp.tool()
+@guard
+def github_pr_reviews(
+    owner: str, repo: str, number: int, limit: int = 20, page: int = 1
+) -> ToolResult:
+    """
+    读一个 PR 的**评审结论**（每一轮评审：谁、结论、正文）——"别人为什么要求修改"在这里。
+    结论是只读展示：APPROVED 的评审只能由人做出（本技能的 `github_pr_review` 只接受
+    `COMMENT` / `REQUEST_CHANGES`）。对话楼层用 `github_issue_comments`。
+    Args:
+        owner: 仓库属主（用户或组织名），如 `octo`。
+        repo: 仓库名，如 `demo`。
+        number: PR 编号（正整数）。
+        limit: 一页最多几条，1–100（默认 20）。
+        page: 第几页，从 1 开始；本页正好装满时回执会提示还有下一页。
+    """
+    owner, repo = _require_slug(owner, "owner"), _require_slug(repo, "repo")
+    number = _positive_int(number, "number")
+    limit = _as_int(limit, "limit", 20, low=1, high=100)
+    page = _page(page)
+
+    state_labels = {
+        "APPROVED": "批准（人的决定）",
+        "CHANGES_REQUESTED": "要求修改",
+        "COMMENTED": "仅评论",
+        "DISMISSED": "已驳回",
+        "PENDING": "待提交（仅作者可见）",
+    }
+
+    def render(data) -> str:
+        items = data if isinstance(data, list) else []
+        if not items:
+            return f"#{number} 还没有任何评审（PR 下的讨论楼层用 github_issue_comments）"
+        lines = []
+        for offset, item in enumerate(items):
+            state = str(item.get("state") or "")
+            label = state_labels.get(state, state or "未知")
+            body = (item.get("body") or "").strip()
+            if not body:
+                body = "（本轮无总评正文——意见可能写在具体代码行上）"
+            lines.append(
+                f"【评审 {(page - 1) * limit + offset + 1}】{(item.get('user') or {}).get('login')}"
+                f"　[{label}]　{item.get('submitted_at')}\n{body}"
+            )
+        return "\n\n".join(lines) + _more_hint(len(items), limit, page)
+
+    params = {"per_page": limit, "page": page}
+    return _fetch(f"/repos/{owner}/{repo}/pulls/{number}/reviews", render, params)
 
 
 # ---------------------- 只读：列表族（SKILL.md §1.1；全部免审批） ----------------------

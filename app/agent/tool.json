@@ -207,6 +207,14 @@
         "need_review":false,
         "source":"skills/github"
     },
+    "github_issue_comments":{
+        "need_review":false,
+        "source":"skills/github"
+    },
+    "github_pr_reviews":{
+        "need_review":false,
+        "source":"skills/github"
+    },
     "github_issue_list":{
         "need_review":false,
         "source":"skills/github"

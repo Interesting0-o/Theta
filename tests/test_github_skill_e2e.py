@@ -162,7 +162,7 @@ def test_get_skill_github_spawns_real_server_and_serves_tools(github_api, tmp_pa
             #    加工具忘了登记、或登记了不存在的工具，都在这里红）
             loaded_names = {n for n in mcp.session_tool_names(workspace, _SESSION) if n.startswith("github_")}
             assert loaded_names == _expected_github_tools()
-            assert len(loaded_names) == 15
+            assert len(loaded_names) == 17
 
             tools = {t.name: t for t in mcp.session_tools(workspace, _SESSION)}
 

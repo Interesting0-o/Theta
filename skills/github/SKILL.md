@@ -24,7 +24,9 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
 | `github_search_repos` | 按关键词搜仓库 |
 | `github_search_code` | 搜代码（可限 `repo` / `language`） |
 | `github_issue_view` | 读单个 issue（含正文 / 标签 / 评论数） |
+| `github_issue_comments` | 读 issue / PR 的**对话楼层**（作者 / 时间 / 正文，可翻页）——"这个 issue 下面讨论了什么" |
 | `github_pr_view` | 读单个 PR（状态 / 分支 / 增删行数 / 正文） |
+| `github_pr_reviews` | 读 PR 的**评审结论**（谁 / 批准还是要求修改 / 正文，可翻页）——"别人为什么要求修改"在这里 |
 | `github_issue_list` | 列 issue（**已替你滤掉 PR**；可按 `state` / 标签过滤，可翻页） |
 | `github_pr_list` | 列 PR（按最近更新；"有哪些在等我审"先看它） |
 | `github_pr_diff` | 读**整个 PR 的区间 diff** |
@@ -36,6 +38,10 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
 >
 > **`github_pr_diff` / `github_pr_files` 管的是 PR 的区间 diff**：本地 `git_diff` 只知道你自己的
 > 工作树，看不到 `main…feature` 这样的区间，更看不到别人的 PR。
+>
+> **能写评审也要能读评审**：`github_issue_comments` / `github_pr_reviews` 把讨论与评审结论读
+> 回来——别人 `REQUEST_CHANGES` 的理由在后者；读到 `APPROVED` 是人做出的决定，你只需要照着它
+> 继续干活。
 
 ### 1.2 平台侧改动（**需人工审批**）
 

@@ -569,3 +569,125 @@ def test_write_403_mentions_protected_branch_not_just_bad_token(gh, monkeypatch)
     assert out.success is False
     assert "受保护" in out.content
     assert "限流" not in out.content
+
+
+# ---------------- 只读补齐：评论 / 评审读取；file_read 的二进制回执 ----------------
+
+
+def test_issue_comments_render_floors(gh, monkeypatch):
+    """对话楼层带序号、作者与正文；请求打到 issues 端点并带上分页参数。"""
+    payload = [
+        {"id": 11, "user": {"login": "alice"}, "created_at": "2026-09-14T10:00:00Z", "body": "第一层"},
+        {"id": 12, "user": {"login": "bob"}, "created_at": "2026-09-14T11:00:00Z", "body": "第二层"},
+    ]
+    seen = {}
+
+    def fake(path, params=None, **_kw):
+        seen["path"], seen["params"] = path, params
+        return payload, {}
+
+    monkeypatch.setattr(gh, "_request", fake)
+
+    out = gh.github_issue_comments("octo", "demo", 42)
+
+    assert out.success is True
+    assert seen["path"] == "/repos/octo/demo/issues/42/comments"
+    assert seen["params"]["per_page"] == 20 and seen["params"]["page"] == 1
+    assert "【楼层 1】alice" in out.content and "第一层" in out.content
+    assert "【楼层 2】bob" in out.content and "第二层" in out.content
+
+
+def test_issue_comments_empty_gives_guidance(gh, monkeypatch):
+    """没有评论时不给空正文，指回正文读取工具。"""
+    monkeypatch.setattr(gh, "_request", lambda path, params=None, **_kw: ([], {}))
+
+    out = gh.github_issue_comments("octo", "demo", 7)
+
+    assert out.success is True
+    assert "没有对话评论" in out.content
+
+
+def test_pr_reviews_translate_states_and_empty_body(gh, monkeypatch):
+    """评审结论翻译成人话；无总评正文的轮次给说明，不输出空段。"""
+    payload = [
+        {
+            "user": {"login": "carol"},
+            "state": "CHANGES_REQUESTED",
+            "submitted_at": "2026-09-14T09:00:00Z",
+            "body": "这里会空指针",
+        },
+        {
+            "user": {"login": "dave"},
+            "state": "COMMENTED",
+            "submitted_at": "2026-09-14T09:30:00Z",
+            "body": "",
+        },
+    ]
+    monkeypatch.setattr(gh, "_request", lambda path, params=None, **_kw: (payload, {}))
+
+    out = gh.github_pr_reviews("octo", "demo", 5)
+
+    assert out.success is True
+    assert "要求修改" in out.content and "会空指针" in out.content
+    assert "仅评论" in out.content and "意见可能写在具体代码行上" in out.content
+
+
+def test_pr_reviews_empty_gives_guidance(gh, monkeypatch):
+    monkeypatch.setattr(gh, "_request", lambda path, params=None, **_kw: ([], {}))
+
+    out = gh.github_pr_reviews("octo", "demo", 5)
+
+    assert out.success is True
+    assert "没有任何评审" in out.content
+
+
+def test_file_read_binary_returns_receipt_not_garbage(gh, monkeypatch):
+    """远端 PNG：NUL 探测 + 类型回执（与本地 read_file 同款），不吐 replace 乱码。"""
+    import base64 as b64
+
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    monkeypatch.setattr(
+        gh,
+        "_request",
+        lambda path, params=None, **_kw: (
+            {
+                "type": "file",
+                "encoding": "base64",
+                "content": b64.b64encode(png).decode(),
+                "path": "pic.png",
+                "size": len(png),
+            },
+            {},
+        ),
+    )
+
+    out = gh.github_file_read("octo", "demo", "pic.png")
+
+    assert out.success is True
+    assert "二进制文件" in out.content and "PNG" in out.content
+    assert "�" not in out.content  # 没有替换字符乱码
+
+
+def test_file_read_utf8_text_unaffected(gh, monkeypatch):
+    """二进制回执不得波及正常路径：文本文件照常解出正文。"""
+    import base64 as b64
+
+    monkeypatch.setattr(
+        gh,
+        "_request",
+        lambda path, params=None, **_kw: (
+            {
+                "type": "file",
+                "encoding": "base64",
+                "content": b64.b64encode("hello".encode()).decode(),
+                "path": "a.txt",
+                "size": 5,
+            },
+            {},
+        ),
+    )
+
+    out = gh.github_file_read("octo", "demo", "a.txt")
+
+    assert out.success is True
+    assert "hello" in out.content

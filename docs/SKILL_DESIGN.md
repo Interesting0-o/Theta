@@ -707,8 +707,8 @@ evaluation = `task.name`，关池用的也是它）；langgraph dev 零参 → `
 | `app/agent/tools.py` | `get_skill` / `drop_skill`（加注入 workspace；drop 改 async）+ 四道校验 + `_skill_preflight_line`（加载时体检）+ `_probe_skill_startup`（起不来时捞真 traceback）+ `SessionToolset`（含双向对账）+ `_tool_config()` 校验缝 |
 | `app/agent/nodes.py` | `LLMNode` 动态 bind；`ToolNode` 动态查表 + 可行动 `unknown_tool` 文案；`ReviewNode` 限定版 fail-closed |
 | `app/agent/graph.py` | 主图装配 `SessionToolset(workspace, static_tools)`、model **不在此绑定**；worker 路径一行未改 |
-| `skills/github/` | `server.py`（12 个只读 + 3 个写工具，stdlib HTTP；§13.10）+ `skill.json`（env + preflight）+ `SKILL.md` 同步 |
-| `app/agent/tool.json` | 15 条 `skills/github` 登记（12 只读 `need_review: false` + 3 写 `true`；§13.10） |
+| `skills/github/` | `server.py`（14 个只读 + 3 个写工具，stdlib HTTP；§13.10）+ `skill.json`（env + preflight）+ `SKILL.md` 同步 |
+| `app/agent/tool.json` | 17 条 `skills/github` 登记（14 只读 `need_review: false` + 3 写 `true`；§13.10） |
 
 **最硬的一处坑（写在这里防复发）**：`_TOOL_SPECS` 按**工作区**缓存"核心四件套"的 schema，内容是
 "调用方传进来的那批 connections"。若技能列 schema 复用它、只传技能自己的 connection，就会把该工作区
@@ -735,7 +735,7 @@ evaluation = `task.name`，关池用的也是它）；langgraph dev 零参 → `
 - **`tests/test_github_skill_e2e.py`**（1 例，2026-09-13 加）：**真技能**的端到端——用真 `skills/`
   源与真 `tool.json`，真 spawn `python -m skills.github.server`（假 token 经**真 `skill_env`** 转发；
   server 在 **import 期**就要 `GITHUB_TOKEN`，所以"加载成功"本身就是转发通了的证明）→ 断言它暴露的
-  工具名与 `tool.json` 的登记**逐字一致**（2026-09-14 起 15 条）→ 真调 `github_repo_view`
+  工具名与 `tool.json` 的登记**逐字一致**（2026-09-14 起 17 条）→ 真调 `github_repo_view`
   → 上游 200 / 401 / 404 三条路都按 `[upstream_error]` 分类回传 → **写工具真发一次 POST**
   → 卸载后工具与子进程一起没了。
   **不联网**：`GITHUB_API_URL` 指向进程内起的 stdlib HTTP 桩（技能 server 在子进程里，进程内
@@ -858,6 +858,15 @@ evaluation = `task.name`，关池用的也是它）；langgraph dev 零参 → `
   一条坏 URL 去撞 404——模型拿到"没有这个东西"，学不到任何东西；
 - 写操作的 **422 / 403** 各自翻译（"参数或目标状态不允许" / "分支受保护或没有推送权限"）——与读
   操作的下一步动作不同，不能混成一句"失败了"。
+
+**同日补遗（评审闭环收口）**：只读再加 2 个——`github_issue_comments`（`GET /issues/{n}/comments`，
+issue / PR 通吃的**对话楼层**，带楼层号与翻页）与 `github_pr_reviews`（`GET /pulls/{n}/reviews`，
+**评审结论**：谁、状态翻成人话、正文；无总评的轮次注明"意见可能写在具体代码行上"）。评审工作流
+此前是断的：模型能 `github_pr_review` 写意见、却读不回别人的意见。同批 `github_file_read` 补
+二进制回执：base64 解出后 NUL 嗅探 + 魔数猜类型（与本地 `read_file` 同日修复同款、口径一致）；
+魔数表在技能内复制一份——技能子进程没有 `WORKSPACE_PATH`，import `file_io` 即炸。至此
+**14 只读 + 3 写**，`tool.json` 17 条。`github_issue_create` / 关 issue **刻意不做**（2026-09-14
+用户拍板：issue/PR 侧保持只读基调，开 PR 与评审的写权不外溢）。
 
 | 模块 | 关系 |
 | --- | --- |
