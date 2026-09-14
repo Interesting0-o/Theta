@@ -40,6 +40,21 @@ class NoteEntry(TypedDict):
     tags: NotRequired[list[str]]
 
 
+class ImageRef(TypedDict):
+    """一条已发送图片的元数据（@路径 附图通道的记账，机制在 LLMNode.attach_images_to_payload）。
+
+    与 PlanStep / NoteEntry 同族：进 state、随 checkpoint 序列化，所以用 TypedDict。
+    **只存元数据**：base64 只活在 LLMNode 构造请求体副本的那一刻，从不进 messages/checkpoint
+    ——图的"正文"就是盘上那个文件（口径同记忆的"文件即真值"），记账它只为"同一张别重发"。
+
+    - path：解析后的**绝对路径**字符串（去重键；schema 字段一律 JSON 友好，不用 Path）；
+    - mime：image/png 等，由扩展名映射（拼 data URI 时要用）。
+    """
+
+    path: str
+    mime: str
+
+
 @dataclass(frozen=True)
 class MCPToolSpec:
     """一条 MCP 工具的静态 schema（**不含会话**，故可跨会话复用、按工作区缓存）。

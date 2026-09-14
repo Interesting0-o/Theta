@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import inspect
 import json
+import re
 import time
 from functools import lru_cache
 from inspect import signature
@@ -16,7 +18,7 @@ from app.agent.skills import skills_block
 from app.agent.state import AgentState
 from app.agent.utils import coerce_tool_result, format_tool_result
 from app.agent.prompt import SYSTEM_PROMPT, workspace_context_block
-from app.schema.agent_schema import NoteEntry, PlanStep
+from app.schema.agent_schema import ImageRef, NoteEntry, PlanStep
 
 _TOOL_CONFIG_PATH = Path(__file__).with_name("tool.json")
 
@@ -50,6 +52,31 @@ AGENT_MD_INJECT_CAP = 8000
 # 注入块标题：AGENT.md 由模型/人自由撰写，加一行标题让模型知道这段是什么
 _PROFILE_BLOCK_HEADER = "# 项目画像（工作区 AGENT.md）\n\n"
 
+#-------------------@图片路径 的调用期附图通道----------------------
+# 用户在消息里写 @路径（相对工作区或绝对），LLMNode 构造请求体副本时把图**临时**附上：
+# state 里的消息始终是带 @路径 的纯文本，base64 只活在副本那一瞬、从不进
+# messages/checkpoint——所以没有"轮末剔除"这回事，从一开始就没写进去。
+# 勘察与方案见 docs/TODO.md「图像输入」条目。
+
+# 扩展名 → data URI 的 mime。命中才算"长得像图片"（宽进策略：不像的 @token 是普通文本，
+# 原样放行——@人名、@note.txt 不该被碰）
+_IMAGE_MIME = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+    "bmp": "image/bmp",
+}
+_IMAGE_EXT_RE = re.compile(r"\.(?:png|jpe?g|gif|webp|bmp)", re.IGNORECASE)
+# 单张体积上限：超限不读盘、给模型一行说明。这是**本地上限**，不是厂商限额（未实测核实）
+_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+# 一条消息最多附几张，多的只给说明（防 payload 失控）
+_MAX_IMAGES_PER_MESSAGE = 4
+
+# read_bytes 失败的哨兵（与"文件不存在"区分：前者给"读取失败"，后者给"未找到"）
+_UNREADABLE = object()
+
 
 class LLMNode:
     def __init__(
@@ -58,6 +85,7 @@ class LLMNode:
         workspace_path: str | None = None,
         system_prompt: str = SYSTEM_PROMPT,
         inject_session_context: bool = True,
+        attach_images: bool = True,
         toolset=None,
     ) -> None:
         # `model` 是**未绑定**的原始模型：给了 toolset 就由本节点按工具集版本调 bind_tools
@@ -68,6 +96,10 @@ class LLMNode:
         # 会话级上下文 = 项目画像（AGENT.md）+ 长期记忆：都是"主 agent 认得这个项目/用户"所需；
         # worker（子 agent）传 False——它是临时资料收集器，两样都不注入（§4 隔离）。
         self.inject_session_context: bool = inject_session_context
+        # @图片 的调用期附图通道（attach_images_to_payload）。worker 同样传 False：worker 的
+        # HumanMessage 是**主模型生成的 dispatch prompt**，不认 @，杜绝"模型借 worker 附带
+        # 本地图片"的旁路（能力白名单同一口径：结构性排除，不是靠提示词自觉）。
+        self.attach_images: bool = attach_images
         # 项目画像实例内 memo：会话第一次启动时读入，之后复用（§4；画像慢变）
         self._profile_block: str | None = None
         # 动态工具集（app/agent/tools.py::SessionToolset）：None = 静态绑定，行为与改造前一致
@@ -115,6 +147,9 @@ class LLMNode:
 
         记忆与技能正文**每轮实时读盘**（文件即真值）；画像**只读一次**（画像慢变）。三处读盘
         都是阻塞调用，走 to_thread 以避开 langgraph dev 的 blockbuster。
+
+        用户消息里的 @图片路径走**调用期附图通道**（attach_images_to_payload）：base64 只临时
+        进请求体副本，state 里的消息永远是带 @路径 的纯文本。
         """
         system_messages = [SystemMessage(content=self.system_prompt)]
         if self.workspace_path:
@@ -147,9 +182,25 @@ class LLMNode:
                 system_messages.append(SystemMessage(content=skill_text))
 
         messages = [*system_messages, *state["messages"]]
+        # @图片 的调用期附图：改的是**请求体副本**，state["messages"] 始终是纯文本（@路径
+        # 原样留在历史里，本身就是"看过哪张图"的日志）。新附上的图记账写回 state，下一轮
+        # 据此不再重发（首次-only）。worker 已在构造期关掉这条通道。
+        newly_attached: list[ImageRef] = []
+        if self.attach_images and self.workspace_path:
+            messages, newly_attached = await self.attach_images_to_payload(
+                messages, state.get("attached_images") or [], self.workspace_path
+            )
         model = await self._model_for(state)
         res = await model.ainvoke(messages)
-        return {"messages": [res]}
+        # 原样写回：**思考内容不会进 history，但这不是因为我们剥了它**——`langchain-openai` 的
+        # 响应转换是白名单式的，`reasoning_content` 压根没被提取进 AIMessage（实测见
+        # tests/test_thinking_config.py 的契约用例）。所以这里没有剥离代码是**有意的**：那段代码
+        # 今天空转。哪天库改成会提取它，那个用例会红——届时在这里（唯一写回点）补一手剥离，
+        # 并顺带决定要不要给人看。
+        out = {"messages": [res]}
+        if newly_attached:
+            out["attached_images"] = [*(state.get("attached_images") or []), *newly_attached]
+        return out
 
     async def _model_for(self, state: AgentState) -> Runnable:
         """取本次要用的模型：按工具集版本决定要不要重新 `bind_tools`（§3.4——不必每轮 bind）。
@@ -199,6 +250,139 @@ class LLMNode:
                 self.agent_md_block, self.workspace_path
             )
         return self._profile_block
+
+    #-------------------@图片 的调用期附图通道----------------------
+
+    @staticmethod
+    def _image_tokens(text: str) -> list[tuple[int, int, str]]:
+        """扫出文本里的 @图片引用：返回 (起始, 结束, 原始路径)，区间即 @token 的原位替换范围。
+
+        - 引号形式 `@"…"`：路径可含空格，整段须有图片扩展名才算引用，否则整个引号段原样放行；
+        - 裸 token 到首个空白为止；整 token 不以图片扩展名收尾（中文习惯 `@a.png帮我看` 不打
+          空格）时**截到首个图片扩展名处**，余下字符留在正文里；
+        - 扩展名不在 _IMAGE_MIME 里的 @token 根本不是引用（@人名、@note.txt），原样放行
+          （宽进策略，2026-09-14 与用户议定）。
+        """
+        tokens: list[tuple[int, int, str]] = []
+        i = 0
+        while (i := text.find("@", i)) != -1:
+            j = i + 1
+            if j >= len(text) or text[j].isspace():
+                i += 1  # 裸 @ 或后面是空白：不是引用
+                continue
+            if text[j] == '"':
+                end = text.find('"', j + 1)
+                if end == -1:  # 引号没闭合：当普通文本
+                    i += 1
+                    continue
+                raw = text[j + 1 : end]
+                if _IMAGE_EXT_RE.search(raw):
+                    tokens.append((i, end + 1, raw))
+                i = end + 1  # 无论是不是引用都跳过整个引号段
+                continue
+            k = j
+            while k < len(text) and not text[k].isspace():
+                k += 1
+            token = text[j:k]
+            m = _IMAGE_EXT_RE.search(token)
+            if m:
+                tokens.append((i, j + m.end(), token[: m.end()]))
+                i = j + m.end()  # 从路径结束处继续扫（余下字符回正文，其中的 @ 还能命中）
+            else:
+                i = k
+        return tokens
+
+    @staticmethod
+    def _resolve_image_path(raw: str, workspace_path: str) -> Path:
+        """解析 @路径：相对路径以工作区为基准、绝对路径原样（含 ~ 展开），resolve() 消掉
+        `../` 与符号链接。
+
+        与 mcp_service/file_io.py::_resolve_path 同形但**不 import 它**：那个模块在 import 期
+        就校验 WORKSPACE_PATH env（主进程没设，import 即炸），且锚死 MCP server 的全局
+        工作区；这里锚本节点收到的 workspace_path，也**不做沙箱拒绝**——@ 是用户亲手输入的
+        通道，沙箱约束的是模型的工具调用，不约束用户自己（截图在桌面/下载是常态）。
+        """
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = Path(workspace_path) / p
+        return p.resolve()
+
+    @staticmethod
+    async def attach_images_to_payload(
+        messages: list,
+        already_attached: list[ImageRef],
+        workspace_path: str,
+    ) -> tuple[list, list[ImageRef]]:
+        """把最后一条 HumanMessage 里的 @图片引用临时附进**请求体副本**（不动 state）。
+
+        返回 (新消息列表, 本次新附上的 ImageRef)。每个 @token 的处置都写成正文里的状态说明，
+        模型自然会把失败转告用户（LLMNode 没有 Notice 通道，让模型当信使）：
+        `[图片已附加: …]` / `[图片已在上文发送过…: …]` / `[图片未找到: …]` /
+        `[图片过大…: …]` / `[图片读取失败: …]`。base64 只活在本函数的调用栈里；记账由
+        调用方写回 state["attached_images"]，下一轮据此不再重发（首次-only 语义；进程重启
+        也不怕——记账里的图重读盘即得）。
+
+        只解析 **HumanMessage** 且只是最后一条：AIMessage/ToolMessage 里的 @ 一律不认——
+        否则模型输出 `@C:\\…` 就等于模型能指挥宿主读任意本地文件送进 API。
+        """
+        sent = {ref["path"] for ref in already_attached}
+        last_human = max(
+            (i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=None
+        )
+        if last_human is None or not isinstance(messages[last_human].content, str):
+            return messages, []
+        text = messages[last_human].content
+        tokens = LLMNode._image_tokens(text)
+        if not tokens:
+            return messages, []
+
+        def _load(p: Path):
+            if not p.is_file():
+                return None
+            try:
+                return p.read_bytes()
+            except OSError:
+                return _UNREADABLE
+
+        parts: list[str] = []
+        blocks: list[dict] = []
+        newly: list[ImageRef] = []
+        pos = 0
+        for start, end, raw in tokens:
+            resolved = LLMNode._resolve_image_path(raw, workspace_path)
+            key = str(resolved)
+            if key in sent or any(ref["path"] == key for ref in newly):
+                marker = f"[图片已在上文发送过，不重复附图: {raw}]"
+            elif len(newly) >= _MAX_IMAGES_PER_MESSAGE:
+                marker = f"[图片数量超上限（{_MAX_IMAGES_PER_MESSAGE} 张），未附加: {raw}]"
+            else:
+                mime = _IMAGE_MIME[Path(raw).suffix.lstrip(".").lower()]
+                data = await asyncio.to_thread(_load, resolved)
+                if data is None:
+                    marker = f"[图片未找到: {raw}]"
+                elif data is _UNREADABLE:
+                    marker = f"[图片读取失败: {raw}]"
+                elif len(data) > _MAX_IMAGE_BYTES:
+                    marker = (
+                        f"[图片过大（上限 {_MAX_IMAGE_BYTES // (1024 * 1024)}MB），未附加: {raw}]"
+                    )
+                else:
+                    b64 = base64.b64encode(data).decode()
+                    blocks.append(
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+                    )
+                    newly.append(ImageRef(path=key, mime=mime))
+                    marker = f"[图片已附加: {raw}]"
+            parts.append(text[pos:start])
+            parts.append(marker)
+            pos = end
+        parts.append(text[pos:])
+
+        out = list(messages)
+        out[last_human] = HumanMessage(
+            content=[{"type": "text", "text": "".join(parts)}, *blocks]
+        )
+        return out, newly
 
 #-------------------工具调用节点-----------------------
 class ToolNode:

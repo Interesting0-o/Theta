@@ -181,6 +181,7 @@ def get_sub_agent_graph(read_tools=None, workspace_path: str | None = None, mode
             workspace_path=workspace_path,
             system_prompt=WORKER_SYSTEM_PROMPT,
             inject_session_context=False,  # worker 不注入项目画像/长期记忆（只读资料收集，§4）
+            attach_images=False,  # worker 的 HumanMessage 是主模型生成的 prompt，不认 @（防模型借 worker 附带本地文件）
         ),
     )
     graph.add_node("queue_node", QueueNode())

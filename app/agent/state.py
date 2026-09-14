@@ -1,6 +1,6 @@
 from typing import TypedDict,Annotated,List,Any,Dict
 from langgraph.graph.message import add_messages,BaseMessage
-from app.schema.agent_schema import PlanStep,NoteEntry
+from app.schema.agent_schema import ImageRef,PlanStep,NoteEntry
 
 class AgentState(TypedDict):
     #--------------会话的唯一标识------------
@@ -25,6 +25,11 @@ class AgentState(TypedDict):
     # 笔记区：折叠时"不可免费重取"的联网检索正文落点；外层 dict 的 key = notes#<n>（稳定 ref），
     # 随 checkpoint 存亡（不做跨会话语义库）。无 reducer → 写入方读改写合并。
     notes: Dict[str, NoteEntry]
+
+    #--------------图片（@路径 的调用期附图通道）-----------------
+    # 已随请求发送过的图片元数据：@路径 由 LLMNode 构造请求体副本时解析附上，base64 从不进
+    # messages/checkpoint（见 ImageRef 注释）。无 reducer → 只由 LLMNode 单调追加。
+    attached_images: List[ImageRef]
 
     #--------------技能（skill）-----------------
     # 已加载技能的 name 清单。**只存名字、不存正文**：正文由 LLMNode 每轮从盘上读

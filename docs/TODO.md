@@ -306,7 +306,7 @@ turn，处置（未找到 / 过大>5MB / 超 4 张 / 读取失败）写进正文
 - 读策略太保守：`read_file` docstring 的"避免大文件整段塞满上下文"引导模型把 1280 行文件
   拆 ~200 行 × 多段读，徒增往返与重发成本；考虑改成"需要整份就整读、超大/只需探测才分段"
   + "相互独立的读取/检索尽量同回合并发"。
-- 思考内容剥离：`LLMNode` 写回 history 前剥掉 AIMessage 里的 thinking/reasoning
-  （content 内块与 additional_kwargs 都剥），保证思考永不回发、不累积成本。
+- ~~思考内容剥离~~：**2026-09-14 查明它在当前栈下是空转的**——`langchain-openai` 根本不提取
+  `reasoning_content`（没有东西可剥），已改为由契约用例钉住库行为，见上面那条 `[x]` 条目。
 - 长回合止损：run_tui 运行中响应 `q` 取消当前 turn；主 ainvoke 显式设 recursion_limit。
 - 大体量广度探索的 dispatch 触发信号（docs/MULTI_AGENT §10"三模式如何被选中"）。
