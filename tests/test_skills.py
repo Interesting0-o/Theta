@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from app.agent import skills
-from app.schema.agent_schema import SkillPreflight
+from app.schema.agent_schema import SkillMeta, SkillPreflight
 
 
 def _make_skill(root: Path, name: str, *, description: str = "干某件事的技能", body: str = "正文") -> Path:
@@ -179,6 +179,55 @@ def test_scan_downgrades_capability_with_unusable_dirname(skills_dir, caplog):
 
     assert metas["not-an-identifier"].capability is False
     assert "identifier" in caplog.text
+
+
+def test_scan_downgrades_capability_for_keyword_dirname(skills_dir, caplog):
+    """目录名是 Python **关键字**（如 `class`）→ 同样降级。
+
+    `"class".isidentifier()` 是 True，但 `import skills.class.server` 是 SyntaxError——只查
+    isidentifier 的话，这种技能会被标成能力型、目录里打上 `[带工具]`，却永远加载不上，
+    正好违反"目录不撒谎"那条不变量。
+    """
+    _make_capability(skills_dir, "class")
+
+    with caplog.at_level("WARNING"):
+        metas = skills.scan_skills()
+
+    assert metas["class"].capability is False
+    assert "identifier" in caplog.text  # 与上一条复用同一次降级告警
+
+
+def test_scan_survives_a_skill_with_broken_encoding(skills_dir, caplog):
+    """一个编码坏掉的 `SKILL.md` 只能弄坏它自己——不许让**整次扫描**抛异常。
+
+    `UnicodeDecodeError` 是 ValueError 的子类、**不是** OSError：只捕 OSError 的话它会一路冒
+    出去，所有技能一起从目录里消失（"装了却不可发现"是这套机制里最坏的失败形态）。
+    """
+    _make_skill(skills_dir, "good")
+    broken = skills_dir / "broken"
+    broken.mkdir()
+    (broken / "SKILL.md").write_bytes(b"---\nname: broken\n---\n\n\xff\xfe\x80")
+
+    with caplog.at_level("WARNING"):
+        metas = skills.scan_skills()
+
+    assert set(metas) == {"good"}
+    assert "broken" in caplog.text
+
+
+def test_body_of_returns_none_when_encoding_is_broken(skills_dir):
+    """正文读取同理：坏编码 → None（`get_skill` 据此回"正文读取失败"），而不是抛异常。"""
+    skill_dir = _make_skill(skills_dir, "broken")
+    (skill_dir / "SKILL.md").write_bytes(b"---\nname: broken\n---\n\n\xff\xfe\x80")
+    meta = SkillMeta(
+        name="broken",
+        description="x",
+        dir_name="broken",
+        capability=False,
+        path=str(skill_dir / "SKILL.md"),
+    )
+
+    assert skills.body_of(meta) is None
 
 
 # ---------------------- 读取（白名单，不拼路径） ----------------------

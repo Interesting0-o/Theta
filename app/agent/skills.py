@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import json
+import keyword
 import logging
 from pathlib import Path
 
@@ -110,6 +111,16 @@ def _read_skill_md(path: Path) -> tuple[dict[str, str], str]:
 # ---------------------- 扫描 ----------------------
 
 
+def _is_module_name(name: str) -> bool:
+    """目录名能不能拿来拼 `python -m skills.<目录名>.server`。
+
+    `isidentifier()` 挡得住点 / 空格 / `-`，**挡不住关键字**：`"class"`、`"for"` 都是合法
+    identifier，可 `import skills.class.server` 是 SyntaxError——那样的技能会被标成能力型、
+    目录里打上 `[带工具]`，却永远加载不上（正好违反"目录不撒谎"那条不变量）。
+    """
+    return name.isidentifier() and not keyword.iskeyword(name)
+
+
 def scan_skills() -> dict[str, SkillMeta]:
     """扫描技能源，返回 {name: SkillMeta}；源目录不存在 → 空表。
 
@@ -128,7 +139,10 @@ def scan_skills() -> dict[str, SkillMeta]:
             continue
         try:
             meta, _body = _read_skill_md(skill_md)
-        except OSError as exc:  # 编码错 / 权限 / 读取失败：坏技能，别让一个目录拖垮整次扫描
+        except (OSError, UnicodeDecodeError) as exc:
+            # 权限 / 读取失败 / **编码不是 UTF-8**：坏技能，别让一个目录拖垮整次扫描。
+            # `UnicodeDecodeError` 不是 `OSError` 的子类（它是 ValueError）——漏掉它的话，
+            # 一个编码坏掉的 SKILL.md 会让**整次扫描**抛异常，所有技能一起消失。
             logger.warning("技能 %s 读取失败，已跳过：%s", entry.name, exc)
             continue
 
@@ -153,10 +167,11 @@ def scan_skills() -> dict[str, SkillMeta]:
             continue
 
         capability = (entry / SERVER_FILENAME).is_file()
-        if capability and not entry.name.isidentifier():
+        if capability and not _is_module_name(entry.name):
             # 目录名要用来拼 `python -m skills.<dir>.server` 与 `source: skills/<dir>`，
-            # 含点 / 空格 / `-` 的名字拼不出合法模块名。**降级为知识型**而不是跳过整个技能：
-            # 正文仍然有价值，只是它的工具不可用（能力型要求 name == 目录名，见 get_skill 的校验）。
+            # 含点 / 空格 / `-` 的名字（以及 `class` 这类关键字）拼不出可 import 的模块名。
+            # **降级为知识型**而不是跳过整个技能：正文仍然有价值，只是它的工具不可用
+            # （能力型要求 name == 目录名，见 get_skill 的校验）。
             logger.warning(
                 "技能 %s 的目录名 %r 不是合法 Python identifier，降级为知识型（其 server.py 不会被拉起）",
                 name,
@@ -190,7 +205,8 @@ def server_module(meta: SkillMeta) -> str:
     """能力型技能的启动模块名：`<SKILLS_PACKAGE>.<目录名>.server`。
 
     **用目录名而非 frontmatter 的 name**（同一条安全纪律：名字来自用户写的文件，不能拿来拼
-    import 路径）；`scan_skills` 已保证目录名是合法 identifier 才会是能力型。
+    import 路径）；`scan_skills` 已保证目录名是**可 import 的模块名**（合法 identifier 且不是
+    关键字）才会是能力型。
     """
     return f"{SKILLS_PACKAGE}.{meta.dir_name}.server"
 
@@ -205,7 +221,9 @@ def _read_skill_config(meta: SkillMeta) -> dict:
         return {}
     try:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # UnicodeDecodeError 单独列出来：它不是 OSError 的子类，而 `read_text` 先于
+        # `json.loads` 跑——编码坏掉的 skill.json 会从这道缝里漏出去。
         logger.warning("技能 %s 的 %s 读取失败，按未声明处理：%s", meta.name, config_path, exc)
         return {}
     if not isinstance(raw, dict):
@@ -287,7 +305,7 @@ def body_of(meta: SkillMeta) -> str | None:
     """读某个已解析技能的正文（已剥 frontmatter）；读取失败 → None。"""
     try:
         _meta, body = _read_skill_md(Path(meta.path))
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         logger.warning("技能 %s 正文读取失败：%s", meta.name, exc)
         return None
     return body
