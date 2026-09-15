@@ -11,14 +11,6 @@
         "need_review":false,
         "source":"plan"
     },
-    "safe_tool":{
-        "need_review":false,
-        "source":"tests"
-    },
-    "risky_tool":{
-        "need_review":true,
-        "source":"tests"
-    },
     "create_file":{
         "need_review":true,
         "source":"mcp_service/file_io"
@@ -69,7 +61,9 @@
     },
     "run_command":{
         "need_review":true,
-        "source":"mcp_service/terminal"
+        "source":"mcp_service/terminal",
+        "worker_allow":true,
+        "free_when":"readonly_shell"
     },
     "start_process":{
         "need_review":true,
@@ -77,67 +71,23 @@
     },
     "process_kill":{
         "need_review":true,
-        "source":"mcp_service/terminal"
+        "source":"mcp_service/terminal",
+        "worker_allow":true
     },
     "process_wait":{
         "need_review":false,
-        "source":"mcp_service/terminal"
+        "source":"mcp_service/terminal",
+        "worker_allow":true
     },
     "process_read":{
         "need_review":false,
-        "source":"mcp_service/terminal"
+        "source":"mcp_service/terminal",
+        "worker_allow":true
     },
     "process_list":{
         "need_review":false,
-        "source":"mcp_service/terminal"
-    },
-    "list_repos":{
-        "need_review":false,
-        "source":"mcp_service/git"
-    },
-    "git_status":{
-        "need_review":false,
-        "source":"mcp_service/git"
-    },
-    "git_branches":{
-        "need_review":false,
-        "source":"mcp_service/git"
-    },
-    "git_diff":{
-        "need_review":false,
-        "source":"mcp_service/git"
-    },
-    "git_log":{
-        "need_review":false,
-        "source":"mcp_service/git"
-    },
-    "git_fetch":{
-        "need_review":false,
-        "source":"mcp_service/git"
-    },
-    "git_add":{
-        "need_review":true,
-        "source":"mcp_service/git"
-    },
-    "git_commit":{
-        "need_review":true,
-        "source":"mcp_service/git"
-    },
-    "git_switch":{
-        "need_review":true,
-        "source":"mcp_service/git"
-    },
-    "git_pull":{
-        "need_review":true,
-        "source":"mcp_service/git"
-    },
-    "git_push":{
-        "need_review":true,
-        "source":"mcp_service/git"
-    },
-    "git_clone":{
-        "need_review":true,
-        "source":"mcp_service/git"
+        "source":"mcp_service/terminal",
+        "worker_allow":true
     },
     "web_search":{
         "need_review":true,

@@ -3,11 +3,12 @@ import base64
 import inspect
 import json
 import re
+import shlex
 import time
 from functools import lru_cache
 from inspect import signature
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import Runnable
@@ -243,7 +244,9 @@ class LLMNode:
     async def _read_profile(self) -> str:
         """项目画像只读一次（会话首启读入，§4）：实例内 memo——画像默认慢变。
 
-        后续若用户改了 AGENT.md，重开会话即生效（新会话 = 新建图/新 LLMNode 实例）。
+        注意这份 memo 是**实例内**的：TUI 路径下每个会话新建一张图/一个实例，改了 AGENT.md
+        重开会话即生效；但零参入口（langgraph dev）一图多 thread、同一实例跨会话复用，那条
+        路径下不重开进程就不会刷新（与 `_model_for` 注释里记的是同一类偏差）。
         """
         if self._profile_block is None:
             self._profile_block = await asyncio.to_thread(
@@ -254,8 +257,13 @@ class LLMNode:
     #-------------------@图片 的调用期附图通道----------------------
 
     @staticmethod
-    def _image_tokens(text: str) -> list[tuple[int, int, str]]:
-        """扫出文本里的 @图片引用：返回 (起始, 结束, 原始路径)，区间即 @token 的原位替换范围。
+    def _image_tokens(text: str) -> list[tuple[int, int, str, str]]:
+        """扫出文本里的 @图片引用：返回 (起始, 结束, 原始路径, mime)，区间即 @token 的原位替换范围。
+
+        mime 在**收词时**一并定下（用命中的那个扩展名反查 _IMAGE_MIME）。调用方别再拿
+        `Path(raw).suffix` 反推：那是"最后一个点号之后"的整段，而收词口径是"任意处命中"，
+        两者不等价——`@"shot.png "` 的 suffix 是 `.png `、`@"a.png（新版）"` 是 `.png（新版）`，
+        反推出来的键根本不在表里。
 
         - 引号形式 `@"…"`：路径可含空格，整段须有图片扩展名才算引用，否则整个引号段原样放行；
         - 裸 token 到首个空白为止；整 token 不以图片扩展名收尾（中文习惯 `@a.png帮我看` 不打
@@ -276,8 +284,9 @@ class LLMNode:
                     i += 1
                     continue
                 raw = text[j + 1 : end]
-                if _IMAGE_EXT_RE.search(raw):
-                    tokens.append((i, end + 1, raw))
+                m = _IMAGE_EXT_RE.search(raw)
+                if m:
+                    tokens.append((i, end + 1, raw, _IMAGE_MIME[m.group(0)[1:].lower()]))
                 i = end + 1  # 无论是不是引用都跳过整个引号段
                 continue
             k = j
@@ -286,7 +295,9 @@ class LLMNode:
             token = text[j:k]
             m = _IMAGE_EXT_RE.search(token)
             if m:
-                tokens.append((i, j + m.end(), token[: m.end()]))
+                tokens.append(
+                    (i, j + m.end(), token[: m.end()], _IMAGE_MIME[m.group(0)[1:].lower()])
+                )
                 i = j + m.end()  # 从路径结束处继续扫（余下字符回正文，其中的 @ 还能命中）
             else:
                 i = k
@@ -348,7 +359,7 @@ class LLMNode:
         blocks: list[dict] = []
         newly: list[ImageRef] = []
         pos = 0
-        for start, end, raw in tokens:
+        for start, end, raw, mime in tokens:
             resolved = LLMNode._resolve_image_path(raw, workspace_path)
             key = str(resolved)
             if key in sent or any(ref["path"] == key for ref in newly):
@@ -356,7 +367,6 @@ class LLMNode:
             elif len(newly) >= _MAX_IMAGES_PER_MESSAGE:
                 marker = f"[图片数量超上限（{_MAX_IMAGES_PER_MESSAGE} 张），未附加: {raw}]"
             else:
-                mime = _IMAGE_MIME[Path(raw).suffix.lstrip(".").lower()]
                 data = await asyncio.to_thread(_load, resolved)
                 if data is None:
                     marker = f"[图片未找到: {raw}]"
@@ -465,6 +475,45 @@ class ToolNode:
         return {"messages": results, "approved_tool_calls": []}
 
 
+#----------------------终端命令的免审判定--------------------
+
+# 免审命令的**策略表是数据，不是代码**：加一族命令 = 改 app/agent/command_policy.json，
+# 判定逻辑一行不动——这就是"把命令审核从逻辑里解耦出来"的具体含义。
+#
+# 为什么要这张表：终端工具在 tool.json 里一律 need_review:true，唯独落在表里的形态免人工审批。
+# 这是**新增授权**（不是把旧行为平移过来）——git 用法一律走 run_command（原先那批 git_* 原子
+# 工具已随 mcp_service/git.py 一并删除），只读的读操作若每次都要人按 y，摩擦就是净增。
+_COMMAND_POLICY_PATH = Path(__file__).with_name("command_policy.json")
+
+
+@lru_cache(maxsize=1)
+def _command_policy() -> dict:
+    """command_policy.json 的解析结果（整进程只读一次，口径同 tool.json）。
+
+    列表在这里归一成元组/冻结集合——调用方要的是"能 startswith 的序列"和"能 O(1) 判成员的
+    集合"，别把裸 list 递给 `str.startswith`（它只认 str 或 tuple）。
+    """
+    with _COMMAND_POLICY_PATH.open("r", encoding="utf-8") as file:
+        raw = json.load(file)
+    return {
+        "free_commands": {name: frozenset(subs) for name, subs in raw["free_commands"].items()},
+        "write_flags": tuple(raw["git_write_flags"]),
+        "global_skip": frozenset(raw["git_global_skip"]),
+        "branch_list_flags": frozenset(raw["git_branch_list_flags"]),
+    }
+
+
+# cmd.exe 的元字符：出现即不判免审。`;` `&&` `|` `>` 能改写一条命令的作用域与去向，
+# `^` 是 cmd 的转义符（可用来拆词绕过白名单）。换行同理（一条命令伪装成两条）。
+#
+# **这一条刻意留在代码里、不进 JSON**：它是解析器的**词法定义**，不是审批策略。放进数据文件
+# 意味着有人能在不改代码的情况下削弱解析器——把 `&&` 从表里删掉，命令拼接的口子就开了。
+# 词法事实也没有"按工作区 / 按命令族调"的诉求。
+# 注：`%` 是 cmd 的变量展开符，但它同时是 git 格式化串的常客（`--format=%h`），而只读 git
+# 命令里它不构成写向量——等 `cat` 那类**按路径判定**的命令进表时，再连它一起处理。
+_SHELL_METACHARS: tuple[str, ...] = (";", "&&", "||", "|", "&", "`", "$(", ">", "<", "^", "\n", "\r")
+
+
 #----------------------工具审核节点--------------------
 class ReviewNode:
     """逐条审批 pending 工具调用，按 tool.json 分流进编排/普通执行队列。
@@ -505,11 +554,75 @@ class ReviewNode:
             return None
         return self.toolset.known_names(state)
 
-    def _decide(self, tool_name: str | None, tool_cfg: dict, state: AgentState) -> str:
+    @staticmethod
+    def _free_shell_verdict(tool_args: dict) -> bool:
+        """run_command 的免审判定：这条命令是名单里的**只读**形态 → True（不弹审批面板）。
+
+        保守优先（fail-closed）：拿不准一律 False，照常弹面板让人看一眼——误判成 review 只是多
+        按一次 y，误判成 free 却是静默放行一次没人看过的命令。判定链（全过才 True）：
+        ① 命令文本不含 cmd 元字符；② 能切分出词；③ 首词在免审命令表里；
+        ④ 跳过 git 全局选项后子命令在白名单；⑤ 无写文件选项；⑥ branch 只认列分支用法。
+
+        ③–⑥ 的口径全部来自 `app/agent/command_policy.json`（经 `_command_policy()`）——加一族
+        命令是改那张表，不是改本函数。①（元字符）刻意留在代码里，理由见 `_SHELL_METACHARS`。
+        """
+        policy = _command_policy()
+        command = tool_args.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return False
+        if any(char in command for char in _SHELL_METACHARS):
+            return False
+        try:
+            # posix=False 是**必须的**：终端跑在 cmd.exe 上，POSIX 规则会把 `C:\work\a` 的
+            # 反斜杠当转义符吃掉，切出与实际执行不同的词串——而"解析结果 ≠ 实际执行的命令"
+            # 正是这类判定最不能有的性质。
+            tokens = shlex.split(command, posix=False)
+        except ValueError:  # 引号不闭合等
+            return False
+        if not tokens:
+            return False
+
+        head = tokens[0].strip("\"'").lower()
+        allowed = policy["free_commands"].get(head)
+        if allowed is None:
+            return False
+
+        # 找子命令：跳过带值的全局选项（`-C <dir>` 占两个词）
+        index = 1
+        while index < len(tokens):
+            token = tokens[index].strip("\"'")
+            if token in policy["global_skip"]:
+                index += 2 if token == "-C" else 1
+                continue
+            break
+        if index >= len(tokens):
+            return False
+        subcommand = tokens[index].strip("\"'")
+        if subcommand not in allowed:
+            return False
+
+        rest = [token.strip("\"'") for token in tokens[index + 1 :]]
+        if any(token.startswith(policy["write_flags"]) for token in rest):
+            return False
+        if subcommand == "branch":
+            # 只认列分支：不能有位置实参，选项也得在列表 flag 白名单里（挡住 -d/-D/-m/-c …）
+            return all(token in policy["branch_list_flags"] for token in rest)
+        return True
+
+    def _decide(
+        self,
+        tool_name: str | None,
+        tool_cfg: dict,
+        state: AgentState,
+        tool_args: dict | None = None,
+    ) -> str:
         """给一条待审调用定处置：`unknown` / `review` / `free`。
 
         - **unknown**：名字不在当前工具表里（模型编的，或它所属技能刚被卸载）→ 回执、**不弹面板**。
           否则模型每编一个名字就打断人一次，而它无论如何都会被 ToolNode 拒掉；
+        - **free（命令级）**：tool.json 标了 `free_when: readonly_shell` 的工具（当前只有
+          run_command），**还要它的参数**判为只读终端命令才算数，见 `_free_shell_verdict`。
+          判定不过就落回 review —— 这条路是加宽免审面的唯一入口，失败方向必须是收紧。
         - **review**：`tool.json` 说要审批；**或**它在工具表里却没登记 —— 这条是 §13.4 的第二道防线
           （fail-closed）：有人往 MCP server 加了个写工具却忘了登记，旧行为是"未登记 = 免审"，
           等于静默放行一次写操作。限定在"在表里"是为了不误伤模型编出来的名字。
@@ -520,6 +633,8 @@ class ReviewNode:
         known = self._known_names(state)
         if known is not None and tool_name not in known:
             return "unknown"
+        if tool_cfg.get("free_when") == "readonly_shell" and self._free_shell_verdict(tool_args or {}):
+            return "free"
         if tool_cfg.get("need_review"):
             return "review"
         if known is not None and tool_name not in self.tool_review:
@@ -561,7 +676,7 @@ class ReviewNode:
         approved = True
         denied_messages: list[ToolMessage] = []
 
-        action = self._decide(tool_name, tool_cfg, state)
+        action = self._decide(tool_name, tool_cfg, state, current_tool.get("args", {}))
         if action == "unknown":
             # 模型编出来的名字（本会话根本没绑定过它）：回执而不弹面板，见 _decide 的说明
             return self._unknown_result(state, current_tool)

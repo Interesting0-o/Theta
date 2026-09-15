@@ -1,0 +1,8 @@
+{
+    "free_commands": {
+        "git": ["status", "branch", "diff", "log", "fetch"]
+    },
+    "git_write_flags": ["-o", "--output"],
+    "git_global_skip": ["-C", "--no-pager"],
+    "git_branch_list_flags": ["-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--list", "--color", "--no-color"]
+}
