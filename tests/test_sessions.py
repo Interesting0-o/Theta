@@ -6,6 +6,7 @@
 """
 import asyncio
 import time
+from datetime import datetime, timezone
 from typing import Annotated, TypedDict
 
 import aiosqlite
@@ -15,7 +16,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 import app.resource as resource
-from app.platform.commands.session import list_sessions, resolve_session_id
+from app.platform.commands.session import _format_time, list_sessions, resolve_session_id
 
 
 class _State(TypedDict):
@@ -106,6 +107,33 @@ def test_list_sessions_respects_summarize_limit(tmp_path, monkeypatch):
     assert [info.session_id for info in infos] == ["new22222", "old11111"]
     assert infos[0].message_count == 2  # 最近的那个读了
     assert infos[1].message_count is None and infos[1].summary == ""  # 更早的没读
+
+
+# ---------------------- 时间渲染：两个来源的时区必须拉齐 ----------------------
+
+
+def test_format_time_converts_utc_checkpoint_ts_to_local():
+    """checkpoint 的 ts 是 **UTC aware** 串，渲染前必须转成本机时区。
+
+    回归：旧实现直接拿它的 date()/%H:%M 当本地用，整列差一个时区（CST 下真实 11:55
+    显示成 03:55），UTC 日期比本地早一天时还会误判成"昨天"。
+    """
+    now_utc = datetime.now(timezone.utc)
+
+    rendered = _format_time(now_utc.isoformat())
+
+    assert rendered.startswith("今天"), rendered
+    # 同一时刻的本地钟点，而不是 UTC 钟点
+    assert rendered == f"今天 {now_utc.astimezone():%H:%M}"
+
+
+def test_format_time_keeps_naive_local_fallback():
+    """文件时间回退（list_sessions 的 fromtimestamp）是**本地 naive**，不能再被转一次。"""
+    moment = datetime.now().replace(second=0, microsecond=0)
+
+    rendered = _format_time(moment.isoformat(timespec="seconds"))
+
+    assert rendered == f"今天 {moment:%H:%M}"
 
 
 def test_resolve_session_id_full_prefix_and_ambiguous(tmp_path, monkeypatch):

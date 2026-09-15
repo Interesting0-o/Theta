@@ -4,7 +4,7 @@
 import 它。web_search.py 在 import 期检查 TAVILY_API_KEY，故先用 setdefault 塞一个
 测试占位键（不发起真实网络请求），因此**不要求 .env / WORKSPACE_PATH**，可独立运行：
 
-    uv run python -m pytest tests/test_web_search.py
+    .venv/Scripts/python.exe -m pytest tests/test_web_search.py
 
 覆盖要点：
 - 三个 wrapper 把上游 dict 渲染成字符串正文（ToolResult.content 恒为 str，

@@ -7,7 +7,6 @@
 `workspace` 参量。`app.platform`（基座）在 import 期不碰 `app.agent` → `import app.tui`
 无需 .env（真图装配在基座 runtime 里懒加载）。
 """
-import asyncio
 import uuid
 from pathlib import Path
 

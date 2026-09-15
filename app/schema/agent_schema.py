@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Literal, NotRequired, TypedDict
+from typing import Literal, TypedDict
 
 from pydantic import BaseModel
 
@@ -27,7 +27,6 @@ class NoteEntry(TypedDict):
     定位：给"花钱、不可免费重取"的大结果（联网检索等）一个指针常驻、正文按需取回的落点，
     让折叠可以更激进。不做跨会话语义库——值钱结论由 agent 主动 promote 进 repo。
     kind 约定：research / web / crawl / extract / command_output …（系统按 kind + 体积阈值归档）。
-    topic/tags：归档时留空，需整理时由模型调 update_note_tags / notes_by_topic 懒分类。
     created：unix 秒；size：content 的字符数；content：markdown payload（消费者是模型）。
     """
     kind: str
@@ -36,8 +35,6 @@ class NoteEntry(TypedDict):
     content: str
     created: int
     size: int
-    topic: NotRequired[str]
-    tags: NotRequired[list[str]]
 
 
 class ImageRef(TypedDict):

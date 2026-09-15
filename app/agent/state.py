@@ -22,7 +22,7 @@ class AgentState(TypedDict):
     current_plan: List[PlanStep]
 
     #--------------上下文留存-----------------
-    # 笔记区：折叠时"不可免费重取"的联网检索正文落点；外层 dict 的 key = notes#<n>（稳定 ref），
+    # 笔记区：折叠时"不可免费重取"的联网检索正文落点；外层 dict 的 key = notes#r<n>（稳定 ref，
     # 随 checkpoint 存亡（不做跨会话语义库）。无 reducer → 写入方读改写合并。
     notes: Dict[str, NoteEntry]
 

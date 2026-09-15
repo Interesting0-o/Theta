@@ -1,4 +1,4 @@
-"""`get_skill("github")` 的端到端：**真拉起** `skills/github/server.py` → 15 个工具进本会话 → 真调用。
+"""`get_skill("github")` 的端到端：**真拉起** `skills/github/server.py` → 17 个工具进本会话 → 真调用。
 
 三块测试的分工（少一块就有一段链路没人验证）：
 

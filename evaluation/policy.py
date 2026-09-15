@@ -1,13 +1,11 @@
 """审批策略：评估时"模拟人"按下 y/n。
 
-真实 TUI（app/main.py）里审批决定来自用户输入；评估要把这部分替换成**确定性策略**，
-否则无法批量跑。每个策略是 `(payload: dict) -> bool` 的函数，payload 即
-ReviewNode interrupt 出的字典（含 tool_name / tool_args / tool_call_id / current_step，
-见 app/agent/nodes.py::ReviewNode），策略只按工具名决策即可覆盖绝大多数场景。
+真实 TUI（`app/platform/turn.py::drive_turn` 的 park/resume）里审批决定来自用户输入；
+评估要把这部分替换成**确定性策略**，否则无法批量跑。每个策略是 `(payload: dict) -> bool`
+的函数，payload 即 ReviewNode interrupt 出的字典（含 tool_name / tool_args / tool_call_id /
+current_step，见 app/agent/nodes.py::ReviewNode），策略只按工具名决策即可覆盖绝大多数场景。
 
 内置策略：
-- auto_approve：全批准（等同人类一路按 y）
-- auto_reject：全拒绝（测拒绝路径：模型能否调整策略而非死循环）
 - allow_except(deny)：除黑名单外批准——**评估默认用它**，把 terminal（任意命令
   执行）与四个联网工具（花钱/外发）列入黑名单，保证评估沙箱安全。
 """
@@ -26,16 +24,6 @@ DEFAULT_DENY_TOOLS: tuple[str, ...] = (
     "crawl_website",
     "deep_research",
 )
-
-
-def auto_approve(payload: dict) -> bool:
-    """一律批准（不校验 payload）。"""
-    return True
-
-
-def auto_reject(payload: dict) -> bool:
-    """一律拒绝（专门用于测 approved=false 的恢复链路）。"""
-    return False
 
 
 def allow_except(deny: tuple[str, ...] = DEFAULT_DENY_TOOLS) -> Policy:

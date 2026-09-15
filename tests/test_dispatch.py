@@ -11,7 +11,6 @@ import asyncio
 import json
 from pathlib import Path
 
-import pytest
 from langchain_core.messages import ToolMessage
 
 import app.agent.tools as tools_mod

@@ -8,7 +8,7 @@
 
 运行（import mcp_service.file_io 需要 WORKSPACE_PATH 存在，见 CLAUDE.md）：
 
-    uv run python -m pytest tests/test_file_io_sandbox.py
+    .venv/Scripts/python.exe -m pytest tests/test_file_io_sandbox.py
 
 符号链接用例在无权限平台（如未开开发者模式的 Windows）自动 skip。
 """

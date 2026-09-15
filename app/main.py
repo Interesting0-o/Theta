@@ -4,8 +4,10 @@ TUI 逻辑已迁入 `app/tui`（终端前端）+ `app/platform`（事件基座�
 `python -m app.main` 的入口语义：调 `app.tui.run_tui()`，并把**入口边界**的配置类错误
 翻成人话（docs/EXCEPTION_DESIGN.md §6）。
 ```
-uv run python -m app.main        # 或 .venv/Scripts/python.exe -m app.main（勿动 venv）
+.venv/Scripts/python.exe -m app.main     # 本机是 WSL + Windows venv，用仓库里的解释器
 ```
+**不要用 `uv run`**：WSL 里的 `uv` 是系统 uv，跑它会另建/重同步一个 Linux venv、破坏现有
+环境（见 CLAUDE.md「常用命令」）。
 """
 import asyncio
 import sys

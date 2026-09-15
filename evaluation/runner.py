@@ -1,6 +1,7 @@
 """评估驱动器：把 TUI 的人工循环改成"审批策略 + 断言"的批量循环。
 
-app/main.py 的循环是评估的原型——这里唯一的变化是把 `input()` 换成 policy 函数：
+app/platform/turn.py::drive_turn 的 park/resume 是评估的原型——这里唯一的变化是把人工决定的
+那一步换成 policy 函数：
 
     while True:
         result = await graph.ainvoke(inputs, config)
@@ -27,11 +28,10 @@ TODO（层 A）：无 LLM 成本的录制回放——把真实运行的 tool_cal
 """
 from __future__ import annotations
 
-import asyncio
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,17 +43,7 @@ from app.agent.graph import get_main_agent_graph
 from app.agent.mcp import close_session_pool
 from app.agent.state import AgentState
 
-from .policy import Policy
 from .tasks import Task
-
-
-@dataclass(frozen=True)
-class InterruptRecord:
-    """一次审批中断的记录：给报告统计审批次数、审计"批了什么"。"""
-
-    tool_name: str
-    approved: bool
-    payload: Dict[str, Any]
 
 
 @dataclass
@@ -66,7 +56,10 @@ class EvalResult:
     task_name: str
     ok: bool
     final_state: Optional[Dict[str, Any]] = None
-    interrupts: List[InterruptRecord] = field(default_factory=list)
+    # 只留计数：消费者（checks.approvals_between / report 的表格列）要的都只是次数。
+    # 曾记过 InterruptRecord(tool_name/approved/payload) 三个字段，全仓无人读——要做
+    # "批了什么"的审计时再按当时的需要加回来。
+    interrupt_count: int = 0
     rounds: int = 0
     elapsed_seconds: float = 0.0
     error: Optional[str] = None
@@ -93,29 +86,23 @@ def apply_setup(workspace: Path, setup: Dict[str, str]) -> None:
         target.write_text(content, encoding="utf-8")
 
 
-def _extract_payload(interrupts) -> Tuple[Any, Dict[str, Any]]:
+def _extract_payload(interrupts) -> Dict[str, Any]:
     """从 result["__interrupt__"] 取最后一个 Interrupt 的 value 字典。
 
     一次挂起只处理一条（与 TUI 一致：恢复后 review_node 会为下一条再次 interrupt）。
     """
-    item = interrupts[-1]
-    payload = getattr(item, "value", item)
+    payload = getattr(interrupts[-1], "value", interrupts[-1])
     if not isinstance(payload, dict):
         payload = {"tool_name": "unknown", "raw": str(payload)}
-    return item, payload
+    return payload
 
 
-async def run_task(
-    graph,
-    task: Task,
-    workspace: Path,
-    policy: Optional[Policy] = None,
-) -> EvalResult:
+async def run_task(graph, task: Task, workspace: Path) -> EvalResult:
     """在已预置的工作区里跑一个任务，返回原始 EvalResult（不做评分）。
 
-    graph 为编译后的图（build_eval_graph 产出）；policy 缺省取 task.policy。
+    graph 为编译后的图（build_eval_graph 产出）；审批策略取 task.policy（每任务自带）。
     """
-    policy = policy or task.policy
+    policy = task.policy
     result = EvalResult(task_name=task.name, ok=False)
     started = time.monotonic()
 
@@ -140,15 +127,9 @@ async def run_task(
 
             interrupts = output.get("__interrupt__") or []
             if interrupts:
-                _, payload = _extract_payload(interrupts)
+                payload = _extract_payload(interrupts)
                 approved = bool(policy(payload))
-                result.interrupts.append(
-                    InterruptRecord(
-                        tool_name=payload.get("tool_name", "unknown"),
-                        approved=approved,
-                        payload=payload,
-                    )
-                )
+                result.interrupt_count += 1
                 inputs = Command(resume={"approved": approved})
                 continue
 

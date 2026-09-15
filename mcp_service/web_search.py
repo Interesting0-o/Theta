@@ -15,7 +15,6 @@
 content 会在构造时抛 ValidationError（曾导致该工具必然 internal_error）。参数类型收窄成
 Literal 后 FastMCP 会在 JSON Schema 里生成 enum，模型只看到合法取值。
 
-注：extract_urls / crawl_website / deep_research 尚未接入 mcp.py 拉起，不影响运行；
 参数校验用 InvalidArgumentError、返回结果与 web_search 一样经 _translate_upstream 翻译成
 失败 ToolResult / 特制渲染的字符串正文（content 恒为 str，不违反 ToolResult schema）。
 """

@@ -11,7 +11,7 @@ TODO（骨架之后）：
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List
+from typing import Dict, List
 
 from .checks import (
     Check,

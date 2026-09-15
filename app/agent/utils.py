@@ -38,8 +38,9 @@ def coerce_tool_result(result) -> ToolResult | None:
 
     处理顺序：
     - ToolResult：原样返回；
-    - dict：仅当含 success 且 content 为 str 时按 ToolResult 还原（多余的键会让
-      ToolResult(**…) 抛 ValidationError → None）；
+    - dict：仅当含 success 且 content 为 str 时按 ToolResult 还原。**多余的键不会让它抛错**
+      （pydantic v2 默认 extra='ignore'，实测 ToolResult(**{...,"extra_key":1}) 正常构造）；
+      这里兜的是 success/content 类型不可强转的情况（如 success 传了 dict）→ None。
     - list（MCP adapters 形态）：逐块取 text 拼成一段、json.loads；命中
       "success + content:str" 才还原为 ToolResult，否则 None。
     其余形态（str 等）一律 None。

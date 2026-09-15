@@ -642,7 +642,7 @@ def test_pr_reviews_empty_gives_guidance(gh, monkeypatch):
 
 
 def test_file_read_binary_returns_receipt_not_garbage(gh, monkeypatch):
-    """远端 PNG：NUL 探测 + 类型回执（与本地 read_file 同款），不吐 replace 乱码。"""
+    """远端 PNG：NUL 探测 + 二进制回执（与本地 read_file 同款），不吐 replace 乱码。"""
     import base64 as b64
 
     png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
@@ -664,7 +664,7 @@ def test_file_read_binary_returns_receipt_not_garbage(gh, monkeypatch):
     out = gh.github_file_read("octo", "demo", "pic.png")
 
     assert out.success is True
-    assert "二进制文件" in out.content and "PNG" in out.content
+    assert "二进制文件" in out.content
     assert "�" not in out.content  # 没有替换字符乱码
 
 

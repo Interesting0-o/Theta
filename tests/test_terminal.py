@@ -147,6 +147,34 @@ def test_start_process_resident_lifecycle():
     asyncio.run(_scenario())
 
 
+def test_process_read_returns_output_of_finished_process():
+    """已结束进程的输出必须完整给到模型，不许回"(无输出)"。
+
+    回归：process_read 曾先无条件 read_new 一次（**推进消费游标**），紧接着的"已结束"
+    分支却把它丢掉、只渲染 _render_finished——后者内部 drain() 再取就只剩空串，
+    等于把"进程没输出"这个错误事实喂给模型（dev server 崩了、后台命令跑完都会中招）。
+    """
+    # 先打一行标记、再自己跑一会儿：启动时仍在运行（走 process_read 路径），稍后自然结束
+    cmd = (
+        "echo MARKER_OUTPUT_XYZ && ping -n 3 127.0.0.1 >nul"
+        if _NT
+        else "echo MARKER_OUTPUT_XYZ; sleep 2"
+    )
+
+    async def _scenario():
+        res = await start_process(cmd, description="测试已结束进程的输出", startup_wait=0.3)
+        assert "仍在运行" in res.content  # 启动时还没结束，否则测不到这条路径
+        pid = _pid(res.content)
+
+        await asyncio.sleep(4)  # 等它自然结束、reader 任务收完输出
+
+        rd = await process_read(pid)
+        assert "MARKER_OUTPUT_XYZ" in rd.content, rd.content
+        assert "(无输出)" not in rd.content
+
+    asyncio.run(_scenario())
+
+
 def test_start_process_detects_immediate_crash():
     async def _scenario():
         # 一个必然启动即退出的命令（不存在的命令会被 shell 报错退出）

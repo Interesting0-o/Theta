@@ -6,7 +6,8 @@ r"""resource 落盘路径单点：所有"按 (工作区, 会话) 定位"的数�
   稳定、可读、跨进程/重启一致；哈希用于消歧——纯替换会把 `C:\work\a-b` 与 `C:\work\a\b`
   塌成同一个 `C-work-a-b`，两个工作区就会共用一份 resource 目录；
 - `<ws_key>/sessions/<session_id>/agent.db`：该 (工作区, 会话) 的 LangGraph checkpoint（每会话一库）；
-- `<ws_key>/memory/`：Phase B 长期记忆 md 落点（本期只预留，不使用）。
+- `<ws_key>/memory/memory.md`：**长期记忆**正文（跨会话长存，文件即真值；读写单点在
+  app/agent/memory.py，注入与上限见 docs/LONG_TERM_MEMORY.md）。
 
 注意：本模块只依赖 stdlib/pathlib——**不 import app.agent**（其 `__init__` re-export graph→model→
 模块顶层 `get_settings()`，import 即要 .env）。放 `app/` 根（命名空间包、无 `__init__`）使
@@ -60,7 +61,7 @@ def session_db_path(workspace_path: str, session_id: str) -> Path:
 
 
 def memory_root(workspace_path: str) -> Path:
-    """某工作区的长期记忆 md 目录（Phase B 预留）。"""
+    """某工作区的长期记忆目录（其下 memory.md=正文；建会话时在此播种模板）。"""
     return workspace_dir(workspace_path) / "memory"
 
 

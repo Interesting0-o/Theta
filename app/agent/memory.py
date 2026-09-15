@@ -1,4 +1,4 @@
-"""agent 长期记忆（Phase B）：记忆 md 的读写单点。
+"""agent 长期记忆：记忆 md 的读写单点（已落地；"Phase B" 是当时的设计阶段名）。
 
 落点：`resource/<ws_key>/memory/memory.md`（路径经 app/resource.py::memory_root 算，文件名
 白名单硬编码在本模块——模型只给 type/content/key，永远不碰路径，见 LONG_TERM_MEMORY.md §5）。

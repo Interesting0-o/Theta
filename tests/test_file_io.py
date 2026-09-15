@@ -1,6 +1,5 @@
 from mcp_service.file_io import (
     copy_path,
-    create_dir,
     create_file,
     delete_dir,
     delete_file,
@@ -118,6 +117,25 @@ def test_copy_and_delete_dir(tmp_path):
     result = delete_dir(str(dst_dir), recursive=True)
     assert result.success is True
     assert not dst_dir.exists()
+
+
+def test_copy_path_directory_without_recursive_fails(tmp_path):
+    """目录 + recursive=False：不许回"目录已复制"却一个文件都没复制。
+
+    回归：旧实现在这条路上只 dst.mkdir() 就回 success=True，等于给模型一个假事实。
+    """
+    src_dir = tmp_path / "cp_src"
+    src_dir.mkdir()
+    (src_dir / "data.txt").write_text("hello", encoding="utf-8")
+    dst_dir = tmp_path / "cp_dst"
+
+    result = copy_path(str(src_dir), str(dst_dir), recursive=False)
+
+    assert result.success is False
+    assert result.error_type == "invalid_argument"
+    assert not dst_dir.exists()  # 什么都别建
+    assert "recursive" in result.content
+    assert src_dir.exists()  # 源也没被动过
 
 
 def test_delete_file(tmp_path):
@@ -265,7 +283,10 @@ def test_read_file_range_out_of_bounds_reports_empty(tmp_path):
 
 
 def test_read_file_binary_png_returns_receipt(tmp_path):
-    """读 PNG 给可预期回执（二进制 + 类型 + 大小），不再让 UnicodeDecodeError 冒成 internal_error。"""
+    """读 PNG 给可预期回执（判定为二进制 + 大小），不再让 UnicodeDecodeError 冒成 internal_error。
+
+    回执只说"是二进制、读不了"，不再猜"是什么格式"——路径里的 .png 已随回执回显。
+    """
     target = tmp_path / "pic.png"
     payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
     target.write_bytes(payload)
@@ -273,18 +294,20 @@ def test_read_file_binary_png_returns_receipt(tmp_path):
     result = read_file(str(target))
 
     assert result.success is True
-    assert "二进制文件" in result.content and "PNG" in result.content
+    assert "二进制文件" in result.content
     assert str(len(payload)) in result.content
 
 
-def test_read_file_unknown_binary_receipt(tmp_path):
-    target = tmp_path / "blob.bin"
-    target.write_bytes(b"abc" + b"\x00" * 8)
+def test_read_file_binary_receipt_carries_the_path(tmp_path):
+    """回执带 path：后缀在里面，模型据此自己判断格式（这是删掉魔数表的依据）。"""
+    target = tmp_path / "archive.tar.gz"
+    target.write_bytes(b"\x1f\x8b" + b"\x00" * 8)
 
     result = read_file(str(target))
 
     assert result.success is True
-    assert "二进制文件" in result.content and "未知类型" in result.content
+    assert "二进制文件" in result.content
+    assert "archive.tar.gz" in result.content
 
 
 def test_read_file_non_utf8_text_receipt(tmp_path):
@@ -327,6 +350,48 @@ def test_read_file_invalid_bounds_are_invalid_argument(tmp_path):
         result = read_file(str(target), **kwargs)
         assert result.success is False
         assert result.error_type == "invalid_argument", kwargs
+
+
+# ---------------- edit_file 二进制 / 非 UTF-8 的可预期回执 ----------------
+# 与 read_file 同一套口径：UnicodeDecodeError 不是 OSError 子类，漏了它就会冒到 guard
+# 被误判成 internal_error（回执还写"无需重试"），模型会因此得出误导结论。
+
+
+def test_edit_file_binary_returns_receipt(tmp_path):
+    target = tmp_path / "pic.png"
+    payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    target.write_bytes(payload)
+
+    result = edit_file(str(target), "x", "y")
+
+    assert result.success is True
+    assert result.error_type is None
+    assert "二进制文件" in result.content
+    assert target.read_bytes() == payload  # 原文件没被动过
+
+
+def test_edit_file_non_utf8_text_receipt(tmp_path):
+    """GBK 文本（无 NUL、NUL 探测放行）：给"不是 UTF-8"的回执而非 internal_error。"""
+    target = tmp_path / "gbk.txt"
+    target.write_bytes("你好，世界".encode("gbk"))
+
+    result = edit_file(str(target), "你好", "再见")
+
+    assert result.success is True
+    assert result.error_type is None
+    assert "不是 UTF-8" in result.content
+
+
+def test_edit_file_utf8_text_unaffected(tmp_path):
+    """修复不得波及正常路径：UTF-8 文本照常编辑。"""
+    target = tmp_path / "a.txt"
+    target.write_text("hello world\n", encoding="utf-8")
+
+    result = edit_file(str(target), "world", "theta")
+
+    assert result.success is True
+    assert "已编辑" in result.content
+    assert target.read_text(encoding="utf-8") == "hello theta\n"
 
 
 # ---------------- glob 按文件名/通配定位 ----------------
@@ -385,6 +450,27 @@ def test_glob_include_dirs_suffix(tmp_path):
     result = glob("sub", path=str(tmp_path), include_dirs=True)
     assert result.success is True
     assert "sub/" in result.content
+
+
+def test_glob_paths_are_relative_to_workspace_root(tmp_path):
+    """收窄 path 时，清单仍以**工作区根**为基准——否则结果喂给 read_file 会读错文件。
+
+    回归：旧实现用 entry.relative_to(root)（root = path 参数），传 path="src" 时回 "a.py"，
+    而 read_file/edit_file 把相对路径按**工作区根**解析 → 读到另一个同名文件或报不存在。
+    pattern 仍按 path 解释（"src/**/*.ts" 那种写法），只有**输出**的基准是工作区根。
+    """
+    from mcp_service import file_io as file_io_module
+
+    sub = tmp_path / "src"
+    sub.mkdir()
+    (sub / "a.py").write_text("x", encoding="utf-8")
+
+    result = glob("*.py", path=str(sub))
+
+    assert result.success is True
+    expected = (sub / "a.py").relative_to(file_io_module.WORKSPACE_PATH).as_posix()
+    assert expected in result.content
+    assert "\na.py" not in result.content  # 不能再是相对 path 的裸名
 
 
 def test_glob_no_match_and_cap(tmp_path):

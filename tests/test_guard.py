@@ -3,7 +3,7 @@
 直接调用原始函数、不经过 FastMCP，与 tests/test_file_io.py 一致。
 本文件不 import mcp_service.file_io，因此**不要求设置 WORKSPACE_PATH**，可独立运行：
 
-    uv run python -m pytest tests/test_guard.py
+    .venv/Scripts/python.exe -m pytest tests/test_guard.py
 
 覆盖要点：
 - L1 异常体系：WorkspaceViolationError 挂在共享根 AgentError 下、携带结构化字段

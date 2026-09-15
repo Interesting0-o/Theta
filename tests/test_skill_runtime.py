@@ -337,6 +337,24 @@ def test_preflight_line_lands_in_the_receipt(skills_dir, monkeypatch):
     assert calls == ["https://example.test/user"]  # 真去打了一次
 
 
+def test_probe_credential_catches_read_phase_oserror(monkeypatch):
+    """读阶段的**裸 OSError** 必须被接住——它是"体检失败不阻断加载"这条契约的一部分。
+
+    回归：urlopen 只在 connect/send 阶段把 OSError 包成 URLError；读阶段的超时
+    （TimeoutError）、连接被重置（ConnectionResetError）是裸 OSError。漏接就会逃出
+    get_skill——而那时 register_server 已经跑过，等于注册了却没写回 loaded_skills。
+    """
+    def _boom(*args, **kwargs):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(tools_module.urllib.request, "urlopen", _boom)
+
+    ok, detail = tools_module._probe_skill_credential("https://example.test/user", "token")
+
+    assert ok is False
+    assert "连不上" in detail
+
+
 def test_preflight_failure_does_not_block_loading(skills_dir, monkeypatch):
     """体检失败**不阻断加载**：正文/纪律在拿不到远端时照样有用，工具也照常注册。
 
@@ -637,6 +655,41 @@ def test_reconcile_failed_rebuild_backs_off(skills_dir, monkeypatch, caplog):
     fresh = SessionToolset(_WS, [])  # 重开会话 = 新实例
     asyncio.run(fresh.tools_and_version(state))
     assert len(calls) == 2  # 新会话真的重试
+
+
+def test_reconcile_failed_backoff_is_per_session(skills_dir, monkeypatch):
+    """失败退避必须**按会话**记：A 会话的失败不许让 B 会话整轮不再尝试重建。
+
+    回归：旧实现只按名字记（`_register_failed: set[str]`），但同一个实例会服务多个会话
+    （langgraph dev 一图多 thread）。更关键的是失败原因里有两条是**会话相关**的——"当前会话
+    没有会话标识"、"与**本会话**已有工具重名"——B 会话本该能成，却会被 A 的失败挡住，且
+    只表现为"正文在、工具没有"，没有任何回执说明为什么。
+    """
+    mcp._reset_pools_for_tests()
+    _make_skill(skills_dir, "demo")
+    monkeypatch.setattr(tools_module, "_tool_config", lambda: {})  # 工具没登记 → 必失败
+    calls: list[str] = []
+
+    async def fake(workspace, server, connection):
+        calls.append(server)
+        return [
+            MCPToolSpec(server=server, name="demo_tool", description="d", args_schema={}, metadata=None)
+        ]
+
+    monkeypatch.setattr(mcp_module, "_server_specs", fake)
+    _fake_settings(monkeypatch)
+
+    toolset = SessionToolset(_WS, [])
+    state_a = {"session_id": "sess-a", "loaded_skills": ["demo"]}
+    state_b = {"session_id": "sess-b", "loaded_skills": ["demo"]}
+
+    asyncio.run(toolset.tools_and_version(state_a))  # A：试一次、失败、记住
+    assert len(calls) == 1
+    asyncio.run(toolset.tools_and_version(state_a))  # A 后续：退避
+    assert len(calls) == 1
+
+    asyncio.run(toolset.tools_and_version(state_b))  # B 必须**自己**试一次
+    assert len(calls) == 2
 
 
 # ---------------------- 动态 bind ----------------------

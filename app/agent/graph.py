@@ -5,7 +5,15 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.messages import AIMessage
 from app.agent.state import AgentState
-from app.agent.nodes import *
+from app.agent.nodes import (
+    CompactNode,
+    LLMNode,
+    OrchestrateNode,
+    QueueNode,
+    ReviewNode,
+    ToolNode,
+    needs_compact,
+)
 from app.agent.model import get_main_chat_model
 from app.agent.prompt import WORKER_SYSTEM_PROMPT
 from app.agent.mcp import load_mcp_tool
@@ -63,8 +71,9 @@ async def get_main_agent_graph(workspace_path: str | None = None, session_id: st
     get_main_agent_graph_langgraph 零参调用 → 默认 <项目根>/tmp。
 
     session_id 同样是构造期参量：它决定 MCP **运行体的作用域**（(工作区, 会话) 一个池，
-    见 app/agent/mcp.py）。TUI 传真实会话 id、evaluation 传任务名、worker 传自己的会话 id；
-    零参入口（langgraph dev）为 None → 所有会话共享一组运行体（已知偏差）。
+    见 app/agent/mcp.py）。TUI 传真实会话 id、evaluation 传任务名；零参入口（langgraph dev）
+    为 None → 所有会话共享一组运行体（已知偏差）。worker 子图**不走本入口**——它走
+    get_sub_agent_graph（签名里没有 session_id）。
     """
     workspace_path = _resolve_workspace(workspace_path)
     # 默认 tmp 工作区需存在：os.makedirs 属阻塞调用，放到线程执行（blockbuster 不拦）

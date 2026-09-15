@@ -72,7 +72,7 @@ def approvals_between(lo: int, hi: int) -> Check:
     """审批（interrupt）次数落在 [lo, hi]：写任务应 ≥1 且不过多，读任务应为 0。"""
 
     def check(result, workspace: Path) -> tuple[bool, str]:
-        count = len(getattr(result, "interrupts", []))
+        count = getattr(result, "interrupt_count", 0)
         if lo <= count <= hi:
             return True, f"审批 {count} 次"
         return False, f"审批 {count} 次，期望 [{lo}, {hi}]"

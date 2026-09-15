@@ -24,7 +24,7 @@ def render_task(
 
     line = (
         f"{task.name:<20} | {passed}/{len(outcomes):<7} | "
-        f"{len(result.interrupts):<4} | {result.rounds:<4} | "
+        f"{result.interrupt_count:<4} | {result.rounds:<4} | "
         f"{result.elapsed_seconds:>6.1f}s | "
         f"{'OK' if result.ok else result.error or 'FAIL'}"
     )

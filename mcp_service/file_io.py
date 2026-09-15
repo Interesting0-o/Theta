@@ -75,31 +75,10 @@ def _is_binary(data: bytes) -> bool:
     return b"\x00" in data[:4096]
 
 
-# 常见二进制格式的魔数前缀（给回执一句"它是什么"的粗提示；只求可读不求精确）。
-# 会被 NUL 探测放行的"真文本"到不了这里，所以 BM/MZ 这类宽松前缀不会误伤文本文件。
-_MAGIC_PREFIXES: tuple[tuple[bytes, str], ...] = (
-    (b"\x89PNG\r\n\x1a\n", "PNG 图片"),
-    (b"\xff\xd8\xff", "JPEG 图片"),
-    (b"GIF87a", "GIF 图片"),
-    (b"GIF89a", "GIF 图片"),
-    (b"BM", "BMP 图片"),
-    (b"%PDF", "PDF 文档"),
-    (b"PK\x03\x04", "ZIP 压缩包"),
-    (b"\x1f\x8b", "GZip 压缩包"),
-    (b"\x7fELF", "ELF 可执行文件"),
-    (b"MZ", "Windows 可执行文件"),
-    (b"\x00\x00\x01\x00", "ICO 图标"),
-)
-
-
-def _binary_kind(head: bytes) -> str:
-    """从文件头部魔数猜二进制类型；猜不出给"未知类型"（WebP 是 RIFF 容器，单独判）。"""
-    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
-        return "WebP 图片"
-    for prefix, kind in _MAGIC_PREFIXES:
-        if head.startswith(prefix):
-            return kind
-    return "未知类型"
+# 注：这里曾有一张 _MAGIC_PREFIXES 魔数表（按文件头猜"PNG 图片/PDF 文档"这类标签）。2026-09-15
+# 删除：它只是回执里的一句显示标签、无任何分支依赖它，而"能不能当文本读"已由 _is_binary 定性；
+# 回执里本就回显了 path（后缀在内），这张表在多数场景是冗余的，又永远覆盖不全（其余一律印
+# "未知类型"）——还给 skills/github 复制了第二份。判定"是二进制"就够了，猜"是什么"交给模型。
 
 
 #---------------------MCP服务------------------------#
@@ -200,7 +179,15 @@ def delete_dir(dir_path: str, recursive: bool = False) -> ToolResult:
 @mcp.tool()
 @guard
 def copy_path(source: str, destination: str, recursive: bool = True) -> ToolResult:
-    """复制文件或目录到指定位置。"""
+    """复制文件或目录到指定位置。
+
+    Args:
+        source: 源路径（文件或目录），须在工作区内。
+        destination: 目标路径，须在工作区内。
+        recursive: 源是**目录**时是否连内容一起复制（默认 True）。源是文件时该参数无意义。
+            目录传 False 会直接失败——它只建一个空的目标目录、什么都不复制，回"已复制"
+            等于给模型一个假事实（旧实现就是这么做的）。
+    """
     src = _resolve_path(source)
     _is_in_workspace(src)  # 检查源路径是否在工作区路径内
     dst = _resolve_path(destination)
@@ -211,10 +198,16 @@ def copy_path(source: str, destination: str, recursive: bool = True) -> ToolResu
             return ToolResult(success=False, content=f"源路径不存在: {src}")
 
         if src.is_dir():
-            if recursive:
-                shutil.copytree(src, dst, dirs_exist_ok=True)
-            else:
-                dst.mkdir(parents=True, exist_ok=True)
+            if not recursive:
+                return ToolResult(
+                    success=False,
+                    error_type="invalid_argument",
+                    content=(
+                        f"{src} 是目录：recursive=False 只会建一个空目标目录、不复制任何内容，"
+                        f"故不予执行。要复制目录及其内容请传 recursive=True（默认）"
+                    ),
+                )
+            shutil.copytree(src, dst, dirs_exist_ok=True)
             return ToolResult(success=True, content=f"目录已复制: {src} -> {dst}")
 
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -273,9 +266,31 @@ def edit_file(
     try:
         if not file_path.exists():
             return ToolResult(success=False, content=f"文件不存在: {file_path}")
+        # 与 read_file 同一套判定（先字节探测、再按文本解码）：UnicodeDecodeError 不是 OSError
+        # 子类，原先它冒到 guard 会被误判成 internal_error（回执还写"无需重试"）——中文 Windows
+        # 上 GBK 源文件很常见，模型会因此得出误导结论。二进制同样落在这里（解不开 UTF-8）。
+        with open(file_path, "rb") as f:
+            head = f.read(4096)
+        if _is_binary(head):
+            size = file_path.stat().st_size
+            return ToolResult(
+                success=True,
+                content=f"{path} 是二进制文件，大小 {size} 字节，无法作为文本编辑",
+            )
         text = file_path.read_text(encoding="utf-8")
     except OSError as e:
         return ToolResult(success=False, error_type="io_error", content=f"读取文件失败: {e}")
+    except UnicodeDecodeError:
+        # 没过 NUL 探测但解不开 UTF-8：多半是 GBK 等本地编码的文本。措辞与 read_file 对齐，
+        # 给可预期回执，不装作读到了、也不当内部错误。
+        size = file_path.stat().st_size
+        return ToolResult(
+            success=True,
+            content=(
+                f"{path} 不是 UTF-8 编码的文本（可能是 GBK/latin-1 等编码），"
+                f"大小 {size} 字节，无法按文本读取；如需内容可用终端命令转码"
+            ),
+        )
 
     if not old_string:
         return ToolResult(success=False, error_type="invalid_argument", content="old_string 不能为空")
@@ -338,11 +353,10 @@ def read_file(
         with open(file_path, "rb") as f:
             head = f.read(4096)
         if _is_binary(head):
-            kind = _binary_kind(head)
             size = file_path.stat().st_size
             return ToolResult(
                 success=True,
-                content=f"{path} 是二进制文件（疑似 {kind}），大小 {size} 字节，无法作为文本读取",
+                content=f"{path} 是二进制文件，大小 {size} 字节，无法作为文本读取",
             )
         with open(file_path, "rb") as f:
             data = f.read()
@@ -451,6 +465,12 @@ def get_directory_tree(path: str, max_depth: int = 3) -> ToolResult:
                         real = entry.resolve()
                     except OSError:
                         continue
+                    # entry.is_dir() 跟随符号链接：工作区里一个指向外部的目录链接，若直接
+                    # 递归进去就会把工作区外的目录/文件名列进树里（内容读不到，但不该列）。
+                    # 与 search_content 对候选路径的口径一致：resolve 后校验，越界即跳过。
+                    if not real.is_relative_to(WORKSPACE_PATH):
+                        lines.append(f"{prefix}    └── (指向工作区外，已跳过)")
+                        continue
                     if real in seen:
                         lines.append(f"{prefix}    └── (循环引用，已跳过)")
                         continue
@@ -534,6 +554,10 @@ def glob(
       的文件（如 .env.example）只要名字匹配就会列出。
     沙箱：结果只可能落在 path 起始目录内（path 须在工作区），不会触达工作区外。
 
+    **基准**：pattern **按 path 解释**（"src/**/*.ts" 是相对 path 的子路径），但返回的
+    清单**一律相对工作区根**——这样结果可以直接喂给 read_file/edit_file（它们把相对路径
+    按工作区根解析）。两者在 path="."（默认）时重合，只有显式收窄 path 时才分得开。
+
     Args:
         pattern: shell 通配模式，如 "*.py"、"test_*.py"、"src/**/*.ts"。
         path: 起始目录，默认整个工作区；须在工作区内。
@@ -575,7 +599,7 @@ def glob(
             for name in dirnames:
                 entry = Path(dirpath) / name
                 if _match(entry):
-                    hits.append(entry.relative_to(root).as_posix() + "/")
+                    hits.append(entry.relative_to(WORKSPACE_PATH).as_posix() + "/")
                     if len(hits) >= max_results:
                         capped = True
                         break
@@ -584,7 +608,7 @@ def glob(
         for name in sorted(filenames):
             entry = Path(dirpath) / name
             if _match(entry):
-                hits.append(entry.relative_to(root).as_posix())
+                hits.append(entry.relative_to(WORKSPACE_PATH).as_posix())
                 if len(hits) >= max_results:
                     capped = True
                     break

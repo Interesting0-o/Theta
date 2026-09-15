@@ -86,14 +86,12 @@ class _OutputBuffer:
 # ------------------------------ 进程记录 ------------------------------
 
 class _Proc:
-    def __init__(self, id_: str, command: str, description: str, resident: bool,
-                 proc: asyncio.subprocess.Process, cwd: str) -> None:
+    def __init__(self, id_: str, command: str, proc: asyncio.subprocess.Process) -> None:
         self.id = id_
         self.command = command
-        self.description = description
-        self.resident = resident
         self.proc = proc
-        self.cwd = cwd
+        # 由 start_process 置 True；_render_running 据此标"常驻/一次性"
+        self.resident = False
         self.started = time.monotonic()
         self.buffer = _OutputBuffer()
         self.exit_code: int | None = None
@@ -112,8 +110,8 @@ def _next_id() -> str:
     return f"p{next(_IDS)}"
 
 
-def _register(command: str, description: str, resident: bool, proc, cwd: str) -> _Proc:
-    rec = _Proc(_next_id(), command, description, resident, proc, cwd)
+def _register(command: str, proc) -> _Proc:
+    rec = _Proc(_next_id(), command, proc)
     _PROCS[rec.id] = rec
     return rec
 
@@ -166,14 +164,14 @@ def _build_spawn_kwargs(cwd: str | None) -> dict:
     return kwargs
 
 
-async def _spawn(command: str, cwd: str | None) -> tuple[_Proc, asyncio.subprocess.Process]:
+async def _spawn(command: str, cwd: str | None) -> _Proc:
     proc = await asyncio.create_subprocess_shell(command, **_build_spawn_kwargs(cwd))
-    rec = _register(command, "", False, proc, cwd or "")
+    rec = _register(command, proc)
     rec.readers = [
         asyncio.create_task(_reader_task(proc.stdout, rec.buffer)),
         asyncio.create_task(_reader_task(proc.stderr, rec.buffer)),
     ]
-    return rec, proc
+    return rec
 
 
 def _kill_tree(proc: asyncio.subprocess.Process) -> None:
@@ -307,8 +305,7 @@ async def run_command(
     cwd = _resolve_cwd(cwd)
     timeout = max(1, int(timeout))
 
-    rec, _proc = await _spawn(command, cwd)
-    rec.description = description
+    rec = await _spawn(command, cwd)
     try:
         code = await asyncio.wait_for(rec.proc.wait(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -353,9 +350,8 @@ async def start_process(
     cwd = _resolve_cwd(cwd)
     startup_wait = max(0, int(startup_wait))
 
-    rec, _proc = await _spawn(command, cwd)
+    rec = await _spawn(command, cwd)
     rec.resident = True
-    rec.description = description
 
     if startup_wait > 0:
         try:
@@ -419,13 +415,16 @@ async def process_read(process_id: str) -> ToolResult:
         process_id: 目标进程号（形如 p1）。
     """
     rec = _find(process_id)
-    new_text = rec.buffer.read_new(limit=12000)
     if rec.exit_code is not None or rec.proc.returncode is not None:
         if rec.exit_code is None:
             rec.exit_code = rec.proc.returncode
         await _collect(rec)
+        # 这条分支**不能**先 read_new 一次：那会推进消费游标，紧接着 _render_finished 里的
+        # drain()（= read_new(None)）就再也取不到东西，已结束进程的输出被静默吞成"(无输出)"。
+        # 只 drain，一次取净。
         return _render_finished(rec, rec.exit_code or 0)
 
+    new_text = rec.buffer.read_new(limit=12000)
     elapsed = time.monotonic() - rec.started
     idle = max(0.0, time.monotonic() - rec.buffer.last_append_ts)
     lines = [

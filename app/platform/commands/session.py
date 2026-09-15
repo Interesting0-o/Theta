@@ -160,11 +160,19 @@ def _short_id(session_id: str) -> str:
 
 
 def _format_time(iso: str) -> str:
-    """把 ISO 时间渲染成"今天 HH:MM / 昨天 HH:MM / YYYY-MM-DD HH:MM"。"""
+    """把 ISO 时间渲染成"今天 HH:MM / 昨天 HH:MM / YYYY-MM-DD HH:MM"（一律按本机时区）。
+
+    两个来源的时区不同，必须在这里拉齐：checkpoint 的 `ts` 是 **UTC 的 aware 串**
+    （langgraph 写 `datetime.now(timezone.utc)`），而文件时间回退（`list_sessions` 的
+    `datetime.fromtimestamp`）是**本地 naive**。旧实现直接拿 UTC 的 date()/%H:%M 当本地用，
+    整列差一个时区（CST 下真实 11:55 显示成 03:55），UTC 日期比本地早一天时还会误判"昨天"。
+    """
     try:
         moment = datetime.fromisoformat(iso)
     except (TypeError, ValueError):
         return "时间未知"
+    if moment.tzinfo is not None:
+        moment = moment.astimezone()  # aware（UTC）→ 本机时区；naive 回退值原样用
     today = datetime.now().date()
     if moment.date() == today:
         return f"今天 {moment:%H:%M}"
