@@ -69,6 +69,11 @@ def format_tool_approval(interrupts) -> str:
             header += f"   步骤 {step}"
         lines.append(header)
 
+        # worker 的子任务原文：先给来龙去脉，再给解释与命令——远端 worker 的推理过程人看不到，
+        # 少了这一行，人手上就只有一条来源不明的命令（见 app/schema/approval_schema.py）。
+        if value.get("subtask"):
+            lines.append(f"  子任务: {truncate(str(value['subtask']))}")
+
         args = value.get("tool_args", {})
         # 终端等工具带必填 description（模型对命令的人话解释）：单独一行突出展示，
         # 让人先看到"意图"，再核对下方命令本身是否一致。

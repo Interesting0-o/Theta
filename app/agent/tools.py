@@ -55,11 +55,15 @@ PLAN_STATUSES: tuple[str, ...] = ("pending", "in_progress", "done")
 
 # ------------------------- worker（子 agent）可用工具子集 -------------------------
 # worker 定位 = 主 agent 的并发资料收集助手，其可用工具按 tool.json 过滤：
-#   工作区只读检索（file_io 读 + git 读，need_review:false，免审批）
+#   工作区只读检索（file_io 读，need_review:false，免审批）
 #   ∪ 联网检索四件套（web_search 系，need_review:true → 触发主侧审批）。
-# 终端（连只读 process_*）、git 写、plan/notes/dispatch 一概不进 worker。
-_WORKSPACE_SOURCES: frozenset[str] = frozenset({"mcp_service/file_io", "mcp_service/git"})
+# 终端（连只读 process_*）、plan/notes/dispatch 一概不进 worker。
+_WORKSPACE_SOURCES: frozenset[str] = frozenset({"mcp_service/file_io"})
 _WEB_SOURCES: frozenset[str] = frozenset({"mcp_service/web_search"})
+# tool.json 里显式标了 worker_allow 的工具：**逐条授权**，不按 source 批量放行。
+# 为什么需要它：现有的两条规则都是"source 命中 ∧ need_review:false"，而 run_command 是
+# need_review:true（它必须能触发审批），加不进任何一条。终端工具下放的语义也不是"这个 source
+# 对 worker 开放"，而是"这几条命令工具交给 worker 用"——所以按名字授权，且权威仍在 tool.json。
 _WORKER_TOOL_CONFIG = Path(__file__).with_name("tool.json")
 
 
@@ -67,10 +71,14 @@ def worker_tools(tools, cfg: dict | None = None):
     """从工具表筛出 worker 可用子集（工作区只读检索 + 联网检索）。
 
     - cfg：tool.json 解析结果 {tool_name: {need_review, source}}；默认读 app/agent/tool.json。
-    - 保留：name 命中 cfg 且（`need_review:false` 且 source∈{file_io,git}）——免审的只读检索；
-      或 source∈{web_search}——联网四件套（need_review:true，会触发主侧审批）。
-    - 剔除：写/删/命令/git 写/plan/notes/dispatch/memory 等（或改状态、或需更高权限、
-      或会再派生子任务；memory 被剔除 = worker 不读写长期记忆，保持只读调查隔离）。
+    - 保留三类：① `need_review:false` 且 source∈{file_io}——免审的只读检索；
+      ② source∈{web_search}——联网四件套；③ tool.json 标了 `worker_allow` 的工具——终端下放。
+    - **①② 免审批、③ 走审批**：worker 的终止/命令类工具会经主侧统一 broker 请人批准
+      （跨进程回传，见 mcp_service/sub_agent.py）。其中 run_command 还带
+      `free_when: readonly_shell`——只读 git 子命令**免审**，所以"派 worker 去看仓库状态"
+      不会产生任何审批；写命令才惊动人。
+    - 剔除：写/删/plan/notes/dispatch/memory 等（或改状态、或需更高权限、或会再派生子任务；
+      memory 被剔除 = worker 不读写长期记忆，保持调查隔离）。
     - 纯函数：不依赖 MCP 加载，便于单测注入假 cfg 验证过滤语义。
     """
     if cfg is None:
@@ -79,7 +87,9 @@ def worker_tools(tools, cfg: dict | None = None):
     allowed: set[str] = set()
     for name, conf in cfg.items():
         source = conf.get("source")
-        if source in _WORKSPACE_SOURCES and not conf.get("need_review"):
+        if conf.get("worker_allow"):
+            allowed.add(name)
+        elif source in _WORKSPACE_SOURCES and not conf.get("need_review"):
             allowed.add(name)
         elif source in _WEB_SOURCES:
             allowed.add(name)
@@ -382,10 +392,14 @@ async def dispatch_subtasks(
     读/搜快得多。派发本身免审批。
 
     worker 的能力边界（重要）：
-    - worker 能：只读当前工作区（文件检索 + git 只读）+ **联网检索**（web_search 等；其联网
-      调用会以"子任务审批"形式出现在人工审批、可能等待）。
-    - worker 不能：改任何文件、执行任何命令、做最终决策——它返回"结论正文 + 出处"，**只是给
+    - worker 能：只读当前工作区（文件检索）+ **终端**（run_command 等）+ **联网检索**。
+      其中只读 git 子命令（status/log/diff/show/branch/fetch）与文件检索**免审批**；
+      其余命令与联网调用会以"子任务审批"形式出现在人工审批、可能等待。
+    - worker 不能：**改动工作区文件**、做最终决策——它返回"结论正文 + 出处"，**只是给
       你做判断的素材**；它上下文独立，看不到其它 worker 的结果。
+    - ⚠️ 也正因如此，**并行派多个 worker 时审批会从多路并来**：每个 worker 的写命令/联网都
+      各占一次人工审批（面板上会标 `worker:<id>` 并附上那条子任务原文，便于你判断来由）。
+      一次别派太多，别把审批面板变成队列。
     - 因此真正"干活"（改动、验证、给用户答复）仍是你自己：收到结论先汇总/交叉核对，需要落地
       改动时由你用写/命令工具执行，不要指望 worker 替你改。
 
@@ -472,7 +486,7 @@ async def write_memory(
     - 工作区的既有约定或特殊之处（如"测试必须用 python -m pytest 并导出 WORKSPACE_PATH"）。
     何时别写：
     - 临时过程与操作流水（"我读了 X 文件"）；猜测、未定方案、还没验证的结论；
-    - 随时能从工作区 / git 重取的 dump（代码内容、目录结构、文件清单）。
+    - 随时能从工作区重取的 dump（代码内容、目录结构、文件清单）。
 
     写法：content 一句话成条、带结论（必要时附出处或日期）；type 取
     user-preference（用户偏好 / 约束）/ decision（决策）/ convention（约定）/
@@ -647,6 +661,12 @@ def _probe_skill_credential(url: str, token: str) -> tuple[bool, str]:
         return False, f"被拒（HTTP {exc.code}：令牌无效/过期，或权限不足）"
     except urllib.error.URLError as exc:
         return False, f"连不上（{exc.reason}）"
+    except OSError as exc:
+        # urlopen 只在 connect/send 阶段把 OSError 包成 URLError；**读阶段**出的超时
+        # （TimeoutError）、连接被重置（ConnectionResetError）等是裸 OSError，不接住就会
+        # 逃出 get_skill——而那时 register_server 已经跑过，等于破坏了"体检失败不阻断加载"
+        # 的契约（见 _skill_preflight_line）。URLError 是 OSError 子类，故这条必须排在它后面。
+        return False, f"连不上（{exc}）"
 
 
 async def _skill_preflight_line(meta: SkillMeta) -> str | None:
@@ -663,13 +683,12 @@ async def _skill_preflight_line(meta: SkillMeta) -> str | None:
     spec = await asyncio.to_thread(skills.read_preflight, meta)
     if spec is None:
         return None
-    try:
-        env = skill_env(await asyncio.to_thread(skills.read_skill_env, meta))
-    except ConfigError as exc:
-        return f"⚠️ 凭证体检没做成：{exc}"
-    token = env.get(spec.bearer_env, "")
-    if not token:
-        return f"⚠️ 凭证体检没做成：{spec.bearer_env} 没有值"
+    # 这里不再兜 skill_env 的 ConfigError / 空值：调用点只在 _register_skill_runtime 成功
+    # 之后才走到本函数，而它已用**同一个 meta** 调过 skill_env（失败就提前回"凭证没配好，
+    # 已拒绝加载"），且 read_preflight 保证 bearer_env 属于 read_skill_env(meta)——空值会
+    # 在那一步抛 ConfigError。所以 env 里该键必有非空值。
+    env = skill_env(await asyncio.to_thread(skills.read_skill_env, meta))
+    token = env[spec.bearer_env]
 
     ok, detail = await asyncio.to_thread(_probe_skill_credential, spec.url, token)
     if ok:
@@ -1049,14 +1068,20 @@ class SessionToolset:
         # 能力型与否由**盘上有没有 server.py** 决定（与会话无关），所以这份备忘不需要分会话；
         # 它按实例存活（一个图/会话一个），技能源类型变更属"重开会话生效"级别的事件，无需失效钩子。
         self._knowledge_only: set[str] = set()
-        # 已经查实"**运行体重建不起来**"的技能名（server 起不来 / 工具没在 tool.json 登记 /
-        # 源已损坏）。**失败必须有退避**，否则这个名字会一直留在 `missing` 里：每轮（LLMNode +
-        # ToolNode 各一次）重新校验 + 重列 schema——而重列要真起一个临时会话（回滚路径已经把
-        # schema 缓存丢了），于是一个坏技能会让该会话**每轮多起两个子进程**，且日志每轮响两遍。
-        # 记下来即回到纯内存比较（与 `_knowledge_only` 同族：按名字、按实例存活）。
+        # 已经查实"**运行体重建不起来**"的 (会话, 技能名)（server 起不来 / 工具没在 tool.json
+        # 登记 / 源已损坏）。**失败必须有退避**，否则这个名字会一直留在 `missing` 里：每轮
+        # （LLMNode + ToolNode 各一次）重新校验 + 重列 schema——而重列要真起一个临时会话
+        # （回滚路径已经把 schema 缓存丢了），于是一个坏技能会让该会话**每轮多起两个子进程**，
+        # 且日志每轮响两遍。记下来即回到纯内存比较。
+        #
+        # ⚠️ **必须连会话一起记**，不能像 `_knowledge_only` 那样只按名字：失败原因里有两条是
+        # 会话相关的——"当前会话没有会话标识"与"与**本会话**已有工具重名"——而同一个实例会服务
+        # 多个会话（langgraph dev 一图多 thread，见 LLMNode._model_for 的注释）。只按名字记的话，
+        # A 会话的失败会让 B 会话整轮不再尝试重建，B 只表现为"正文在、工具没有"。
+        # （`_knowledge_only` 只按名字是安全的：能力型与否由盘上有没有 server.py 决定，与会话无关。）
         # 失效靠重开会话（新图 = 新实例）；模型若 drop_skill 后再 get_skill 也会**真的重试**
         # ——`get_skill` 不查这份备忘，且失败时给的是可行动回执，比这里静默跳过有用得多。
-        self._register_failed: set[str] = set()
+        self._register_failed: set[tuple[str | None, str]] = set()
 
     async def tools_and_version(self, state: AgentState) -> tuple[list[BaseTool], int]:
         """给 LLMNode：当前工具表（静态 + MCP）+ 版本（版本变了才需要重新 `bind_tools`）。"""
@@ -1115,7 +1140,9 @@ class SessionToolset:
             for server in mcp.registered_servers(self.workspace, session)
             if server.startswith(prefix)
         }
-        missing = loaded - registered - self._knowledge_only - self._register_failed
+        # 备忘按会话过滤：本会话查实过建不起来的才跳过，别的会话的失败与这里无关
+        failed_here = {name for sess, name in self._register_failed if sess == session}
+        missing = loaded - registered - self._knowledge_only - failed_here
         if not missing and not registered - loaded:
             return
 
@@ -1135,7 +1162,7 @@ class SessionToolset:
                 # 记下失败就不再逐轮重试（见 `_register_failed` 上的说明）。正文侧由 skills_block
                 # 正常注入——模型若真去调那个不存在的工具，会拿到 unknown_tool 回执并被引向
                 # get_skill 重载，那时它会拿到这条失败的**可行动原因**，比这里静默跳过有用。
-                self._register_failed.add(name)
+                self._register_failed.add((session, name))
                 logger.warning(
                     "技能 %s 的运行体重建失败（本会话不再重试，重开会话可重来）：%s", name, problem
                 )

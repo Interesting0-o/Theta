@@ -80,6 +80,8 @@ def test_approved_closes_chain(tmp_path):
                     pending = server.queue.pending()
                     if pending:
                         assert pending[0]["payload"]["tool_name"] == "web_search"
+                        # 子任务原文随审批一起到主侧：人审时才有"这个 worker 在做什么"的上下文
+                        assert pending[0]["payload"]["subtask"] == "查 x"
                         assert server.queue.complete(pending[0]["approval_id"], True)
                         return
                     await asyncio.sleep(0.01)

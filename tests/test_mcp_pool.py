@@ -344,8 +344,9 @@ def test_shim_keeps_names_order_and_worker_filter(tmp_path, monkeypatch):
         assert [tool.name for tool in tools] == ["read_file", "run_command", "web_search"]
         assert all(tool.response_format == "content_and_artifact" for tool in tools)
 
-        # worker 子集的过滤按 name 查 tool.json：shim 保名即可，无需任何改动
-        assert [tool.name for tool in worker_tools(tools)] == ["read_file", "web_search"]
+        # worker 子集的过滤按 name 查 tool.json：shim 保名即可，无需任何改动。
+        # run_command 现在被保留——tool.json 给了它 worker_allow（终端下放），过滤走的是真表。
+        assert [tool.name for tool in worker_tools(tools)] == ["read_file", "run_command", "web_search"]
 
         # 同一 (工作区, 会话) 第二次加载命中缓存（不重新拉 schema）
         assert await load_mcp_tool(str(tmp_path), "s1") is tools

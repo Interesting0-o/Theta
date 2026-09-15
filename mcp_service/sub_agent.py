@@ -8,12 +8,16 @@ app/agent/tools.py）把一条**子任务**（并发资料收集）派过来，�
 - 子图 = `app/agent/graph.py::get_sub_agent_graph`（复用 Queue/Review/Tool/LLM 节点 +
   InMemorySaver compile，need_review 调用 interrupt，免审放行进 approved_tool_calls）；
 - 人设 = `app/agent/prompt.py::WORKER_SYSTEM_PROMPT`；
-- 可用工具子集 = `app/agent/tools.py::worker_tools`（工作区只读检索 ∪ 联网四件套）。
+- 可用工具子集 = `app/agent/tools.py::worker_tools`（工作区只读检索 ∪ 联网四件套 ∪ 下放的终端）。
 本模块只在 run_subtask 真正执行时才懒加载它们 → 模块 import 不碰 app.agent、无需 .env。
 - 本模块自留：FastMCP(stdio) 入口 + run 编排（run_subtask_impl：建 state / 跑图 / 提结论）+
   审批回传 driver（interrupt → POST 主侧 ApprovalInboxServer → 长轮询 → Command(resume)）。
-- worker = 主 agent 的并发资料收集助手：只读工作区 + 可联网；联网触发主 agent 人工审批；
-  **无工作区写/命令**（其下放是后续里程碑，docs §6）。
+- worker = 主 agent 的并发资料收集助手：只读工作区 + 可联网 + 可用终端。终端里**只读 git 子命令
+  免审**（worker 侧 ReviewNode 读同一份 tool.json 与 command_policy.json，自动生效），其余命令与
+  联网调用都触发主 agent 人工审批——**审核权始终在主侧**，worker 不自批。
+- ⚠️ 终端的执行发生在 **worker 自己的终端 server 实例**里（每子任务一个 session_id，见
+  run_subtask_impl）：所以 worker 起的进程不在主 agent 的 process_list 里、主 agent 也杀不掉，
+  随子任务结束回收。这是"独立进程表"的代价，不是缺陷。
 - 工作区取自 env WORKSPACE_PATH（缺失/非目录 → ConfigError，由 @guard 归成 config_error）。
 """
 import os
@@ -27,7 +31,7 @@ from mcp.server.fastmcp import FastMCP
 
 from app.exception import ConfigError, InvalidArgumentError
 from app.schema.agent_schema import ToolResult
-from app.schema.approval_schema import DEFAULT_INBOX_HOST, DEFAULT_INBOX_PORT
+from app.schema.approval_schema import DEFAULT_INBOX_HOST, DEFAULT_INBOX_PORT, INBOX_BLOCK_SECONDS
 from mcp_service.utils import guard
 
 mcp = FastMCP("SubAgent")
@@ -39,8 +43,13 @@ _MAX_STEPS = 100
 # （app/schema/approval_schema.py），两边各写一个字面量迟早会漂。env AGENT_INBOX_URL 可覆盖，
 # 且主侧启动收件箱后会把**实际**地址写进该 env、由 spawn 时转发进来（子进程 env 是替换制、不继承）。
 _INBOX_DEFAULT_URL = f"http://{DEFAULT_INBOX_HOST}:{DEFAULT_INBOX_PORT}"
-# 单条审批决定等待的总上限（秒）；server 单次 block 最多等 120s，driver 外层循环重试到该上限
+# 单条审批决定等待的总上限（秒）；server 单次 block 最多等 INBOX_BLOCK_SECONDS，外层循环重试到该上限
 _APPROVAL_TIMEOUT_S = 300.0
+# HTTP 单次请求的超时（秒）。**必须严格大于主侧的长轮询 block 时长**：主侧会攥着连接
+# INBOX_BLOCK_SECONDS 才回 `{"status":"pending"}`，客户端若等得比它短，就会在人还在思考时先
+# ReadTimeout——那个异常在下面的循环里没被接，会直接冒泡出去让整条子任务失败，而人的决定
+# 变成无人领取（2026-09-15 审计发现；原先写死 60s < 主侧 120s）。
+_HTTP_TIMEOUT_S = INBOX_BLOCK_SECONDS + 30.0
 
 
 def _resolve_workspace() -> str:
@@ -94,15 +103,20 @@ async def _await_main_decision(
     tool_args: dict,
     *,
     worker_id: str,
+    subtask: str | None = None,
     base_url: str | None = None,
     timeout: float = _APPROVAL_TIMEOUT_S,
 ) -> bool:
     """把一条 worker 需审批的调用发进主侧统一 broker 并长轮询等人工决定，返回是否批准。
 
-    协议与主侧 ApprovalInboxServer（app/tui/approval_inbox.py）对齐：POST /requests 入队拿
+    协议与主侧 ApprovalInboxServer（app/platform/approvals.py）对齐：POST /requests 入队拿
     approval_id → 循环 GET /requests/{id}?block=1 直到 status=="decided"（server 单次最多 block
     120s 会回 {"status":"pending"}，故外层循环）。失败（非 200 / 超时）抛 RuntimeError，
     由 @guard 收成 error ToolResult——worker 不静默放行。
+
+    subtask 一并带上：人审的时候只有 command + description，而 worker 的推理过程不在人眼前
+    （与主 agent 不同——它的对话人一直在跟）。带上子任务原文，"审的是什么"才有来龙去脉，
+    审批面板会单独渲染这一行（app/tui/panels.py::format_tool_approval）。
     """
     import httpx  # noqa: PLC0415 —— 只在真 interrupt 时才需要网络，保持模块 import 轻
 
@@ -113,8 +127,10 @@ async def _await_main_decision(
         "tool_args": tool_args,
         "description": description,
     }
+    if subtask:
+        payload["subtask"] = subtask
     deadline = time.monotonic() + timeout
-    async with httpx.AsyncClient(base_url=url, timeout=60.0) as client:
+    async with httpx.AsyncClient(base_url=url, timeout=_HTTP_TIMEOUT_S) as client:
         resp = await client.post("/requests", json=payload)
         if resp.status_code != 200:
             raise RuntimeError(f"审批收件箱入队失败: HTTP {resp.status_code} {resp.text[:200]}")
@@ -136,10 +152,11 @@ async def _run_with_remote_approval(
     *,
     base_url: str | None = None,
     worker_id: str | None = None,
+    subtask: str | None = None,
 ) -> dict:
     """跑子任务图：遇 __interrupt__ 经 HTTP 送回主侧审批、以 Command(resume) 续跑。
 
-    与主侧 app/tui/driver.py::drive_turn 同形态，只把"本地 broker park"换成"POST 主侧收件箱 +
+    与主侧 app/platform/turn.py::drive_turn 同形态，只把"本地 broker park"换成"POST 主侧收件箱 +
     长轮询取回"。worker 图由 ReviewNode 产生 interrupt（逐条 drain，一次一条 need_review 调用），
     因此正常路径单 interrupt/轮；多条走兜底合成一次审批（与 drive_turn 兜底语义一致）。
     返回终态（无 __interrupt__ 的 result），由调用方提取结论。
@@ -164,7 +181,9 @@ async def _run_with_remote_approval(
                 (v.get("tool_name") if isinstance(v, dict) else "?") for v in values
             ]
             tool_name, tool_args, description = "多工具审批", {}, "一次请求审批多项 worker 工具：" + "、".join(names)
-        approved = await _await_main_decision(description, tool_name, tool_args, worker_id=wid, base_url=base_url)
+        approved = await _await_main_decision(
+            description, tool_name, tool_args, worker_id=wid, subtask=subtask, base_url=base_url
+        )
         inputs = Command(resume={"approved": approved})
     raise RuntimeError(f"worker 子任务超过步数上限 {_MAX_STEPS}")
 
@@ -196,7 +215,7 @@ async def run_subtask_impl(
 
     - task：子任务描述；空白 → InvalidArgumentError。
     - workspace：工作区绝对路径（须存在）。
-    - tools：默认经 load_mcp_tool(workspace) 拉取后按 app.agent.tools::worker_tools 筛成可用
+    - tools：默认经 load_mcp_tool(workspace, session_id) 拉取后按 app.agent.tools::worker_tools 筛成可用
       子集（只读检索 + 联网，后者 need_review 会触发审批）；注入时直接用。
     - model：默认 app.agent.graph::get_sub_agent_graph 内建 get_main_chat_model()；注入假模型则无需
       真实 LLM。
@@ -231,7 +250,7 @@ async def run_subtask_impl(
         "current_plan": [],
         "notes": {},
     }
-    result = await _run_with_remote_approval(graph, state, base_url=inbox_url)
+    result = await _run_with_remote_approval(graph, state, base_url=inbox_url, subtask=task)
     return ToolResult(success=True, content=_extract_conclusion(result))
 
 
@@ -240,9 +259,10 @@ async def run_subtask_impl(
 async def run_subtask(task: str) -> ToolResult:
     """把一条**子任务**（工作区调研 / 联网检索 / 读码 / 出方案）派发给独立子 agent 执行。
 
-    子 agent 用**只读**工具（工作区文件检索 + git 只读）调查当前工作区，也可**联网检索**
-    （web_search 等）——联网调用会先请求主 agent 人工审批、可能等待。它**不能改动工作区任何
-    文件、不能执行命令**——需要落地改动时，由你在收到结论后自行执行。
+    子 agent 用**只读**工具（工作区文件检索）调查当前工作区，也可**联网检索**（web_search 等），
+    并使用**终端**——终端里的只读 git 子命令（status/log/diff/show/branch/fetch）**免审批**，
+    其余命令与联网调用都要先请求主 agent 人工审批、可能等待。它**不改动工作区文件**——需要
+    落地改动时，由你在收到结论后自行执行。
 
     Args:
         task: 一条边界清晰的子任务描述（含目标与期望结论要点），如

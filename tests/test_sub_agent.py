@@ -112,7 +112,12 @@ def test_resolve_workspace_nonexistent_dir_raises(monkeypatch, tmp_path):
 
 
 def test_worker_tools_filter():
-    """worker 子集 = 免审只读检索(file_io读/git读) ∪ 联网四件套(need_review:true)；其余剔除。"""
+    """worker 子集 = 免审只读检索(file_io 读) ∪ 联网四件套(need_review:true)；其余剔除。
+
+    git 源**已不在** `_WORKSPACE_SOURCES`（mcp_service/git.py 已删、git 走 run_command），
+    所以哪怕 tool.json 里再冒出 need_review:false 的 git 条目，worker 也拿不到——下面放一行
+    git 条目正是为了把这个边界钉住。
+    """
     cfg = {
         "read_file": {"need_review": False, "source": "mcp_service/file_io"},
         "glob": {"need_review": False, "source": "mcp_service/file_io"},
@@ -143,8 +148,8 @@ def test_worker_tools_filter():
         "glob",            # file_io 读 → 保留
         "git_add",         # git 写 → 剔除
         "search_content",  # file_io 读 → 保留
-        "list_repos",      # git 读 → 保留
-        "git_log",         # git 读 → 保留
+        "list_repos",      # git 读 → 剔除（git 源已不在 worker 白名单）
+        "git_log",         # git 读 → 剔除（同上）
         "extract_urls",    # 联网 → 保留
         "create_plan",     # 编排 → 剔除
         "read_note",       # notes → 剔除
@@ -158,7 +163,35 @@ def test_worker_tools_filter():
         "read_file",
         "glob",
         "search_content",
-        "list_repos",
-        "git_log",
         "extract_urls",
     ]
+
+
+def test_worker_tools_honors_explicit_worker_allow():
+    """终端下放靠 tool.json 的 `worker_allow` **逐条授权**。
+
+    为什么不能沿用现有两条规则：它们都是"source 命中 ∧ need_review:false"，而 run_command
+    必须保留 need_review:true（写命令要能触发审批）——按 source 放行会连 start_process 一起给，
+    按 need_review 则一条终端工具都进不来。
+    """
+    cfg = {
+        "run_command": {
+            "need_review": True,
+            "source": "mcp_service/terminal",
+            "free_when": "readonly_shell",
+            "worker_allow": True,
+        },
+        "process_wait": {"need_review": False, "source": "mcp_service/terminal", "worker_allow": True},
+        "process_kill": {"need_review": True, "source": "mcp_service/terminal", "worker_allow": True},
+        # 未标注的终端工具：即使 need_review:false 也不下放（worker 不该起常驻服务）
+        "start_process": {"need_review": True, "source": "mcp_service/terminal"},
+        "process_list_only": {"need_review": False, "source": "mcp_service/terminal"},
+    }
+
+    class _FakeTool:
+        def __init__(self, name):
+            self.name = name
+
+    names_in = ["run_command", "process_wait", "process_kill", "start_process", "process_list_only"]
+    kept = worker_tools([_FakeTool(n) for n in names_in], cfg=cfg)
+    assert [t.name for t in kept] == ["run_command", "process_wait", "process_kill"]
