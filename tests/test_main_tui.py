@@ -40,6 +40,31 @@ def test_terminal_ui_eof_makes_reads_return_immediately():
     asyncio.run(asyncio.wait_for(go(), timeout=2))
 
 
+def test_decide_holds_back_lines_typed_before_the_panel(capsys):
+    """面板出现**之前**排队的行属于下一个 turn，不能被当 y/n 答案吞掉。
+
+    实际场景：用户在模型思考时先敲好下一条消息 → turn 撞上审批 → 若 decide 直接取队首，那行
+    消息就会被当成答案，不匹配 y/n 判为"拒绝"，而且**字丢了**（2026-09-15 审计发现）。
+    """
+
+    async def go():
+        ui = TerminalUI()
+        ui._out_q = asyncio.Queue()  # 白盒注入：不真起 stdin reader 线程
+        ui._out_q.put_nowait("帮我改一下 X")  # 模型思考时预打的下一条消息
+
+        task = asyncio.create_task(ui.decide({"tool_name": "run_command"}))
+        await asyncio.sleep(0)  # 让 decide 走完打印、挪走预输入，停在等答案处
+        ui._out_q.put_nowait("y")  # 用户看到面板后敲的答案
+        approved = await asyncio.wait_for(task, timeout=2)
+
+        assert approved is True  # 答案是 y，没被预输入顶掉
+        assert ui._held == ["帮我改一下 X"]  # 预输入既没丢、也没被当答案
+        assert await ui.read_line() == "帮我改一下 X"  # 按原样进下一个 turn
+        assert "已留给下一个回合" in capsys.readouterr().out
+
+    asyncio.run(go())
+
+
 def test_terminal_ui_aclose_finishes_pump_task():
     """`aclose` 要 **await 掉**被取消的 pump：只 cancel 不 await 会留下 pending 任务噪声。"""
 

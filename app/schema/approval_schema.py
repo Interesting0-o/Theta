@@ -16,6 +16,12 @@ from typing import Any, Literal, NotRequired, TypedDict
 DEFAULT_INBOX_HOST = "127.0.0.1"
 DEFAULT_INBOX_PORT = 25010
 
+# 长轮询单次 block 的上限（秒）：`GET /requests/{id}?block=1` 最多攥着连接这么久，到点回
+# `{"status":"pending"}` 让客户端重试。**两侧必须共用这一个值**——客户端 httpx 的 read
+# timeout 若小于它，人还在思考时客户端就先 ReadTimeout 了，而那个异常会让 worker 整条子任务
+# 失败、决定无人领取（2026-09-15 审计发现的实际缺陷）。
+INBOX_BLOCK_SECONDS = 120.0
+
 
 class ApprovalRequest(TypedDict):
     """worker→主 agent 的一条审批请求（跨进程 HTTP JSON 结构）。"""
@@ -25,6 +31,10 @@ class ApprovalRequest(TypedDict):
     tool_args: dict[str, Any]
     # 终端/命令类必填的人话解释，审批时与命令同屏展示
     description: NotRequired[str]
+    # 仅远端 worker 携带：**派给它的那条子任务原文**。主 agent 的对话人一直在跟，worker 的
+    # 推理过程人看不到——只有命令 + 解释时，"审的是什么"就没有来龙去脉。带上它是让审批从
+    # "审一条来源不明的命令"回到"审一个有上下文的动作"（见 docs/MULTI_AGENT.md）。
+    subtask: NotRequired[str]
     # 仅本地（主 agent 自身 interrupt）携带的**纯展示**字段：保持审批面板旧样式
     # （"步骤 1/1" + 调用ID），不参与决定逻辑；远端 worker 请求不带。
     current_step: NotRequired[str]
@@ -39,7 +49,6 @@ class ApprovalRecord(TypedDict):
 
     approval_id: str
     payload: ApprovalRequest
-    created: float
     decided: bool | None
 
 

@@ -135,6 +135,9 @@ class AgentPlatform:
                 turn.cancel()
                 # 等它真的停下，再关运行体：否则"取消中的调用"会与"关闭会话"并发踩同一个运行体
                 await asyncio.gather(turn, return_exceptions=True)
+            # 退出前把未决审批一律拒绝：远端 worker 才不会白等到超时（且把"没人应答"记成网络
+            # 错误）。放在 stop() 之前——stop() 之后收件箱不再收新请求，此刻的 pending 就是全部。
+            inbox.queue.deny_pending()
             await inbox.stop()
             if self._connection is not None:
                 await self._connection.close()

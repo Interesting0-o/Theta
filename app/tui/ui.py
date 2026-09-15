@@ -42,6 +42,10 @@ class TerminalUI:
         # 输入通道是否已 EOF（stdin 关了 / 管道耗尽）：EOF 之后队列再不会有新内容，
         # 谁再 await 它就是永久阻塞——见 _take_line。
         self._eof = False
+        # **面板出现之前**就已排队的行（= 用户在模型思考时预打的下一条消息）。它们属于下一个
+        # turn，不属于这张面板：decide 会把它们挪到这里，read_line 优先从这里取。不这么做的话
+        # 预输入会被当成 y/n 答案——不匹配就成了"拒绝"，而且那行字永久消失（2026-09-15 审计）。
+        self._held: list[str] = []
 
     async def start(self) -> None:
         """起输入通道（单 stdin reader 线程 + pump 任务）；需在事件循环内调用。"""
@@ -97,18 +101,37 @@ class TerminalUI:
             print(f"\n[提示] {event.text}")
 
     async def read_line(self) -> str | None:
-        """取一行用户输入；None = EOF。可被基座 cancel 而不丢输入（队列内容仍在）。"""
+        """取一行用户输入；None = EOF。可被基座 cancel 而不丢输入（队列内容仍在）。
+
+        先取 `_held`（审批期间被挡下的预输入），再取队列——保证那几行按原顺序走进下一个 turn。
+        """
+        if self._held:
+            return self._held.pop(0)
         return await self._take_line()
 
     async def decide(self, value: dict) -> bool:
         """画 Command 框 + 审批面板，向用户收 y/n；返回是否批准（决定权威在人）。
 
+        面板出现**之前**就已排队的行（用户在模型思考时预打的下一条消息）先挪进 `_held`，留给
+        下一个 turn——否则它们会被当成 y/n 答案：不匹配就成了"拒绝"，而且那行字永久消失。
+        这段挪动与下面的打印之间**没有 await**，pump 不可能插进来把答案混进这批旧的。
+
         EOF（stdin 关了 / 管道耗尽）时没人能回答 → 按**不批准**处理并说明，让 run 能收尾；
         否则这里会永久阻塞（pump 已结束，队列不会再有内容）。
         """
+        stale = self._out_q.qsize() if self._out_q is not None else 0
         print(COMMAND_TITLE)
         print(format_tool_approval([value]))
         print()
+        if stale:
+            for _ in range(stale):
+                item = self._out_q.get_nowait()
+                if item is None:
+                    self._eof = True  # EOF 哨兵：别把它当成一行输入塞给下一个 turn
+                    break
+                self._held.append(item)
+            if self._held:
+                print(f"（面板出现前你已输入 {len(self._held)} 行，已留给下一个回合）")
         print("是否批准该操作？(y/n): ", end="", flush=True)
         line = await self._take_line()
         if line is None:

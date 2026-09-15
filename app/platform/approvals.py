@@ -37,7 +37,7 @@ import asyncio
 import itertools
 import os
 import socket
-import time
+from collections import deque
 from dataclasses import dataclass, field
 
 from starlette.applications import Starlette
@@ -50,6 +50,7 @@ from app.platform.ui import UI
 from app.schema.approval_schema import (
     DEFAULT_INBOX_HOST,
     DEFAULT_INBOX_PORT,
+    INBOX_BLOCK_SECONDS,
     ApprovalRecord,
     ApprovalRequest,
     ApprovalStatus,
@@ -57,6 +58,11 @@ from app.schema.approval_schema import (
 
 # 本地主 agent 中断入 broker 时用的 worker_id 标记（远端 worker 用真实 id）
 LOCAL_WORKER_ID = "main"
+
+# 已回填记录保留的条数上限（见 ApprovalInbox.complete）：够长到"刚拿到决定再查一次状态"
+# 一定命中，又足够小到长会话不会无界堆积。数很小，不按时间做（时间要靠定时器或惰性清理，
+# 为这点内存不值得）。
+_DECIDED_HISTORY = 256
 
 
 @dataclass
@@ -80,6 +86,8 @@ class ApprovalInbox:
     def __init__(self) -> None:
         self._items: dict[str, _Pending] = {}
         self._seq = itertools.count(1)
+        # 已回填记录按**回填顺序**排队，用于限长回收（见 complete）——deque 是为了 popleft O(1)
+        self._decided_order: deque[str] = deque()
         # 有新请求置位（idle 循环用事件竞争唤醒）；观察方处理后自行 clear。
         self.new_pending = asyncio.Event()
 
@@ -89,7 +97,6 @@ class ApprovalInbox:
         record: ApprovalRecord = {
             "approval_id": approval_id,
             "payload": dict(payload),
-            "created": time.time(),
             "decided": None,
         }
         self._items[approval_id] = _Pending(record=record)
@@ -123,6 +130,13 @@ class ApprovalInbox:
         item.record["decided"] = bool(approved)
         if not item.decision.done():
             item.decision.set_result(bool(approved))
+        # 已回填的记录**保留一段历史**再回收：worker 拿到决定后可能再查一次状态（状态查询
+        # 也有非阻塞形态），所以不能一回填就删。但若永不回收，长会话里 _items 会无界增长、
+        # 而 pending() 每次都要全表扫描（2026-09-15 审计发现）。按回填顺序保留最近
+        # _DECIDED_HISTORY 条，更早的丢弃——未回填的条目**不参与回收**。
+        self._decided_order.append(approval_id)
+        while len(self._decided_order) > _DECIDED_HISTORY:
+            self._items.pop(self._decided_order.popleft(), None)
         return True
 
     async def wait(self, approval_id: str, timeout: float | None = None) -> bool:
@@ -135,6 +149,22 @@ class ApprovalInbox:
         if timeout is not None:
             return await asyncio.wait_for(asyncio.shield(item.decision), timeout)
         return await item.decision
+
+    def deny_pending(self) -> int:
+        """把**仍未回填**的请求一律按拒绝回填，返回处理条数（收尾用）。
+
+        进程要退出了，这些面板不会再有人回答。不这么做的话，远端 worker 会一直等到自己的
+        超时才失败，还会把"没人应答"记成网络错误——立刻回一个拒绝更准确，也让 worker 当场
+        收尾。语义上也是 fail-closed：**没人回答 = 不放行**。
+        """
+        undecided = [
+            item.record["approval_id"]
+            for item in self._items.values()
+            if item.record["decided"] is None
+        ]
+        for approval_id in undecided:
+            self.complete(approval_id, False)
+        return len(undecided)
 
     def clear_new(self) -> None:
         """观察方已处理完待批后清事件（避免下轮空转）。"""
@@ -171,6 +201,9 @@ def build_app(queue: ApprovalInbox) -> Starlette:
             "tool_args": body.get("tool_args") if isinstance(body.get("tool_args"), dict) else {},
             "description": body.get("description"),
         }
+        # worker 派给自己的那条子任务原文（可选；本地中断不带）：审批面板靠它给出上下文
+        if isinstance(body.get("subtask"), str) and body["subtask"].strip():
+            payload["subtask"] = body["subtask"]
         approval_id = queue.enqueue(payload)
         return JSONResponse({"approval_id": approval_id, "status": "pending"})
 
@@ -182,7 +215,7 @@ def build_app(queue: ApprovalInbox) -> Starlette:
         if not block:
             return JSONResponse(queue.status(approval_id))
         try:
-            approved = await queue.wait(approval_id, timeout=120.0)
+            approved = await queue.wait(approval_id, timeout=INBOX_BLOCK_SECONDS)
             return JSONResponse({"status": "decided", "approved": approved})
         except asyncio.TimeoutError:
             return JSONResponse({"status": "pending"})
@@ -201,13 +234,9 @@ def build_app(queue: ApprovalInbox) -> Starlette:
         queue.complete(approval_id, approved)
         return JSONResponse(queue.status(approval_id))
 
-    async def list_requests(request: Request):
-        return JSONResponse({"pending": queue.pending()})
-
     return Starlette(
         routes=[
             Route("/requests", enqueue_request, methods=["POST"]),
-            Route("/requests", list_requests, methods=["GET"]),
             Route("/requests/{approval_id}", get_request, methods=["GET"]),
             Route("/requests/{approval_id}/decision", post_decision, methods=["POST"]),
         ]
@@ -355,6 +384,9 @@ def _record_to_value(record: ApprovalRecord) -> dict:
         value["current_step"] = step
     if payload.get("tool_call_id"):
         value["tool_call_id"] = payload["tool_call_id"]
+    # worker 的子任务原文透传给前端——人靠它判断"这个 worker 想跑的命令是否有来由"
+    if payload.get("subtask"):
+        value["subtask"] = payload["subtask"]
     return value
 
 

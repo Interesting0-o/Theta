@@ -61,6 +61,55 @@ def test_start_reports_busy_port_as_config_error():
     asyncio.run(go())
 
 
+def test_worker_http_timeout_strictly_exceeds_server_block():
+    """客户端 HTTP 超时必须 **严格大于** 主侧单次 block。
+
+    主侧攥着连接最多 `INBOX_BLOCK_SECONDS` 才回 `{"status":"pending"}`；客户端若等得比它短，
+    人还在思考时 worker 就先 ReadTimeout——那个异常在 driver 的循环里没被接，会让整条子任务
+    失败，而人的决定变成无人领取（2026-09-15 审计发现：原先写死 60s < 主侧的 120s）。
+    """
+    from app.schema.approval_schema import INBOX_BLOCK_SECONDS
+    from mcp_service.sub_agent import _APPROVAL_TIMEOUT_S, _HTTP_TIMEOUT_S
+
+    assert _HTTP_TIMEOUT_S > INBOX_BLOCK_SECONDS
+    # 单条决定的总等待上限还要留出重试的余地
+    assert _APPROVAL_TIMEOUT_S > _HTTP_TIMEOUT_S
+
+
+def test_decided_records_are_bounded_but_recent_stay_queryable():
+    """已回填记录要有界回收，但**最近那些仍可查**（worker 拿到决定后可能再查一次状态）。"""
+    from app.platform.approvals import _DECIDED_HISTORY
+
+    async def go():
+        queue = ApprovalInbox()
+        ids = [queue.enqueue(PAYLOAD) for _ in range(_DECIDED_HISTORY + 10)]
+        for approval_id in ids:
+            queue.complete(approval_id, True)
+
+        assert queue.status(ids[-1]) == {"status": "decided", "approved": True}
+        assert queue.status(ids[0]) is None  # 更早的已回收——无界增长被挡住
+        assert queue.pending() == []
+
+    asyncio.run(go())
+
+
+def test_deny_pending_rejects_everything_undecided():
+    """收尾时未决请求一律按拒绝回填：远端 worker 不必白等到超时（且不会把没人应答记成网络错误）。"""
+
+    async def go():
+        queue = ApprovalInbox()
+        first, second, decided = (queue.enqueue(PAYLOAD) for _ in range(3))
+        queue.complete(decided, True)
+
+        assert queue.deny_pending() == 2
+        assert queue.status(first) == {"status": "decided", "approved": False}
+        assert queue.status(second)["approved"] is False
+        assert queue.status(decided)["approved"] is True  # 已决定的不被改动
+        assert queue.deny_pending() == 0  # 幂等
+
+    asyncio.run(go())
+
+
 def test_queue_enqueue_pending_complete_wait():
     async def go():
         queue = ApprovalInbox()
