@@ -97,6 +97,38 @@ def test_quoted_path_with_spaces(tmp_path):
     assert "[图片已附加: with space.png]" in out[0].content[0]["text"]
 
 
+def test_image_token_mime_follows_the_admission_rule():
+    """mime 必须由**命中的那个扩展名**决定，而不是 Path(raw).suffix。
+
+    两者不等价：收词口径是"任意处命中扩展名"，suffix 是"最后一个点号之后的整段"。
+    回归：`@"shot.png "` 的 suffix 是 `.png `、`@"a.png（新版）"` 是 `.png（新版）`，
+    都不在 _IMAGE_MIME 里 → KeyError → 整轮 turn 直接失败（不是软回执）。
+    """
+    for text, want in [
+        ('@"with space.png "', "image/png"),   # suffix 会是 '.png '
+        ('@"a.png（新版）"', "image/png"),      # suffix 会是 '.png（新版）'
+        ("@a.png", "image/png"),
+        ("@b.JPG", "image/jpeg"),              # 大小写不敏感（_IMAGE_EXT_RE 是 IGNORECASE）
+        ("@c.jpeg", "image/jpeg"),
+    ]:
+        tokens = LLMNode._image_tokens(text)
+        assert len(tokens) == 1, text
+        assert tokens[0][3] == want, text
+
+
+def test_quoted_token_that_is_not_a_real_file_gets_note_not_crash(tmp_path):
+    """引号里"含扩展名但不止于扩展名"→ 软回执（路径就是那段原文，指不到文件）。"""
+    ws = _make_ws(tmp_path)
+    content = '@"with space.png（新版）" 看看'
+
+    out, newly = asyncio.run(
+        LLMNode.attach_images_to_payload([HumanMessage(content=content)], [], ws)
+    )
+
+    assert newly == []
+    assert "[图片未找到: with space.png（新版）]" in out[0].content[0]["text"]
+
+
 def test_non_image_at_tokens_left_alone(tmp_path):
     """宽进策略：不像图片的 @token 是普通文本，整条消息保持 str 原样。"""
     ws = _make_ws(tmp_path)
@@ -242,7 +274,7 @@ def test_live_apple_image_through_attach_channel(monkeypatch):
 
         THETA_LIVE_VISION=1 .venv/Scripts/python.exe -m pytest tests/test_image_attach.py -k apple
 
-    模型用 glm-4.6v-flash（主模型 glm-4.7-flash 不吃图，前提说明见 test_vision_input.py）。
+    模型必须能看图（当前主模型 glm-5.3-flash 已支持；前提与实测记录见 test_vision_input.py）。
     """
     if not os.getenv("THETA_LIVE_VISION"):
         pytest.skip("需要 THETA_LIVE_VISION=1 才跑（真打 API，会花钱）")

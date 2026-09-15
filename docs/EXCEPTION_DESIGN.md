@@ -165,7 +165,7 @@ def write_file(path: str, content: str) -> ToolResult:
 
 ### 工作区守卫
 
-`[已落地]` 在 `mcp_service/file_io.py`（`git.py` 同款）。**环境变量是 `WORKSPACE_PATH`**（早期伪码写的 `WORKSPACE_ROOT` 从未存在）；工作区在 **import 时**读取并校验，**不存在即 `ConfigError`**：
+`[已落地]` 在 `mcp_service/file_io.py`（删除的 `git.py` 曾是同款）。**环境变量是 `WORKSPACE_PATH`**（早期伪码写的 `WORKSPACE_ROOT` 从未存在）；工作区在 **import 时**读取并校验，**不存在即 `ConfigError`**：
 
 ```python
 import os
@@ -423,4 +423,4 @@ def test_format_tool_result_prefixes_error_type():
 WORKSPACE_PATH=/tmp python -m pytest        # 需 `python -m`（包未安装）+ 导出 WORKSPACE_PATH
 ```
 
-> （`.venv/Scripts/python.exe` 或 `uv run python -m pytest` 均可；关键是 `-m pytest` 与 `WORKSPACE_PATH` 两条前提。）
+> （用 `.venv/Scripts/python.exe -m pytest`，**不要用 `uv run`**；关键是 `-m pytest` 与 `WORKSPACE_PATH` 两条前提。）

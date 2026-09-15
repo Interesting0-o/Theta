@@ -49,6 +49,8 @@
 
 ## [ ] agent 提问模式：需求不明确时，给用户选项等回答
 
+**排期**（2026-09-14）：用户拍板其效益高于「文档解析技能」（后面那条），**优先做它**，文档解析相应搁置。
+
 **动机**（2026-09-10 记）：agent 调用编排工具，把"不明确之处的选项"返回给用户、等用户填写反馈。
 本质是**把"审批闸门"泛化成"人机闸门"**：现在图↔人的往返只运一个 bool
 （`Command(resume={"approved": …})`），这里要运"一个回答"（选项 / 自由文本）。
@@ -76,6 +78,7 @@
 ## [ ] 工具面缺口：一次真实运行的实测（2026-09-13）
 
 **样本**：一个会话、3 轮用户请求（克隆 Luna-Agent → uv 补环境 → 查/拉分支），共 **55 次**工具调用。
+下面的 `git_*` 计数是**当时的形态**——那批工具 2026-09-15 已删，保留原样是为了让结论可复核。
 
 | 工具 | 次数 |
 | --- | --- |
@@ -99,15 +102,20 @@
    `git_*` 里，而 `git_*` 又不支持上面那些参数。**模型没加载它是对的**（"克隆+补环境"本来就不是
    GitHub 平台操作）。
 
-**收敛清单（按日志频次排序）**：
+**收敛清单（原按日志频次排序）—— ❌ 已整条作废（2026-09-15）**：
 
-- `git_clone` 加 `depth`（浅克隆；日志里它直接用了 `--depth 1`）；
-- `git_switch` 支持"从远端建跟踪分支"（`--track` / `-B` / `-u`；日志里试了三次才绕过去）；
-- **远端分支清单**（`ls-remote` 语义）独立成只读工具、或给 `git_branches` 一个开关 —— 浅克隆下
-  本地只有默认分支的跟踪引用，日志里连着两轮都在找它；
-- `git_fetch` 支持 refspec / `--unshallow`。
+下面这几条都是"给 git 原子工具补参数"，而 **git 专用工具已于 2026-09-15 整体删除**（`mcp_service/git.py`
+连同 12 个工具；git 一律走 `run_command`）。这些诉求由 shell 天然满足：`--depth` / `--track` /
+`ls-remote` / `--unshallow` 直接就是命令行。**不要再去给不存在的工具加参数。**
+（原文留档，供理解当初的判断依据）
+
+- ~~`git_clone` 加 `depth`（浅克隆；日志里它直接用了 `--depth 1`）；~~
+- ~~`git_switch` 支持"从远端建跟踪分支"（`--track` / `-B` / `-u`）；~~
+- ~~**远端分支清单**（`ls-remote` 语义）独立成只读工具、或给 `git_branches` 一个开关；~~
+- ~~`git_fetch` 支持 refspec / `--unshallow`。~~
 
 **不要做**：给 `git_clone` 透传 `-c`——那等于给模型一个正式"关掉证书校验"的开关（MITM 面）。
+（**该顾虑已由命令白名单承接**：`git -c …` 一律不判免审，见 `app/agent/command_policy.json`。）
 
 **审批摩擦（同一份实测）**：全程 **33 次人工 y**，其中 **30 次是 shell 命令**。"一次路由调用了多个
 工具"的实际开销是**人的**：图里 `review_node` 逐条 drain（`review_node → review_node`，排空才去
@@ -241,7 +249,7 @@ env 声明与白名单转发）——那是 §3.3/§3.4 那套，也是最重的
 复用 §12 的运行体）。首个能力型技能 `skills/github/` 落了 **7 个只读工具**（stdlib HTTP，不引 PyGithub）+ 一次**加载时凭证体检**（`skill.json` 的 `preflight`，替代了原 `github_auth_status` 工具）。
 
 **三期已落地（2026-09-14，见 SKILL_DESIGN §13.10）**：`skills/github/` 从 7 个只读工具长到
-**12 只读 + 3 写**（`github_pr_create` / `github_pr_review` / `github_issue_comment`，都要人批）。
+**14 只读 + 3 写**（`github_pr_create` / `github_pr_review` / `github_issue_comment`，都要人批）。
 越权动作在工具内**结构性拒绝**：`github_pr_review` 的 `event` 白名单不含 `APPROVE`；**"合并"连工具
 都没有**（"合并权留给人"最彻底的落点是这个动作压根不存在，与"APPROVE 被拒"同构）。同批修掉了
 `server.py` 的 8 处审计问题与 `skills.py` 两处真 bug（坏编码的 `SKILL.md` 会拖垮整次扫描；目录名是
@@ -275,9 +283,11 @@ turn，处置（未找到 / 过大>5MB / 超 4 张 / 读取失败）写进正文
 
 三条结论：
 
-- **唯一前提是模型**：当前 `glm-4.7-flash` 硬拒图片（`400 / code 1210 / messages.content.type
-  参数非法，取值范围 ['text']`）；实测可用的是 `glm-4.6v-flash`（base64 与 URL 都行，**且能同时挂
-  工具**）；免费层的 `glm-4v-flash` 只吃 URL、不吃 base64。附图真调用曾持续 429（1305 访问量
+- **唯一前提是模型**：当日配置的 `glm-4.7-flash` 硬拒图片（`400 / code 1210 /
+  messages.content.type 参数非法，取值范围 ['text']`）；实测可用的是 `glm-4.6v-flash`（base64 与
+  URL 都行，**且能同时挂工具**）；免费层的 `glm-4v-flash` 只吃 URL、不吃 base64。
+  **2026-09-15 复测：当前配置的 `glm-5.3-flash` 已支持视觉**（`tests/test_vision_input.py` 的
+  live 用例三连过）——换模型后重跑一次，别照抄上面的历史结论。附图真调用曾持续 429（1305 访问量
   过大）——免费端点负载问题，非通道缺陷，限流缓解后跑 `-k apple` 即验。
 - **库侧零障碍**：`ChatOpenAI` 原样透传 `image_url`，并把 LangChain 的规范图块**自动翻译**成
   `data:<mime>;base64,…`；`ToolMessage` 带图也被端点接受。
@@ -300,6 +310,100 @@ turn，处置（未找到 / 过大>5MB / 超 4 张 / 读取失败）写进正文
 与 `search_content` 共享同一口径）+ 魔数猜类型，二进制/非 UTF-8 文本都给"它是什么 + 多大"的
 可预期回执（success=True，不进错误分类）；行尾显式保持旧文本模式的 universal newlines 行为
 （`\r\n`→`\n`），编辑锚定不受影响。`tests/test_file_io.py` 二进制回执一节共 5 例。
+
+## [ ] 文档解析技能（skills/documents）：勘察完毕，暂缓（2026-09-14）
+
+**结论**：值得做，但用户拍板 agent 提问模式（前面那条）效益更高、先做它——本条设计已收敛，
+捡起即可开工，无需重新勘察。
+
+**落点判定**：能力型技能 `skills/documents/`，不进 `mcp_service`（§8.1 并列不混入）。"不做、
+让模型走 `run_command` + 临时脚本"能顶：但每次读都要审批、依赖装没装不可控、表格还原靠模型
+肉眼拼、"怎么读 docx"的知识散在提示词里。技能侧的额外意义：这会是 `requirements` 通道
+（`skill.json` 声明 + host `find_spec` 起进程前预检 + 未装 fail-closed 拒载）的**第一个真实消费者**
+——github 是纯 stdlib，没走过这条路。
+
+**依赖成本（与 github 技能的本质区别）**：没法纯 stdlib，主 venv 装 3–4 个纯 Python 包——
+`pdfminer.six`（PDF；MIT、CJK 支持尚可）/ `openpyxl`（xlsx）/ `python-docx` / `python-pptx`。
+全纯 Python、无编译依赖；§9 已决依赖进主 venv，机制零新增。
+
+**范围（已议定）**：
+
+- 一期 **xlsx + pdf**（编码场景最高频）：`xlsx_read`（工作表 → markdown 表格，限行列防爆炸）、
+  `pdf_read`（按页 range 分段，回执带页码）；二期 docx + pptx。
+- **只读不写**：生成 docx/pdf 体大频低，转换类任务用文本工具输出 markdown 就够。
+- **扫描件 PDF 不做 OCR**：提取不到文本层就如实回执"疑似扫描件（无文本层）"，OCR 另立项。
+- `need_review: false`（纯读本地）+ 路径过工作区沙箱（对齐 file_io）+ 损坏文件给可预期回执
+  （read_file 2026-09-14 口径）。
+
+**待拍**：真实频次（几个月遇不到一次的话，继续搁置就是对的）；命名 `documents`（倾向，一个
+技能装四族、共享沙箱与渲染）还是按 pdf / office 拆。
+
+## [ ] 减法审计遗留：低危清理项（2026-09-15）
+
+**背景**：2026-09-15 对全仓做了一轮"减法审计"（逻辑冗余 / 死代码 / 逻辑错误 / 过时注释），
+高危与中危已就地修掉（见下"已清"），剩下这批是**不承重的零碎**——每条都确证过行号，但单独
+不值得开一轮，做别的改动顺路带上即可。**不必再全仓扫一遍**：已清的部分不会复现，下面这些
+是**仅剩**的清单。
+
+**已清（同批，供对照，避免重复排查）**：
+
+- 高危 4 条：`@图片` 引号分支 KeyError（`Path(raw).suffix` 反查 mime，用户写 `@"x.png "` 即崩
+  整轮）、`process_read` 吞掉已结束进程的输出（先 `read_new` 消耗再 `drain`）、`edit_file` 读
+  GBK/二进制被误判 `internal_error`、技能体检漏捕**读阶段**的裸 `OSError`（逃出 `get_skill`）；
+- 中危 7 条：`glob` 输出基准与 `read_file` 不一致、`copy_path(recursive=False)` 对目录假成功、
+  `get_directory_tree` 的符号链接逃逸、`/list session` 把 UTC 的 checkpoint `ts` 当本地、
+  `git_commit` 的 `Co-authored-by` 子串误判（他人的 trailer 会让 Theta 尾注被跳过）、
+  `prompt.py` 漏登记 `git_push`/`git_clone`、`_register_failed` 跨会话串味（改为按
+  `(会话, 名字)` 记账）；
+- 文档漂移：`README.md` / `app/main.py` / `docs/EXCEPTION_DESIGN.md` / 3 个测试 docstring
+  **共 5 个文件 11 处**的 `uv run`（会另建/重同步 Linux venv、破坏现有环境）、GitHub 工具
+  计数统一到 **14 只读 + 3 写 = 17 条**、`SKILL.md` 的 PR 流程与示例文档冲突 + `git_pull`
+  参数顺序写错、`Phase B 预留` / `尚未接入` 一类失效陈述；
+- 删除：`_MAGIC_PREFIXES` 魔数表（file_io + github 两份）——它只产出显示标签、无分支依赖，
+  且回执里本就回显 path（后缀在内），参见 `mcp_service/file_io.py:78` 的留痕注释；
+  `tool.json` 的 `safe_tool`/`risky_tool`、`NoteEntry.topic/tags`、`auto_approve`/`auto_reject`、
+  `InterruptRecord`（三个字段无人读，改为 `EvalResult.interrupt_count`）、terminal 的 6 处
+  只写不读的进程状态、`graph.py` 的 `from app.agent.nodes import *`（连带 31 个无关名灌进建图
+  模块的命名空间）、9 处未使用 import。
+
+**遗留（均为低危）**：
+
+- **只被测试用的生产函数**：`app/agent/skills.py::read_body`——生产路径走 `get_meta`/`body_of`，
+  只有 `tests/test_skills.py` 在用；而同文件 docstring:24 把"host 侧只读 SKILL.md、不拿模型
+  给的名字拼路径"这条安全不变量的落点指成了它（真正落点是 `get_meta`）。删需同步改
+  `tests/test_skills.py` 里 4 条用例的调用。
+- **自我标注的 YAGNI 字段**：`app/schema/agent_schema.py::MCPToolSpec.metadata`（注释自述
+  "当前无消费者，保留以备将来"）。留就换成具体计划，删就顺带清 `app/agent/mcp.py` 两处透传。
+- **重复真相**：`app/agent/tools.py:54::PLAN_STATUSES` 与 `agent_schema.py::PlanStatus` Literal
+  是同一份取值表的两处副本（可由 `get_args(PlanStatus)` 派生）；`tools.py:1100` 的
+  `{…} or set(_ORCHESTRATE_TOOL_NAMES)` 右半在生产**永不求值**（同源同内容，只有测试传空表时生效）。
+- **导出缺口**：`app/schema/__init__.py` 漏了 `ImageRef` / `SkillPreflight`，与"app.schema 导出
+  全部纯数据结构"的口径不符（目前全仓都从 `agent_schema` 直连 import，故不报错，
+  但 `from app.schema import ImageRef` 会 ImportError）。
+- **跨文件重复**：`file_io._resolve_path` ↔ `git._resolve_repo_path` 逐字同构；`WORKSPACE_PATH`
+  的"取 env + resolve + 存在性校验 + **同文案** `ConfigError`"在 file_io 与 git 各一份，
+  `app/agent/mcp.py::_validate_workspace` 是第三份近亲。抽到 `mcp_service/utils.py` 即可
+  ——那里没有 import 期 env 校验，两个 server 都能 import（技能侧已 import 它）。
+- **小冗余**：`mcp_service/file_io.py:389` 的 `if total == 0 or lo > total`（`lo ≥ 1` 已被上游
+  保证，前半恒假）；同文件 698-699 的 `ext_set` 两次赋值可合一；
+  `mcp_service/git.py:110` 的 `_get_repos() or _get_repos(refresh=True)` 在未命中时**必然**
+  全量扫两次（缓存为空时的第一次调用尤其白扫）。
+- **校验口径不一**：`mcp_service/web_search.py` 里 `extract_urls` 有取值校验，而同族的
+  `crawl_website.extract_depth` / `format` 没有；同文件另有一处占位注释 `# ... 其他校验 ...`
+  下面是空的。
+- **远端 GBK**：`skills/github/server.py::github_file_read` 只做了二进制那半防线（NUL 探测），
+  GBK 文本仍会 `errors="replace"` 成一片替换字符喂给模型——本地 `read_file` 2026-09-14 已补
+  第二半，这里是漏掉的孪生。
+- **过时注释**：`app/agent/nodes.py` 的 `QueueNode` 空 docstring + 空 `__init__`（与不写等价），
+  以及 `needs_compact` 上方一条与被注释物错位（描述 `_FOLD_HEADER`，而它早已搬进类体）；
+  `app/schema/ui_schema.py` 的"**将来的**帮助/会话切换"（早已落地）；`app/schema/session_schema.py`
+  把渲染者指成 `commands/__init__.py`（实际在 `session.py` 自己）。
+
+**待拍（一条）**：`app/agent/tools.py:785` 的 `meta.name != meta.dir_name` 分支**生产不可达**
+（扫盘期已保证能力型两者相等），但 `tests/test_skill_runtime.py:467` 自述是"安全网…即便拿到
+构造出来的 meta，加载期也必须拒绝"。二选一：① 删掉该分支 + 同步删那条用例；② 按安全网保留
+——保留的话请在注释里点明它不可达，并修掉 `app/agent/skills.py:174` 那处把校验位置指向
+"get_skill 的校验"的指针（实际执行处是**扫描期**）。
 
 ## 相关但未立项（讨论过，待显式拍板再单列）
 

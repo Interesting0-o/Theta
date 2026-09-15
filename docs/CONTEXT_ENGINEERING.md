@@ -53,7 +53,7 @@
 | 工具类 | 行内 | 跨轮留全量？ | 理由 |
 |---|---|---|---|
 | `read_file` / `list_dir` / `get_directory_tree` / `search_content` / `glob` | 该文件此后被 edit/write 改过 → 旧读全废；可折 | 否 | 磁盘即真值，重取便宜，一次性 scaffold |
-| git 只读 `git_status/diff/log/branches/fetch` | 消费后可折 | 否 | repo 即真值 |
+| git 只读（`git status/diff/log/branch/fetch`，经 run_command） | 消费后可折 | 否 | repo 即真值 |
 | 写类回执 `edit/create/delete/commit/copy` | 记 work_log，回执内容小可不折 | 否 | "做了 X" 是事实，进 log |
 | `run_command` | **调错迭代期内留错误文本**；被后续成功替换后压成 `exit=N` 一行 | 否（verdict 进 log） | 输出可重跑重取但**有成本/副作用**；log 存证据 |
 | `process_read` / `process_wait` 增量 | 只在该进程仍被等待时有用 | 否 | 输出流**不可重取**但极瞬态，关键行进 log |

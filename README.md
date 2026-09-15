@@ -24,8 +24,8 @@
 
 - 🛡️ **知情审批闸门**：写文件、删目录、跑命令前，TUI 展示工具名、参数与模型的**意图解释**，等你按 `y/n`。终端命令强制模型附一句"这条命令要干什么"，命令 + 解释同屏展示，先看意图再核对命令
 - 📋 **计划编排**：模型把任务拆成步骤（`create_plan`），边做边推进状态（`update_plan_step`），计划跨对话轮持久跟踪，不随对话丢失
-- 🔌 **MCP 工具即插即用**：文件、终端、git、联网检索各自是**独立 MCP 服务器**，新增工具只改对应 server，核心 agent 代码不动
-- 📁 **文件沙箱**：全部文件 / git 读写锁在 `WORKSPACE_PATH` 内——相对路径解析 + 符号链接消解后再校验，越界即拒绝
+- 🔌 **MCP 工具即插即用**：文件、终端、联网检索各自是**独立 MCP 服务器**，新增工具只改对应 server，核心 agent 代码不动（**git 没有专用 server**——它一律走 `run_command`，见下面的免审面一节）
+- 📁 **文件沙箱**：文件工具（**含读操作**）全部锁在 `WORKSPACE_PATH` 内——相对路径解析 + 符号链接消解后再校验，越界即拒绝
 - 🔍 **检索基建**：`read_file` 行号分段读、`glob` 按路径定位、`search_content` 内容检索（大小写 / 正则可配），大仓库不整段读
 - 🌐 **联网检索四件套**：`web_search` / `extract_urls` / `crawl_website` / `deep_research`（内置 Tavily）
 - 🖥️ **终端进程管理器**：一次性 `run_command`（到点不杀、转入受管句柄）+ 常驻 `start_process` + `process_*` 生命周期管理
@@ -64,8 +64,10 @@ TAVILY_API_KEY=tvly-...              # 网页搜索 Key；留空则联网工具�
 ### 3. 启动并体验
 
 ```bash
-uv run python -m app.main
+.venv/Scripts/python.exe -m app.main     # 本机是 WSL + Windows venv，用仓库里的解释器
 ```
+
+> ⚠️ **不要用 `uv run`**：WSL 里的 `uv` 是系统 uv，跑它会另建/重同步一个 Linux venv、破坏现有环境（见 CLAUDE.md「常用命令」）。
 
 > 💡 工作区沙箱默认指向**启动目录**（运行 `python -m app.main` 所在的项目，agent 直接对它动手）；想操作别的项目就 `cd` 过去再启动。`langgraph dev` 与无参调用 `get_main_agent_graph()` 则默认 `<项目根>/tmp`（不指向仓库自身）。
 
@@ -158,7 +160,7 @@ START ─► llm_node ──(有 tool_calls)──► queue_node ─► review_n
 几个关键点：
 
 - **审批用 interrupt 而非条件分支**：每个需审的 `tool_call` 各自 `interrupt()` 一次，所以一次请求可能挂起多次；基座（`app/platform`）把中断入统一 broker 并 park 住 run，前端（终端 TUI）只负责画面板、收 `y/n`，基座再以 `Command(resume={"approved": ...})` 续跑——**阻塞图、不阻塞进程**，因此主 agent 等审批时 worker 的审批照样能被服务。
-- **为什么这几类免审**：计划编排只动会话内、跨轮持久化的 `current_plan`；`read_note` 只读会话内的笔记；`write_memory` 写的是 agent 自己的私有记忆目录（`resource/` 下，不在你的仓库里，可随时改）；`dispatch_subtasks` 派出的 worker **只持有只读工具**（它要联网时仍会来问你）。真正有副作用的（写文件 / 删目录 / 跑命令 / git 写 / 联网检索）一律要审批。
+- **为什么这几类免审**：计划编排只动会话内、跨轮持久化的 `current_plan`；`read_note` 只读会话内的笔记；`write_memory` 写的是 agent 自己的私有记忆目录（`resource/` 下，不在你的仓库里，可随时改）；`dispatch_subtasks` 派出的 worker 只有 file_io 读 + **下放的终端** + 联网（后两者要审批时才来问你，**只读 git 子命令免审**）。真正有副作用的（写文件 / 删目录 / 跑命令 / 联网检索）一律要审批。
 - **审批策略与工具归属集中在 `app/agent/tool.json`**（`need_review` + `source`）：
 
 | 类别 | 工具 | 审批 |
@@ -167,9 +169,9 @@ START ─► llm_node ──(有 tool_calls)──► queue_node ─► review_n
 | 会话笔记 | `read_note`（读被折叠归档的联网正文） | 免审 |
 | 并发资料收集 | `dispatch_subtasks`（派发只读 worker 并行调研） | 免审（worker 自己发起的联网调用另需审批） |
 | 长期记忆 | `write_memory` / `read_memory` | 免审（写在 resource 私有目录，可随时改） |
-| 读 / 查询 | file_io：`read_file` / `list_dir` / `get_directory_tree` / `search_content` / `glob`；git 只读：`list_repos` / `git_status` / `git_branches` / `git_diff` / `git_log` / `git_fetch`；terminal 只读：`process_wait` / `process_read` / `process_list` | 免审 |
+| 读 / 查询 | file_io：`read_file` / `list_dir` / `get_directory_tree` / `search_content` / `glob`；terminal 只读：`process_wait` / `process_read` / `process_list`；**git 只读子命令**（`git status` / `log` / `diff` / `show` / `branch` 列表 / `fetch`，经 `run_command`） | 免审 |
 | 文件写 | `create_file` / `create_dir` / `write_file` / `edit_file` / `delete_file` / `delete_dir` / `copy_path` | 需审批 |
-| git 写 | `git_add` / `git_commit` / `git_switch` / `git_pull` | 需审批 |
+| git 写 | `git add` / `commit` / `switch` / `pull` / `push` / `clone` …（同样是 `run_command`，但不在免审白名单里） | 需审批 |
 | 终端执行 | `run_command` / `start_process` / `process_kill` | 需审批 + 必填「解释」 |
 | 联网检索 | `web_search` / `extract_urls` / `crawl_website` / `deep_research` | 需审批 |
 
@@ -185,13 +187,13 @@ START ─► llm_node ──(有 tool_calls)──► queue_node ─► review_n
 | 何时被读到 | **每轮**注入系统提示 | **会话启动时**读入一次（改了它要重开会话才生效） |
 | 给 worker 吗 | 不给（worker 是只读资料收集器，两样都不注入） | 不给 |
 
-两边都**只放跨会话仍然成立的东西**：临时过程、随时能从工作区 / git 重取的内容不记——记忆里存的是"下次做这个项目时还成立"的偏好、决策与约定。
+两边都**只放跨会话仍然成立的东西**：临时过程、随时能从工作区重取的内容不记——记忆里存的是"下次做这个项目时还成立"的偏好、决策与约定。
 
 ### 并发资料收集：一次派发多个只读 worker
 
 需要"先并行查一堆互不相关的资料"时，模型可以调 `dispatch_subtasks`：每个独立问题派给一个**独立 worker 进程**（`mcp_service/sub_agent.py`，stdio spawn、干完即回收）并发执行，拿回各自的结论正文，由主 agent 汇总核对后再落地改动。
 
-worker 的边界是硬的：**只读**当前工作区（文件检索 + git 只读）并可联网检索；**不能**改文件、执行命令、推进计划或做决策——它返回的结论只是素材。worker 的联网调用会以"子任务审批"的形式出现在同一个审批面板里（worker 进程经 HTTP 把待审请求回传给主侧队列）。
+worker 的边界是硬的：工作区**只读**（文件检索）**＋ 下放的终端 ＋ 联网检索**，但**不改文件、推进计划或做决策**——它返回的结论只是素材。终端的下放靠 `tool.json` 的 `worker_allow` **逐条授权**（`run_command` 与四个进程管理工具），其中**只读 git 子命令免审**，写命令与联网会以"子任务审批"的形式出现在同一个审批面板里——worker 进程经 HTTP 把待审请求回传给主侧队列，**审核权始终在主侧**（面板上标 `worker:<id>` 并附上那条子任务原文，便于人判断来由）。
 
 ### 目录结构
 
@@ -225,12 +227,12 @@ theta/
 │   │   ├── memory.py           # 长期记忆 memory.md 的读写与注入渲染
 │   │   ├── skills.py           # 技能（skill）扫描 / 解析 / 注入渲染（只读单点）
 │   │   ├── utils.py            # format_tool_result / coerce_tool_result（工具结果归一化）
-│   │   └── tool.json           # 审批策略集中登记（need_review / source）
+│   │   ├── tool.json           # 审批策略集中登记（need_review / source / worker_allow）
+│   │   └── command_policy.json # 终端命令的免审白名单（只读 git 子命令等）
 │   └── schema/                 # 数据形状（agent / approval / ui / session 四个域）
 ├── mcp_service/                # MCP 服务器（各自独立子进程）
 │   ├── file_io.py              # 文件操作 + WORKSPACE_PATH 沙箱（import 时校验该 env）
 │   ├── terminal.py             # 终端进程管理器（任意命令 + 进程组托管 + sudo 硬拒绝）
-│   ├── git.py                  # git 仓库操作（向下查找仓库；读免审、写需审）
 │   ├── web_search.py           # Tavily 联网检索四件套 + 上游失败翻译
 │   ├── sub_agent.py            # worker（子 agent）MCP server：run_subtask（spawn 即走，只读）
 │   └── utils.py                # guard 异常收口装饰器（只 return 不 raise）
@@ -246,16 +248,21 @@ theta/
 
 ### 运行测试
 
-两条前提缺一不可：用 `python -m pytest`（裸 `pytest` 因包未安装会报 ModuleNotFoundError）；导出 `WORKSPACE_PATH` 指向一个已存在目录（`mcp_service/file_io.py` 在 import 时即校验；测试夹具建在 pytest 的 tmp 下，用 `/tmp` 即可）。
+两条前提缺一不可：用 `python -m pytest`（裸 `pytest` 因包未安装会报 ModuleNotFoundError）；导出 `WORKSPACE_PATH` 指向一个已存在的目录（`mcp_service/file_io.py` 在 import 时即校验；测试夹具建在 pytest 的 tmp 下，该目录必须**包住**它，所以用系统的临时目录）。
 
 ```bash
-WORKSPACE_PATH=/tmp uv run python -m pytest                       # 全部测试
-WORKSPACE_PATH=/tmp uv run python -m pytest tests/test_file_io.py # 单文件
-WORKSPACE_PATH=/tmp uv run python -m pytest tests/test_guard.py   # 异常/guard 层
-WORKSPACE_PATH=/tmp uv run python -m pytest tests/test_terminal.py  # 终端进程管理器
+# 本机是 WSL + Windows venv：用仓库里的解释器，且 WSL → Windows 传 env 必须靠 WSLENV
+export WSLENV="WORKSPACE_PATH"
+export WORKSPACE_PATH='C:\Users\<你>\AppData\Local\Temp'   # 见 python -c "import tempfile;print(tempfile.gettempdir())"
+
+.venv/Scripts/python.exe -m pytest                                   # 全部测试
+.venv/Scripts/python.exe -m pytest tests/test_file_io.py             # 单文件
+.venv/Scripts/python.exe -m pytest tests/test_guard.py               # 异常/guard 层
+.venv/Scripts/python.exe -m pytest tests/test_terminal.py            # 终端进程管理器
 ```
 
-> Windows（PowerShell）：`$env:WORKSPACE_PATH="$env:TEMP"` 后再跑 `python -m pytest`——该 env 指向的目录必须**包住** pytest 的 tmp。
+> 不设 `WSLENV` 变量根本进不去子进程（会看到 "WORKSPACE_PATH 未设置"），且值要写 **Windows 路径**（别用 `/tmp`，那会被当成 `E:\tmp`）。纯 Linux/macOS 下把解释器换成 `python`、`WORKSPACE_PATH` 指向该系统的临时目录并跳过 `WSLENV` 即可。
+> Windows（PowerShell）：`$env:WORKSPACE_PATH="$env:TEMP"` 后再跑 `python -m pytest`。
 
 > `app/config.py` 在 import 阶段就读 `.env`，跑测试/启动前 `.env` 必须存在（键全、值可空）。`tests/test_file_io_sandbox.py` 的符号链接逃逸用例在 Windows（无符号链接权限）会 skip。
 
@@ -311,7 +318,7 @@ langgraph build        # 构建可部署镜像
 欢迎提交 Issue 与 Pull Request！
 
 1. Fork 并创建功能分支
-2. 提交改动，确保 `WORKSPACE_PATH=/tmp uv run python -m pytest` 全部通过
+2. 提交改动，确保测试全部通过（跑法见上文「运行测试」；**不要用 `uv run`**）
 3. 发起 Pull Request，描述改动目的
 
 详细流程见 `CONTRIBUTING.md`（待补充）。

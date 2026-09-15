@@ -1,10 +1,16 @@
 # Theta $\theta$ 技能（Skill）设计（草稿）
 
+> ⚠️ **2026-09-15 作废通告**：本文多处（尤以 §8.3 与 §13 的工具清单）以 `mcp_service/git.py` 的
+> `git_push` / `git_clone` / `git_*` 为参照来论证"核心能力 vs 技能"的边界。**那批工具已整体删除**
+> （git 一律走 `run_command`，只读子命令免审见 `app/agent/command_policy.json`）。
+> **下述记录保留原样**——它们是当时的决策依据，不是当前事实；读到时以代码为准。判据本身
+> （"动的是本地仓库还是远端平台"）仍然成立。
+
 > 状态标注：`[已落地]` = 已实现（可指到代码/测试）；`[未做]` = 目标态（设计方向，尚未实现）。
 > **一期已落地（2026-09-12）**：`get_skill` / `drop_skill` 通道（两型共用那半）——见 §11「一期落地」。
 > **前置里程碑已落地（2026-09-12）**：§12 = 「MCP 运行体常驻化」（**通用基建，非 skill 专属**）——含它的承重约束（anyio × langgraph 的 Task 绑定），改那套机制前必读。
 > **二期已落地（只读子集，2026-09-12）**：§13 = 能力型——技能可以带 `server.py`，工具随加载出现、随卸载消失。
-> **未做**：GitHub 的写操作与部分只读工具（§13.9）、技能运行体的空闲回收、`/skills` 命令、§6 的 fork 执行、§10 的命令收敛。
+> **未做**：技能运行体的空闲回收、`/skills` 命令、§6 的 fork 执行、§10 的命令收敛。
 > 文中标 `[已落地]` 的另一些是**既有基建**（当时为"将来复用"而标），不是 skill 能力本身。
 > 相关：[[docs/ARCHITECTURE]] §4（"图内一条边" vs "基座上一类事件"的判据）、[[docs/MULTI_AGENT]] §6（统一审批视图 / 子 agent 写权限下放）、[[docs/EXCEPTION_DESIGN]]（`guard` 与错误语义）、[[docs/CONTEXT_ENGINEERING]]（notes 的"轻注入"同构）、[[docs/LONG_TERM_MEMORY]]（工作区内容 → 注入的既有通道）。
 
@@ -368,7 +374,7 @@ skills/<name>/
 
 **测试**：`tests/test_skills.py`（扫描 / 解析 / **路径穿越被挡** / 预算 / 渲染与截断告警）、`tests/test_skill_tools.py`（登记与路由、加载 / 幂等 / 未知 / 预算拒绝、切片合并与同回合链式）、`tests/test_memory_injection.py` 补三例（注入位置、未加载不注入、独立于开关）。
 
-**已知错配（一期当时）**：`skills/github/SKILL.md` 正文声明的工具此刻并不存在——它是能力型的稿子，一期验证的是**通道**（目录 → 加载 → 注入 → 卸载），不是那些工具。**二期已落地其中 8 条只读工具**（§13）；清单 2026-09-13 与 `git.py` 去重后为 **17 条**（8 ✅ + 5 ⏳ 只读 + 4 写——砍掉 `github_branch_list`、`github_branch_create`，并把 `github_push` 移进核心 git 服务，理由见 §8.3）。
+**已知错配（一期当时）**：`skills/github/SKILL.md` 正文声明的工具此刻并不存在——它是能力型的稿子，一期验证的是**通道**（目录 → 加载 → 注入 → 卸载），不是那些工具。**二期已落地其中 8 条只读工具**（§13）；清单 2026-09-13 与 `git.py` 去重后为 **17 条**（8 ✅ + 5 ⏳ 只读 + 4 写——砍掉 `github_branch_list`、`github_branch_create`，并把 `github_push` 移进核心 git 服务，理由见 §8.3）。**⚠️ 此处是当日（2026-09-13）的清单快照，已被后续实现取代**：落地的最终形态是 **14 只读 + 3 写 = 17 条**（写工具里 `github_pr_merge` 明确不做），见 §13.10。（本节上文另有一处"18 条"是同一日的更早口径，同已作废。）
 
 **二期（未做）**：能力型 `server.py` 生命周期、会话级工具注册表 + 动态 `bind_tools`、env 声明与白名单转发、`/skills` 控制面命令、§10 的 `PROMPT_COMMANDS` 收敛。**前置里程碑 §12（MCP 运行体常驻化）已落地（2026-09-12）**，二期设计见 §13——它骑在那批常驻运行体上。
 
@@ -549,7 +555,7 @@ async def _call(**kwargs):
 
 ---
 
-## 13. 能力型：技能自带的工具（**已落地：12 只读 + 3 写**，2026-09-12 / 2026-09-14）
+## 13. 能力型：技能自带的工具（**已落地：14 只读 + 3 写**，2026-09-12 / 2026-09-14）
 
 > **本节已落地**（落点见 §13.7、测试见 §13.8）。**机制在实现时被简化过一次**：原稿打算"造一个会话级
 > 注册表对象、注入三个节点"，实现时发现 §12 的常驻运行体本来就是"任意 server 的运行体"——技能只是
@@ -725,7 +731,7 @@ evaluation = `task.name`，关池用的也是它）；langgraph dev 零参 → `
 - **端到端验收（实测通过）**：`load_mcp_tool` → `get_skill("github")` → 15 个 `github_*` 进表、核心 34 个
   **不受影响**、版本 +1；真调一次工具 → 运行体键出现（懒起）；`drop_skill` → 工具与运行体一起消失、
   版本再 +1；**另一会话的核心工具仍是完整 34 个**（锁住上面那颗雷）。
-- **`tests/test_github_skill.py`**（11 例，2026-09-13；2026-09-14 扩到 27 例）：技能自带 server 的**收口行为**——render
+- **`tests/test_github_skill.py`**（11 例，2026-09-13；2026-09-14 扩到 34 例）：技能自带 server 的**收口行为**——render
   抛 `_UpstreamError`（坏 base64）必须翻成 `upstream_error` 而不是被 `guard` 判成内部 bug；上游 HTTP
   失败与成功截断各一例。打磨时又加了 7 例：**限流要按响应头认出来**（`X-RateLimit-Remaining: 0`
   → "限流 + 恢复时刻 + 别重试"；429/secondary → 二级限流；**配额还有剩的 403 不许误报成限流**）、
@@ -813,7 +819,7 @@ evaluation = `task.name`，关池用的也是它）；langgraph dev 零参 → `
 
 ### 13.10 三期：平台侧写操作 + 列表族（2026-09-14）
 
-`skills/github/` 从 7 个只读工具长到 **12 只读 + 3 写**，`tool.json` 相应 **15 条**登记（写工具
+`skills/github/` 从 7 个只读工具长到 **14 只读 + 3 写**，`tool.json` 相应 **17 条**登记（写工具
 `need_review: true`）。同批还做了一次 `server.py` 的审计修复（下面单列）。
 
 **新增只读 5 个**（全部免审，走同一条 `_fetch` + `render` 骨架）：
@@ -871,7 +877,7 @@ issue / PR 通吃的**对话楼层**，带楼层号与翻页）与 `github_pr_re
 | 模块 | 关系 |
 | --- | --- |
 | `mcp_service/`（file_io / terminal / git / web_search） | **内置核心能力**，skill 与它并列而不混入（§8.1）；`terminal.py::_deny_sudo` 是"结构性拒绝"的样板；`git.py` 的 `git_push` / `git_clone` 都收远程仓库**地址**（§8.3），核心服务因此**不持有任何平台凭证** |
-| `skills/<name>/`（顶层库） | 一个技能一个目录：`SKILL.md` + 可选 `server.py`（能力型）+ 可选 `skill.json`（env 声明 + 加载时体检 `preflight`）。首个 = `skills/github/`（2026-09-12 起带 server.py；2026-09-14 起 **12 只读 + 3 写**工具 + 加载时体检，见 §13.10） |
+| `skills/<name>/`（顶层库） | 一个技能一个目录：`SKILL.md` + 可选 `server.py`（能力型）+ 可选 `skill.json`（env 声明 + 加载时体检 `preflight`）。首个 = `skills/github/`（2026-09-12 起带 server.py；2026-09-14 起 **14 只读 + 3 写**工具 + 加载时体检，见 §13.10） |
 | `mcp_service/sub_agent.py` + `app/agent/graph.py::get_sub_agent_graph` + `app/agent/tools.py::worker_tools` | **fork 执行的现成骨架**（独立上下文 / 工具子集 / 跨进程审批回流）——§6 要复用它 |
 | `app/agent/mcp.py` | **§12 已落地**：现在同时承载连接配置、工具加载（**不绑会话的 shim**）与运行体常驻（`_ServerWorker` + `get_worker` + `close_session_pool`）。`load_mcp_tool(workspace, session_id)` 增加会话参量；`get_resources` 管道一期不做（§9 已决）——软约束由 host 读 `SKILL.md` |
 | `mcp_service/terminal.py` | **§12 顺带修好了它的跨调用进程管理**（改造前 `start_process` 起的进程下次调用就认不到，实测）——池化后自动恢复，**本文件一行没改** |
