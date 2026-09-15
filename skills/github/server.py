@@ -1,4 +1,4 @@
-"""GitHub 技能的**能力侧**：12 个只读工具 + 3 个写工具（仓库 / 目录树 / 文件 / 搜索 / issue / PR）。
+"""GitHub 技能的**能力侧**：14 个只读工具 + 3 个写工具（仓库 / 目录树 / 文件 / 搜索 / release / issue / PR / 评论与评审读取）。
 
 由 `get_skill("github")` 按需拉起（`python -m skills.github.server`），不由模型直接执行。
 本文件**不读 `SKILL.md`**（§2.2 的不变量）：正文永远由 host 侧读、注入系统提示；server 只管工具。
@@ -8,8 +8,8 @@
 写工具是 `github_pr_create` / `github_pr_review` / `github_issue_comment`（都要人批），越权的
 动作在工具内**结构性拒绝**（`github_pr_review` 不接受 `APPROVE`）。
 **没有"合并 PR"这个工具**：合并权留给人，最彻底的落点就是这个动作压根不存在——`github_pr_view`
-回的"可自动合并：true/false"够模型说清状况。**推送**也不在这里，那是核心的 `git_push`
-（平台无关、不持有任何凭证，理由见 docs/SKILL_DESIGN.md §8.3）。
+回的"可自动合并：true/false"够模型说清状况。**推送**也不在这里：`git push` 走核心的
+run_command（平台无关、不持有任何凭证，理由见 docs/SKILL_DESIGN.md §8.3）。
 
 用 stdlib 的 `urllib.request` 而不是 PyGithub：读写都只是现成的 REST 端点，多一个三方依赖就要动
 主 `pyproject.toml`（§9 已决：技能依赖进主 venv，不做隔离）——能不加就不加。
@@ -341,34 +341,9 @@ def _patch_excerpt(patch: str, limit_lines: int = 40) -> str:
 mcp = FastMCP("GitHub")
 
 # ---------------------- 远端二进制探测（与本地 read_file 同款防线） ----------------------
-
-# 与 mcp_service/file_io.py::_MAGIC_PREFIXES 同一套魔数。**不能 import 它**：file_io 在 import 期
-# 就校验 WORKSPACE_PATH（技能子进程没有这个 env，import 即炸），所以这里复制一份——两处口径
-# 必须保持一致（本地与远端对"二进制"的判定若不同，模型会看到两套世界）。
-_MAGIC_PREFIXES: tuple[tuple[bytes, str], ...] = (
-    (b"\x89PNG\r\n\x1a\n", "PNG 图片"),
-    (b"\xff\xd8\xff", "JPEG 图片"),
-    (b"GIF87a", "GIF 图片"),
-    (b"GIF89a", "GIF 图片"),
-    (b"BM", "BMP 图片"),
-    (b"%PDF", "PDF 文档"),
-    (b"PK\x03\x04", "ZIP 压缩包"),
-    (b"\x1f\x8b", "GZip 压缩包"),
-    (b"\x7fELF", "ELF 可执行文件"),
-    (b"MZ", "Windows 可执行文件"),
-    (b"\x00\x00\x01\x00", "ICO 图标"),
-)
-
-
-def _binary_kind(head: bytes) -> str:
-    """从文件头部魔数猜二进制类型；猜不出给"未知类型"（WebP 是 RIFF 容器，单独判）。"""
-    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
-        return "WebP 图片"
-    for prefix, kind in _MAGIC_PREFIXES:
-        if head.startswith(prefix):
-            return kind
-    return "未知类型"
-
+# 口径 = mcp_service/file_io.py::_is_binary 的 NUL 嗅探（4KB 内出现 NUL 即按二进制）。
+# 只判"是不是二进制"，不再猜"是什么格式"（本地那份 _MAGIC_PREFIXES 已于 2026-09-15 删除，
+# 这里同步）——路径里的后缀已随回执回显，猜格式交给模型。
 
 # ---------------------- 只读工具（SKILL.md §1.1；全部免审批） ----------------------
 
@@ -483,7 +458,7 @@ def github_file_read(owner: str, repo: str, path: str, ref: str = "") -> ToolRes
             # read_file 2026-09-14 修过同款缺陷，这里是远端孪生）。NUL 嗅探口径与之一致。
             if b"\x00" in raw[:4096]:
                 return (
-                    f"{data.get('path')} 是二进制文件（疑似 {_binary_kind(raw[:4096])}），"
+                    f"{data.get('path')} 是二进制文件，"
                     f"大小 {data.get('size')} 字节，无法作为文本读取"
                 )
             content = raw.decode("utf-8", errors="replace")
@@ -820,7 +795,7 @@ def github_pr_list(
 def github_pr_diff(owner: str, repo: str, number: int) -> ToolResult:
     """
     看一个 PR 的**完整 diff**（`base…head` 区间、所有改动文件）。
-    这是本地 `git_diff` 给不了的：它只知道你自己的工作树，看不到两个分支之间的**区间**，
+    这是本地 `git diff` 给不了的：它只知道你自己的工作树，看不到两个分支之间的**区间**，
     更看不到别人的 PR。正文太长会被截断；只想先知道"动了哪些文件、各增删几行"用
     `github_pr_files` 更省。
     Args:
@@ -944,7 +919,7 @@ def github_pr_create(
     draft: bool = False,
 ) -> ToolResult:
     """
-    开一个 PR（**写操作，需人工审批**）。`head` 必须是你**已经推上去**的分支（先 `git_push`），
+    开一个 PR（**写操作，需人工审批**）。`head` 必须是你**已经推上去**的分支（先用 `git push` 推上去），
     `base` 是要合进的目标分支（通常是默认分支，用 `github_repo_view` 确认）。
     `body` **必填**：空描述的 PR 等于把成本转嫁给 reviewer——写清 ① 改动的动机
     ② 怎么验证的（跑了什么、结果如何）③ 遗留事项 / 要 reviewer 特别看的地方。

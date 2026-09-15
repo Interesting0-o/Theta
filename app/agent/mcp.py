@@ -5,7 +5,7 @@
 
 **本模块承载三件事**（合一即"MCP 运行时"这一职责）：
 
-1. **连接配置**：`_build_servers` 按工作区构造 file_io / terminal / git / web_search 的 stdio 连接；
+1. **连接配置**：`_build_servers` 按工作区构造 file_io / terminal / web_search 的 stdio 连接；
 2. **工具加载**：`load_mcp_tool` 返回模型可见的工具（**不绑会话的 shim**，见下）；
 3. **运行体常驻**：每个 (工作区, 会话, server) 一个 owner task，持有一条长活 MCP 会话。
 
@@ -97,10 +97,10 @@ def stdio_connection(
 ) -> StdioConnection:
     """按项目约定造一个 stdio 连接：cwd=工作区、PYTHONPATH=项目根、可追加额外 env。
 
-    核心四件套与**技能自带的 server** 共用这一份约定（模块名不同而已），所以启动器是通用的：
+    核心 server 与**技能自带的 server** 共用这一份约定（模块名不同而已），所以启动器是通用的：
     `python -m <module>`，不为每个 server 记启动方式。
 
-    - 各 server 都以**工作区**为启动目录（而非项目根）：file_io / git 本身按 WORKSPACE_PATH 解析
+    - 各 server 都以**工作区**为启动目录（而非项目根）：file_io 本身按 WORKSPACE_PATH 解析
       路径，cwd 与解析无关；terminal 的 run_command 不显式传 cwd 时就在该进程 cwd 里执行，切到
       工作区可避免命令默认落在 Theta 仓库根、误伤自身源码。
     - 子进程 cwd 已切走，靠 PYTHONPATH 补回项目根，保证 `python -m mcp_service.*` /
@@ -123,13 +123,12 @@ def stdio_connection(
 def _build_servers(workspace_path: str) -> dict[str, Connection]:
     """按当前配置构造要拉起的 MCP server 连接集合（不实际拉起子进程，便于单测）。
 
-    - file_io / terminal / git：必选，cwd 设为工作区根；
+    - file_io / terminal：必选，cwd 设为工作区根；
     - web_search：TAVILY_API_KEY 为空则跳过并告警（可选能力不阻塞主流程）。
     """
     servers: dict[str, Connection] = {
         "file_io": stdio_connection("mcp_service.file_io", workspace_path),
         "terminal": stdio_connection("mcp_service.terminal", workspace_path),
-        "git": stdio_connection("mcp_service.git", workspace_path),
     }
 
     tavily_key = get_settings().TAVILY_API_KEY.get_secret_value()
@@ -145,13 +144,13 @@ def _build_servers(workspace_path: str) -> dict[str, Connection]:
 
 # ---------------------- 工具的 schema ----------------------
 
-# schema 缓存：键 = 工作区（**只放核心四件套**）。schema 与会话无关，且每条 (工作区, 会话) 的 shim 都从它派生。
+# schema 缓存：键 = 工作区（**只放核心 server**）。schema 与会话无关，且每条 (工作区, 会话) 的 shim 都从它派生。
 _TOOL_SPECS: dict[str, list[MCPToolSpec]] = {}
 # 单 server 的 schema 缓存：键 = (工作区, server)，给**运行中动态加入的 server**（技能）用。
 #
 # ⚠️ 与 `_TOOL_SPECS` 是两条缓存，**绝不能互相写**：`_TOOL_SPECS` 的内容等于"调用方传进来的那批
 # connections"，若技能列 schema 复用它、只传技能自己的 connection，就会把该工作区的核心 schema
-# 覆盖成"只剩技能工具"——之后每个新会话的 file_io/terminal/git 都会静默消失。
+# 覆盖成"只剩技能工具"——之后每个新会话的 file_io/terminal 都会静默消失。
 _SERVER_SPECS: dict[tuple[str, str], list[MCPToolSpec]] = {}
 # shim 缓存：键 = (工作区, 会话)。shim 是**无状态**的（调用时才解析 worker），
 # 所以关闭运行体后无需失效——同一个 shim 会透明地连到重建后的运行体。
@@ -178,7 +177,7 @@ def _spec_from_tool(server: str, tool) -> MCPToolSpec:
 
 
 async def _tool_specs(workspace_path: str, connections: dict[str, Connection]) -> list[MCPToolSpec]:
-    """取某工作区**核心四件套**的工具 schema（按工作区缓存）。
+    """取某工作区**核心 server** 的工具 schema（按工作区缓存）。
 
     **逐 server** 调 `client.get_tools(server_name=...)` 是有意的——归属必须显式（见 `schema.agent_schema.MCPToolSpec`）；
     用 `asyncio.gather` 保持并发（别写成串行，那会把加载延迟从 max(t) 变成 sum(t)）。

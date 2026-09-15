@@ -1,6 +1,6 @@
 ---
 name: github
-description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜仓库）。当任务涉及 GitHub 上的仓库——查看 issue、开或审 PR、读远端代码、搜项目——时使用。本地仓库操作（status / diff / commit / 切分支 / 克隆 / 推送）走 git_* 系列工具，不要用本技能。
+description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜仓库）。当任务涉及 GitHub 上的仓库——查看 issue、开或审 PR、读远端代码、搜项目——时使用。本地仓库操作（status / diff / commit / 切分支 / 克隆 / 推送）走 run_command 跑 git 命令，不要用本技能。
 ---
 
 # GitHub 技能
@@ -9,6 +9,9 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
 
 > **阅读顺序**：§2.1 是硬约束（系统层面拦着或要求人批的，不是你该不该遵守的问题），其中标 ⚠️ 的那条
 > 是例外，见该行说明；§2.2 是软约束（你**应当遵守**的行动指导）。两者都不是建议。
+>
+> **实例**：`examples/pr-create.md` 是一次真实会话的完整流程复盘（分批提交 → 推送 → 开 PR，
+> 含仓库改名 307 的处置）——走 PR 流程前值得对照一遍。
 
 ---
 
@@ -36,8 +39,9 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
 > **`github_tree` + `github_file_read` 是"不克隆读代码"的主力**：只想看一个文件、一层目录时用它们，
 > 不要为了看一眼就把整个仓库克隆下来（慢、占地方、还要过审批）。
 >
-> **`github_pr_diff` / `github_pr_files` 管的是 PR 的区间 diff**：本地 `git_diff` 只知道你自己的
-> 工作树，看不到 `main…feature` 这样的区间，更看不到别人的 PR。
+> **`github_pr_diff` / `github_pr_files` 管的是 PR 的区间 diff**：本地的
+> `git diff`（走 run_command）只知道你自己的工作树，看不到 `main…feature` 这样的区间，
+> 更看不到别人的 PR。
 >
 > **能写评审也要能读评审**：`github_issue_comments` / `github_pr_reviews` 把讨论与评审结论读
 > 回来——别人 `REQUEST_CHANGES` 的理由在后者；读到 `APPROVED` 是人做出的决定，你只需要照着它
@@ -55,24 +59,29 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
 > **合并没有对应的工具**（不是藏在别处——别猜名字、也别绕道 shell），这两件事都是人的权力。
 > `github_pr_view` 会告诉你"可自动合并：true / false"，把它和开 PR 回执里的链接一起交给用户即可。
 >
-> **推送也不在这里**：用 `git_push`（参数是**远程仓库的完整地址**，地址由用户给；不要用
-> `run_command` + `git push` 绕开审批）。
+> **推送也不在这里**：`git push` 走 `run_command`（**需人工审批**）——① 地址要**来自用户**
+> （用户给的、或用户确认过的），不要凭记忆拼、也不要用 `origin` 去猜；② 地址里不要写
+> token / 密码（会进命令行、回执与对话历史）；③ **不要用 `--force`**，那会覆写远端历史、不可逆。
 >
-> **别绕道**：用 `run_command` + `gh` / `curl` 去改远端，既没有审批粒度，错误也只剩一坨文本。
+> **但平台对象仍然只走本技能**：改 issue / PR（留言、评审、开 PR）别绕道 `run_command` + `gh` /
+> `curl` 去打 API——那些既没有审批粒度，错误也只剩一坨文本。
 
 ### 1.3 不归本技能的事（别用本技能重复实现）
 
-- **本地仓库操作**（`status` / `diff` / `log` / `add` / `commit` / 切分支 / 列分支 / 推送）→ 用
-  `git_status` / `git_diff` / `git_log` / `git_add` / `git_commit` / `git_switch` / `git_fetch` /
-  `git_branches` / `git_push`。四处最容易搞混的：
-  - **列分支** → `git_fetch`（只读：取远端最新对象、不动工作树）+ `git_branches`；本技能**没有**
-    `github_branch_list`（同一件事不两处维护）。
-  - **建分支** → `git_switch` 建本地的；远端那条同名分支在你第一次 `git_push` 时一并创建。
-  - **推送** → `git_push`（**地址要来自用户**；不要用 `run_command` + `git push` 绕开审批）。
-  - **看自己未提交的改动** → `git_diff`。
-- **克隆仓库** → 优先用 §1.1 的远端读工具（看一眼不需要一份工作树）；确实要克隆时用 `git_clone`
-  （目标目录必须在**工作区内**，且要人批）。
-- **用 `curl` 之类的命令直接打 GitHub API** → 用本技能的工具（否则既没有审批粒度，错误也只剩一坨文本）。
+- **本地仓库操作**（`status` / `diff` / `log` / `add` / `commit` / 切分支 / 列分支 / 推送 / 克隆）
+  → 用 `run_command` 跑 git 命令。**本 agent 没有 git 专用工具**。四处最容易搞混的：
+  - **列分支** → `git fetch`（只读、免审：取远端最新对象、不动工作树）+ `git branch -a`；本技能
+    **没有** `github_branch_list`（同一件事不两处维护）。
+  - **建分支** → `git switch -c <名字>` 建本地的；远端那条同名分支在你第一次推送时一并创建。
+  - **推送** → `git push <完整地址> <分支>`（**地址要来自用户**；需审批）。
+  - **看自己未提交的改动** → `git diff`。
+
+  只读的 `git status` / `log` / `diff` / `show` / `branch`（只列表）/ `fetch` 走 run_command 时
+  **免审批**；带 `&&`、管道、重定向的组合形态会转为需审批——想免审就一条一条地跑。
+- **克隆仓库** → 优先用 §1.1 的远端读工具（看一眼不需要一份工作树）；确实要克隆时用 `run_command`
+  跑 `git clone`（目标目录要在**工作区内**，需审批）。
+- **用 `gh` / `curl` 之类的命令直接打 GitHub API 改平台对象** → 用本技能的工具（否则既没有审批
+  粒度，错误也只剩一坨文本）。
 
 ---
 
@@ -90,11 +99,11 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
 
 **分支与提交**
 
-1. **先开分支，再动手；主分支里不落提交。** 要落地的改动，第一步是 `git_switch` 开一个语义化
-   名字的**本地**分支（如 `fix/issue-42-null-deref`）。`main` / `master` 这类主分支**只进合并**
-   （改动经 PR 由人合并进去），**不在主分支里直接提交**——所有写改动都发生在新分支上；
-   远端那条同名分支等你第一次 `git_push` 时一并创建。
-2. **小步提交，一个提交一件事。** `git_commit` 的粒度按"一个可独立解释的改动"切，别把三件不
+1. **先开分支，再动手；主分支里不落提交。** 要落地的改动，第一步是 `git switch -c <名字>` 开一个
+   语义化名字的**本地**分支（如 `fix/issue-42-null-deref`）。`main` / `master` 这类主分支**只进
+   合并**（改动经 PR 由人合并进去），**不在主分支里直接提交**——所有写改动都发生在新分支上；
+   远端那条同名分支等你第一次推送时一并创建。
+2. **小步提交，一个提交一件事。** `git commit` 的粒度按"一个可独立解释的改动"切，别把三件不
    相关的事塞进一个提交。
 3. **提交信息写"为什么"，不写"改了什么"。** 改了什么 diff 里看得到，为什么改只有你知道。
 4. **推送前先确认推的是哪个分支、哪个地址。** 分支要与你本地提交的一致；**地址要来自用户**
@@ -103,14 +112,16 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
 
 **PR**
 
-5. **开 PR 之前，必须先把主分支同步进来、解决完所有冲突。** 步骤：`git_fetch` 拿远端最新（免审）
-   → 在自己的分支上 `git_pull(<remote>, <主分支名>)` 把 `origin/main` 合进来（要审批）→ 有冲突
-   就 `read_file` / `edit_file` 处理冲突标记，`git_add` + `git_commit` 完成这次合并 → `git_diff`
-   / `git_log` 确认干净再 `git_push`。**带着冲突开 PR 等于把解决冲突的成本转嫁给 reviewer**；
-   拿不准主分支动没动，先 `git_fetch` + `git_branches` 看一眼再动手。
+5. **开 PR 之前，必须先确认"能干净合入主分支"。** 步骤：`git fetch` 拿远端最新（免审）→ 比一比
+   自己的分支与主分支（`git log` / `git diff`，或 `git merge-base` 找分叉点）：**分支严格领先**
+   （主分支上的提交都已在你的历史里）就无需同步；**确实分叉了**才在自己的分支上
+   `git pull <remote> <主分支名>` 把 `origin/main` 合进来（要审批），有冲突就用
+   `read_file` / `edit_file` 处理冲突标记，`git add` + `git commit` 完成这次合并 → `git diff`
+   / `git log` 确认干净再推送。**带着未解决的冲突开 PR 等于把解决冲突的成本转嫁给 reviewer**；
+   拿不准主分支动没动，先 `git fetch` + `git branch -a` 看一眼再动手。
 6. **PR 描述必须写清三件事**：① 改动的动机（解决什么问题）；② 怎么验证的（跑了什么命令、结果
    如何）；③ 遗留事项 / 需要 reviewer 特别看的地方。**空描述的 PR 等于把成本转嫁给 reviewer。**
-7. **要开 PR 前先自查 diff**（自己的改动用 `git_diff`，别人的 PR 用 `github_pr_diff` 看区间）：
+7. **要开 PR 前先自查 diff**（自己的改动用 `git diff`，别人的 PR 用 `github_pr_diff` 看区间）：
    有没有夹带调试代码、临时文件、密钥。
 8. **评审意见要具体。** 用 `github_pr_review` 留意见时指向文件与行，说清"这里为什么有问题"，
    不要只写"看起来不错"。
@@ -118,10 +129,10 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
 
 **读**
 
-9. **读远端优先用 `github_tree` / `github_file_read`**，别为了看一眼就克隆。
-10. **拿不准仓库的实际状态时先读再动**：`github_repo_view` 看默认分支，`git_fetch` + `git_branches`
+10. **读远端优先用 `github_tree` / `github_file_read`**，别为了看一眼就克隆。
+11. **拿不准仓库的实际状态时先读再动**：`github_repo_view` 看默认分支，`git fetch` + `git branch -a`
     看分支现状——凭印象推送是事故之源。
-11. **要摸清"这个仓库在忙什么"**：`github_issue_list` / `github_pr_list` 看开放项，版本问题看
+12. **要摸清"这个仓库在忙什么"**：`github_issue_list` / `github_pr_list` 看开放项，版本问题看
     `github_release_list`——比逐个猜编号快得多。
 
 ---
@@ -147,6 +158,6 @@ description: GitHub 平台操作（PR / issue / 不克隆读远端代码 / 搜�
   只有"留意见 / 要求修改"，**没有"批准"与"合并"**。
 - **不碰别的平台**：GitLab / Gitea 等不在本技能范围。本技能只管 PR / issue 这些平台对象。
 - **不做本地仓库的活**（§1.3）：`status` / `diff` / `log` / `add` / `commit` / 切分支 / 列分支 /
-  克隆 / 推送，一律走 `git_*` 系列工具。
+  克隆 / 推送，一律走 `run_command` 跑 git 命令。
 - **不做"自动提交马拉松"**：不要在一轮里连续推送多个分支、批量开 PR。每个远端改动都过一次审批，
   批量操作会变成审批轰炸——**做一步、验一步、报一步**。

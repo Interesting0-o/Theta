@@ -32,11 +32,11 @@ def test_load_mcp_tool_rejects_nonexistent_workspace(tmp_path):
         asyncio.run(load_mcp_tool(str(absent)))
 
 
-def test_build_servers_always_includes_file_io_terminal_and_git(tmp_path, monkeypatch):
-    # 密钥为空时也只跳过 web_search，文件/终端/git 能力必须保留
+def test_build_servers_always_includes_file_io_and_terminal(tmp_path, monkeypatch):
+    # 密钥为空时也只跳过 web_search，文件 / 终端能力必须保留
     monkeypatch.setattr(mcp_module, "get_settings", lambda: _fake_settings(""))
     servers = mcp_module._build_servers(str(tmp_path))
-    assert set(servers) == {"file_io", "terminal", "git"}
+    assert set(servers) == {"file_io", "terminal"}
 
 
 def test_build_servers_skips_web_search_when_key_empty(tmp_path, monkeypatch):
@@ -48,7 +48,7 @@ def test_build_servers_skips_web_search_when_key_empty(tmp_path, monkeypatch):
 def test_build_servers_includes_web_search_when_key_present(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_module, "get_settings", lambda: _fake_settings("tavily-key"))
     servers = mcp_module._build_servers(str(tmp_path))
-    assert set(servers) == {"file_io", "terminal", "git", "web_search"}
+    assert set(servers) == {"file_io", "terminal", "web_search"}
 
 
 def test_build_servers_web_search_env_carries_key_and_pythonpath(tmp_path, monkeypatch):
