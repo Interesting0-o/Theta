@@ -23,6 +23,7 @@
 ## ✨ 核心特性
 
 - 🛡️ **知情审批闸门**：写文件、删目录、跑命令前，TUI 展示工具名、参数与模型的**意图解释**，等你按 `y/n`。终端命令强制模型附一句"这条命令要干什么"，命令 + 解释同屏展示，先看意图再核对命令
+- ❓ **人机闸门 · agent 提问**：需求不明确时模型可以**停下来问**（`ask_user`）——摆出几个带差别的选项，你选一项、也可以**另外补一段说明**（补充是独立的一段，不是"选项之外的替代品"）。与审批共用同一个闸门骨架；没人回答就记"未作答"，模型按最佳判断继续
 - 📋 **计划编排**：模型把任务拆成步骤（`create_plan`），边做边推进状态（`update_plan_step`），计划跨对话轮持久跟踪，不随对话丢失
 - 🔌 **MCP 工具即插即用**：文件、终端、联网检索各自是**独立 MCP 服务器**，新增工具只改对应 server，核心 agent 代码不动（**git 没有专用 server**——它一律走 `run_command`，见下面的免审面一节）
 - 📁 **文件沙箱**：文件工具（**含读操作**）全部锁在 `WORKSPACE_PATH` 内——相对路径解析 + 符号链接消解后再校验，越界即拒绝
@@ -128,7 +129,12 @@ async def main():
 asyncio.run(main())
 ```
 
-> 💡 遇到 `__interrupt__` 挂起时，用 `Command(resume={"approved": True/False})` 继续执行——详见 [工具审批流程](#-进阶内容)。
+> 💡 遇到 `__interrupt__` 挂起时，先看 `payload["type"]` 再决定回什么（`resume` 的值随闸门种类变，见 `app/platform/turn.py::decision_to_resume`）：
+> - `tool_approval`（工具审批）→ `Command(resume={"approved": True/False})`；
+> - `ask_user`（agent 提问）→ `Command(resume={"option_index": 1, "supplement": "另外……"})`，
+>   两段都可为 `None`（选项序号 0 起始）。
+>
+> 详见 [工具审批流程](#-进阶内容)。
 
 ## 🧩 进阶内容
 
@@ -151,15 +157,15 @@ START ─► llm_node ──(有 tool_calls)──► queue_node ─► review_n
 | 节点 | 职责 |
 | --- | --- |
 | `llm_node` | 聊天模型判断本轮要不要调工具（可调 = 编排/笔记/派发/记忆工具 + 四个 MCP server 的全部工具）；拼系统消息时注入 行为契约 + 工作区上下文 + 当前计划 + 项目画像 + 长期记忆 |
-| `queue_node` | 把模型输出的 `tool_calls` 移入待审队列，清空上一轮审批结果 |
-| `review_node` | 按 `tool.json` 逐个判定：`need_review: true` 则 `interrupt()` 挂起等 `y/n`；通过的调用按 `source` 分流（state 工具 → orchestrate_node，其余 → tool_node）；**被拒**的调用回灌一条带 `[approval_denied]` 的回执（不让模型以为它执行了） |
-| `orchestrate_node` | 执行 agent 侧 state 工具：计划编排（`create_plan` / `update_plan_step` / `clear_plan`）、`read_note`、`dispatch_subtasks`、`write_memory` / `read_memory`——只动会话内 state，不产生真实副作用 |
+| `queue_node` | 把模型输出的 `tool_calls` 移入待审队列，清空上一轮的放行队列与提问回答 |
+| `review_node` | **人机闸门的落点**，按 `tool.json` 逐个判定：`need_review: true` 则 `interrupt()` 挂起等 `y/n`；`source: "ask"`（`ask_user`）则 `interrupt()` **提问**并把回答写进 state；通过的调用按 `source` 分流（state 工具 → orchestrate_node，其余 → tool_node）；**被拒**的调用回灌一条带 `[approval_denied]` 的回执（不让模型以为它执行了） |
+| `orchestrate_node` | 执行 agent 侧 state 工具：计划编排（`create_plan` / `update_plan_step` / `clear_plan`）、`read_note`、`ask_user`（把闸门收来的两段回答渲染成回执）、`dispatch_subtasks`、`write_memory` / `read_memory`——只动会话内 state，不产生真实副作用 |
 | `tool_node` | `ainvoke` 执行已批准的工具（MCP 工具是 async-only），结果作为 `ToolMessage` 回传 |
 | `compact_node` | **轮末折叠**：历史超预算（默认 60000 字符）时，把更早轮次**已消费的完整工具块**折成一条摘要系统消息（联网正文归档进 `notes`，需要时用 `read_note` 取回）；只在收尾跑，不碰当前轮 |
 
 几个关键点：
 
-- **审批用 interrupt 而非条件分支**：每个需审的 `tool_call` 各自 `interrupt()` 一次，所以一次请求可能挂起多次；基座（`app/platform`）把中断入统一 broker 并 park 住 run，前端（终端 TUI）只负责画面板、收 `y/n`，基座再以 `Command(resume={"approved": ...})` 续跑——**阻塞图、不阻塞进程**，因此主 agent 等审批时 worker 的审批照样能被服务。
+- **闸门用 interrupt 而非条件分支**：每个需审的 `tool_call` 各自 `interrupt()` 一次，所以一次请求可能挂起多次；基座（`app/platform`）把中断入统一 broker 并 park 住 run，前端（终端 TUI）只负责画面板、收人的决定（审批 `y/n`、提问选选项 + 补充），基座再以 `Command(resume=…)` 续跑——**阻塞图、不阻塞进程**，因此主 agent 等审批时 worker 的审批照样能被服务。**interrupt 必须待在"挂起之前没有副作用"的节点里**：resume 会把节点整体重跑，而外部副作用不会回滚（`review_node` 满足，`orchestrate_node` 不满足——所以 `ask_user` 的挂起在闸门处、执行在编排处）。
 - **为什么这几类免审**：计划编排只动会话内、跨轮持久化的 `current_plan`；`read_note` 只读会话内的笔记；`write_memory` 写的是 agent 自己的私有记忆目录（`resource/` 下，不在你的仓库里，可随时改）；`dispatch_subtasks` 派出的 worker 只有 file_io 读 + **下放的终端** + 联网（后两者要审批时才来问你，**只读 git 子命令免审**）。真正有副作用的（写文件 / 删目录 / 跑命令 / 联网检索）一律要审批。
 - **审批策略与工具归属集中在 `app/agent/tool.json`**（`need_review` + `source`）：
 
@@ -167,6 +173,7 @@ START ─► llm_node ──(有 tool_calls)──► queue_node ─► review_n
 | --- | --- | --- |
 | 计划编排 | `create_plan` / `update_plan_step` / `clear_plan` | 免审（无真实副作用） |
 | 会话笔记 | `read_note`（读被折叠归档的联网正文） | 免审 |
+| 向用户提问 | `ask_user`（摆选项问用户、挂起等回答；回答 = 选中项 + 一句补充） | 免审（不产生副作用，也不替代审批） |
 | 并发资料收集 | `dispatch_subtasks`（派发只读 worker 并行调研） | 免审（worker 自己发起的联网调用另需审批） |
 | 长期记忆 | `write_memory` / `read_memory` | 免审（写在 resource 私有目录，可随时改） |
 | 读 / 查询 | file_io：`read_file` / `list_dir` / `get_directory_tree` / `search_content` / `glob`；terminal 只读：`process_wait` / `process_read` / `process_list`；**git 只读子命令**（`git status` / `log` / `diff` / `show` / `branch` 列表 / `fetch`，经 `run_command`） | 免审 |
@@ -306,6 +313,7 @@ langgraph build        # 构建可部署镜像
 单 agent 闭环（执行 / 审批 / 计划）已通，以下为纵深方向（2026-09 规划）：
 
 - [x] **多 Agent 编排（并行分发已落地）**：通过 MCP 服务拉起多个子 agent——`dispatch_subtasks` 一次派发多个**相互独立**的调研子任务，各自 spawn 独立 worker 进程并发执行；worker 只读工作区 + 可联网检索，敏感动作（联网四件套）经 **HTTP 回传进主侧统一审批闸门**；结论回主 agent 归并。**未做的是 DAG 拓扑编排与依赖调度**（下游消费上游产出 + 就绪调度）、以及子 agent 写权限下放。**设计草稿见 [`docs/MULTI_AGENT.md`](docs/MULTI_AGENT.md)**
+- [x] **人机闸门 · agent 提问**：审批闸门泛化成"人机闸门"——`ask_user` 把选项摆给用户、挂起图等回答（回答 = 选中项 + 一句补充，两段都可只给一半）。与审批共用 `ReviewNode` 的 interrupt、统一 broker 与 `Command(resume)` 回程；worker 侧结构性不参与
 - [ ] **反思节点（reflect-before-act）**：在 llm_node 拟调用 tool_calls 之后、进入人工审核之前，用**另一模型**审计一次拟执行操作（不同模型常有不同视角，容易揪出主模型盲点）；被否决则把**理由回灌主模型重想**。反思次数必须有**上限**——按实测，**单次反思收益已足够大，可先只做一次**，再做"多次 vs 收益"的评估对比
 - [ ] **Web UI**：FastAPI（web 依赖组已预留）暴露 SSE + 审批端点，把人工审批与计划可视化搬到浏览器
 - [ ] Web API 服务层（FastAPI）暴露 REST / SSE 接口

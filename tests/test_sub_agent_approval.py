@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 from app.schema.agent_schema import ToolResult
 from app.platform.approvals import ApprovalInboxServer
+from app.schema.approval_schema import Decision
 from mcp_service.sub_agent import run_subtask_impl
 
 FINAL = "结论：联网调研完成"
@@ -82,7 +83,9 @@ def test_approved_closes_chain(tmp_path):
                         assert pending[0]["payload"]["tool_name"] == "web_search"
                         # 子任务原文随审批一起到主侧：人审时才有"这个 worker 在做什么"的上下文
                         assert pending[0]["payload"]["subtask"] == "查 x"
-                        assert server.queue.complete(pending[0]["approval_id"], True)
+                        assert server.queue.complete(
+                            pending[0]["approval_id"], Decision(kind="approval", approved=True)
+                        )
                         return
                     await asyncio.sleep(0.01)
                 raise AssertionError("收件箱一直没收到 worker 审批请求")
@@ -115,7 +118,9 @@ def test_denied_closes_chain(tmp_path):
                 for _ in range(500):
                     pending = server.queue.pending()
                     if pending:
-                        assert server.queue.complete(pending[0]["approval_id"], False)
+                        assert server.queue.complete(
+                            pending[0]["approval_id"], Decision(kind="approval", approved=False)
+                        )
                         return
                     await asyncio.sleep(0.01)
                 raise AssertionError("收件箱一直没收到 worker 审批请求")

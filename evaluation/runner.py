@@ -42,6 +42,7 @@ from langgraph.types import Command
 from app.agent.graph import get_main_agent_graph
 from app.agent.mcp import close_session_pool
 from app.agent.state import AgentState
+from app.platform.turn import decision_to_resume
 
 from .tasks import Task
 
@@ -128,9 +129,11 @@ async def run_task(graph, task: Task, workspace: Path) -> EvalResult:
             interrupts = output.get("__interrupt__") or []
             if interrupts:
                 payload = _extract_payload(interrupts)
-                approved = bool(policy(payload))
+                decision = policy(payload)
                 result.interrupt_count += 1
-                inputs = Command(resume={"approved": approved})
+                # resume 值经**与基座同一个映射**造（app/platform/turn.py::decision_to_resume）：
+                # 评估绕过 UI 协议，但不该绕过图侧的契约——否则审批/提问的形状会各写一份。
+                inputs = Command(resume=decision_to_resume(decision))
                 continue
 
             result.ok = True

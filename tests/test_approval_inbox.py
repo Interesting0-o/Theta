@@ -1,4 +1,4 @@
-"""app/platform/approvals.py：待审请求队列（ApprovalInbox）+ 薄 HTTP 收件箱的测试。
+"""app/platform/approvals.py：闸门队列（ApprovalInbox）+ 薄 HTTP 收件箱的测试。
 
 本模块不 import app.agent → 无需 .env、无需 WORKSPACE_PATH。
 HTTP 用 ApprovalInboxServer(start(port=0)) 在测试自己的事件循环里拉起，测试后 stop。
@@ -11,7 +11,12 @@ import pytest
 
 from app.exception import ConfigError
 from app.platform.approvals import ApprovalInbox, ApprovalInboxServer
-from app.schema.approval_schema import DEFAULT_INBOX_HOST, DEFAULT_INBOX_PORT
+from app.schema.approval_schema import (
+    DEFAULT_INBOX_HOST,
+    DEFAULT_INBOX_PORT,
+    GATE_ASK_USER,
+    Decision,
+)
 
 PAYLOAD = {
     "worker_id": "worker-1",
@@ -19,6 +24,19 @@ PAYLOAD = {
     "tool_args": {"command": "rm -rf dist", "description": "清理构建产物"},
     "description": "清理 dist",
 }
+
+# 一条 agent 提问的载荷（本地主 agent 才有；worker 侧结构性不可达）
+ASK_PAYLOAD = {
+    "worker_id": "main",
+    "type": GATE_ASK_USER,
+    "why": "两条路差别很大",
+    "question": "用哪个测试框架？",
+    "options": ["pytest", "unittest"],
+}
+
+# 审批的两个决定
+ALLOW = Decision(kind="approval", approved=True)
+DENY = Decision(kind="approval", approved=False)
 
 
 def test_default_inbox_port_is_shared_constant(monkeypatch):
@@ -84,7 +102,7 @@ def test_decided_records_are_bounded_but_recent_stay_queryable():
         queue = ApprovalInbox()
         ids = [queue.enqueue(PAYLOAD) for _ in range(_DECIDED_HISTORY + 10)]
         for approval_id in ids:
-            queue.complete(approval_id, True)
+            queue.complete(approval_id, ALLOW)
 
         assert queue.status(ids[-1]) == {"status": "decided", "approved": True}
         assert queue.status(ids[0]) is None  # 更早的已回收——无界增长被挡住
@@ -99,13 +117,66 @@ def test_deny_pending_rejects_everything_undecided():
     async def go():
         queue = ApprovalInbox()
         first, second, decided = (queue.enqueue(PAYLOAD) for _ in range(3))
-        queue.complete(decided, True)
+        queue.complete(decided, ALLOW)
 
         assert queue.deny_pending() == 2
         assert queue.status(first) == {"status": "decided", "approved": False}
         assert queue.status(second)["approved"] is False
         assert queue.status(decided)["approved"] is True  # 已决定的不被改动
         assert queue.deny_pending() == 0  # 幂等
+
+    asyncio.run(go())
+
+
+def test_deny_pending_answers_questions_with_unanswered_not_denied():
+    """收尾时提问按**未回答**回填，而不是"用户否决"——两种闸门各有各的 fail-closed 语义。"""
+
+    async def go():
+        queue = ApprovalInbox()
+        asked, approval = queue.enqueue(ASK_PAYLOAD), queue.enqueue(PAYLOAD)
+
+        assert queue.deny_pending() == 2
+        assert (await queue.wait(asked)) == Decision(kind="answer")  # 两段皆空 = 未回答
+        assert (await queue.wait(approval)) == DENY
+        # 提问没有 bool 可投影（HTTP 长轮询只有 worker 在用，它只会审批）
+        assert queue.status(asked) == {"status": "decided", "approved": None}
+
+    asyncio.run(go())
+
+
+def test_record_to_value_passes_question_fields():
+    """提问载荷透传到前端：type 决定怎么问，why / question / options 一个都不能丢。"""
+    from app.platform.approvals import _record_to_value
+
+    async def go():
+        queue = ApprovalInbox()  # 队列带 asyncio.Future，须在事件循环里建
+        queue.enqueue(ASK_PAYLOAD)
+        value = _record_to_value(queue.pending()[0])
+
+        assert value["type"] == GATE_ASK_USER
+        assert value["why"] == "两条路差别很大"
+        assert value["question"] == "用哪个测试框架？"
+        assert value["options"] == ["pytest", "unittest"]
+        assert "tool_name" not in value  # 提问不谈工具
+
+    asyncio.run(go())
+
+
+def test_record_to_value_keeps_approval_shape_and_step():
+    """审批载荷形状不变（含远端 worker 的"来源标记"回退）——改闸门不该动到审批面板。"""
+    from app.platform.approvals import _record_to_value
+
+    async def go():
+        queue = ApprovalInbox()
+        queue.enqueue(PAYLOAD)
+        value = _record_to_value(queue.pending()[0])
+
+        assert value["tool_name"] == "run_command"
+        assert value["tool_args"] == PAYLOAD["tool_args"]
+        assert value["current_step"] == "worker:worker-1"  # 无 current_step → 回退成来源标记
+
+        queue.enqueue({**PAYLOAD, "worker_id": "main", "current_step": "1/1"})
+        assert _record_to_value(queue.pending()[1])["current_step"] == "1/1"
 
     asyncio.run(go())
 
@@ -123,16 +194,16 @@ def test_queue_enqueue_pending_complete_wait():
         await asyncio.sleep(0)
         assert not waiter.done()
 
-        assert queue.complete(approval_id, True) is True
-        assert (await waiter) is True
+        assert queue.complete(approval_id, ALLOW) is True
+        assert await waiter == ALLOW
         assert queue.status(approval_id) == {"status": "decided", "approved": True}
 
         # 幂等：已回填再 complete 无效；未知 id 也无效
-        assert queue.complete(approval_id, False) is False
-        assert queue.complete("nope", True) is False
+        assert queue.complete(approval_id, DENY) is False
+        assert queue.complete("nope", ALLOW) is False
 
         # 已回填后 wait 立即返回
-        assert await queue.wait(approval_id) is True
+        assert await queue.wait(approval_id) == ALLOW
 
     asyncio.run(go())
 

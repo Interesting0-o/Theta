@@ -18,6 +18,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from app.agent.nodes import OrchestrateNode
 from app.schema.agent_schema import ToolResult
 from app.platform.approvals import ApprovalInboxServer
+from app.schema.approval_schema import Decision
 
 import app.agent.tools as tools_mod
 from mcp_service.sub_agent import run_subtask_impl
@@ -85,7 +86,10 @@ def _run_main_dispatch(monkeypatch, workspace, reviewer_result: bool):
                     if pending:
                         assert pending[0]["payload"]["tool_name"] == "web_search"
                         assert pending[0]["payload"]["worker_id"].startswith("worker-")
-                        assert server.queue.complete(pending[0]["approval_id"], reviewer_result)
+                        assert server.queue.complete(
+                            pending[0]["approval_id"],
+                            Decision(kind="approval", approved=reviewer_result),
+                        )
                         return
                     await asyncio.sleep(0.01)
                 raise AssertionError("收件箱一直没收到 worker 审批请求")

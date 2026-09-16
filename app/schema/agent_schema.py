@@ -52,6 +52,22 @@ class ImageRef(TypedDict):
     mime: str
 
 
+class AskAnswer(TypedDict):
+    """一条 agent 提问的回答（人机闸门的产出，进 state 的 `ask_answers`，随 checkpoint 序列化）。
+
+    与 PlanStep / NoteEntry / ImageRef 同族：**进 state → TypedDict**（值对象才用 frozen dataclass）。
+    生产者 = `ReviewNode`（提问闸门），消费者 = `ask_user` 工具——**闸门的产出是 state，执行器消费
+    state**，与 `approved_*` 队列同一条路子。工具靠它 + 自己的 options 渲染出给模型的回执。
+
+    回答是**两段**：`option_index` 是用户选中的选项序号（0 起始；没选任何给定选项时为 None），
+    `supplement` 是用户自己补的一段话（可空）。**两段皆空 = 未回答**，消费方只认这一条判据
+    （见 `app/schema/approval_schema.py::Decision.unanswered`）。
+    """
+
+    option_index: int | None
+    supplement: str | None
+
+
 @dataclass(frozen=True)
 class MCPToolSpec:
     """一条 MCP 工具的静态 schema（**不含会话**，故可跨会话复用、按工作区缓存）。

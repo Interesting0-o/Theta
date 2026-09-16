@@ -20,17 +20,29 @@ import app.platform.commands as commands_mod
 import app.resource as resource
 from app.platform.commands import PROMPT_COMMANDS
 from app.platform.loop import AgentPlatform
+from app.schema.approval_schema import GATE_ASK_USER, Decision
 from app.schema.ui_schema import Notice, ReadyForInput, SessionStarted, TurnFailed, TurnFinished
 
 REPLY = "答复正文"
 
 
 class FakeUI:
-    """无终端的假前端：脚本化输入 + 自动决定 + 录事件（结构上满足 UI 协议）。"""
+    """无终端的假前端：脚本化输入 + 自动决定 + 录事件（结构上满足 UI 协议）。
 
-    def __init__(self, lines: list[str | None], approve: bool = True) -> None:
+    - `approve`：审批闸门的固定答案（一次构造一个值，够参数化两条分支）；
+    - `answers`：提问闸门的脚本化回答，按序弹出；没给 = 一律"未回答"（EOF 语义）。
+    两者按 `value["type"]` 分派，与终端前端同一套契约。
+    """
+
+    def __init__(
+        self,
+        lines: list[str | None],
+        approve: bool = True,
+        answers: list[Decision] | None = None,
+    ) -> None:
         self._lines = list(lines)
         self.approve = approve
+        self._answers = list(answers or [])
         self.events: list = []
         self.decisions: list[dict] = []  # decide 收到的待审 value
 
@@ -49,9 +61,11 @@ class FakeUI:
         # 于是纯空白行 = 空串 = "无输入"，基座会继续等同一提示
         return line.strip()
 
-    async def decide(self, value: dict) -> bool:
+    async def decide(self, value: dict) -> Decision:
         self.decisions.append(value)
-        return self.approve
+        if value.get("type") == GATE_ASK_USER:
+            return self._answers.pop(0) if self._answers else Decision(kind="answer")
+        return Decision(kind="approval", approved=self.approve)
 
 
 class FakeStep:
@@ -132,6 +146,37 @@ def test_loop_parks_and_resumes_on_approval(tmp_path, monkeypatch, approved):
     assert [d["tool_name"] for d in ui.decisions] == ["run_command"]
     assert step.resumes == [{"approved": approved}]  # 决定透传给图
     assert step.calls == 2  # 中断 + 终态
+    assert [type(e) for e in ui.events].count(TurnFinished) == 1
+
+
+def test_loop_parks_and_resumes_on_question(tmp_path, monkeypatch):
+    """提问闸门：value 带问题与选项交前端，回答的**两段**透传给图（不是 bool）。"""
+    ui = FakeUI(
+        ["帮我改一下那个函数", None],
+        answers=[
+            Decision(
+                kind="answer", option_index=1, option_text="改 c.py", supplement="别动 b.py"
+            )
+        ],
+    )
+    step = FakeStep(
+        [
+            {
+                "type": "ask_user",
+                "why": "工作区里有两个同名函数，猜错要重做",
+                "question": "改哪个？",
+                "options": ["a.py 里的", "c.py 里的"],
+            }
+        ]
+    )
+
+    asyncio.run(_platform(tmp_path, monkeypatch, ui, step).run())
+
+    value = ui.decisions[0]
+    assert value["type"] == "ask_user"
+    assert value["question"] == "改哪个？"
+    assert value["options"] == ["a.py 里的", "c.py 里的"]
+    assert step.resumes == [{"option_index": 1, "supplement": "别动 b.py"}]
     assert [type(e) for e in ui.events].count(TurnFinished) == 1
 
 

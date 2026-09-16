@@ -20,6 +20,7 @@ from app.agent.state import AgentState
 from app.agent.utils import coerce_tool_result, format_tool_result
 from app.agent.prompt import SYSTEM_PROMPT, workspace_context_block
 from app.schema.agent_schema import ImageRef, NoteEntry, PlanStep
+from app.schema.approval_schema import GATE_ASK_USER, GATE_TOOL_APPROVAL
 
 _TOOL_CONFIG_PATH = Path(__file__).with_name("tool.json")
 
@@ -514,23 +515,93 @@ def _command_policy() -> dict:
 _SHELL_METACHARS: tuple[str, ...] = (";", "&&", "||", "|", "&", "`", "$(", ">", "<", "^", "\n", "\r")
 
 
+# ---------------------- 提问闸门的参数契约 ----------------------
+# 选项上限：面板与人的注意力都有限，"5 个选项比 1 个问题更难答"。开放式提问（0 项）不限。
+_MAX_ASK_OPTIONS = 5
+
+
+def _ask_request(args: dict) -> tuple[dict | None, str | None]:
+    """校验并归一提问参数，返回 `(归一后的请求, 问题说明)`；无问题时前者为 None。
+
+    **为什么校验在闸门这里**：编排工具不走 langchain 的参数校验管线
+    （`OrchestrateNode._invoke` 直接调底层函数，见该处说明），"必填"与"上限"都得自己拦。
+    而拦的位置必须是**弹面板之前**——把一个空问题、或 8 个选项摆到人面前，比回一条可行动回执
+    让模型自己改要糟得多。
+    """
+    why = str(args.get("why") or "").strip()
+    question = str(args.get("question") or "").strip()
+    raw_options = args.get("options")
+    options = (
+        [str(item).strip() for item in raw_options if str(item).strip()]
+        if isinstance(raw_options, list)
+        else []
+    )
+
+    problems: list[str] = []
+    if not why:
+        problems.append("why（为什么问）为空")
+    if not question:
+        problems.append("question（问题本身）为空")
+    if len(options) > _MAX_ASK_OPTIONS:
+        problems.append(f"options 给了 {len(options)} 项，超过上限 {_MAX_ASK_OPTIONS} 项")
+    if problems:
+        return None, (
+            "提问未发出：" + "；".join(problems) + "。请补齐后重发"
+            f"（options 至多 {_MAX_ASK_OPTIONS} 项，也可以留空做开放式提问）。"
+        )
+    return {"why": why, "question": question, "options": options}, None
+
+
+def _normalize_ask_answer(decision, options: list[str]) -> dict:
+    """把闸门收到的回答归一成 `AskAnswer`（写进 state.ask_answers 的形状）。
+
+    - **序号按 options 校验**：越界 / 非整数一律当作"没选"。取向同 `_decide` 的 fail-closed——
+      宁可让模型看到"用户没选"，也不能把一段对不上号的文本当成选项原文喂过去；
+    - 补充去首尾空白，空串归一成 None——让"**两段皆空 = 未回答**"这条判据在 state 里直接可读，
+      消费端不必各自再判一次空白。
+    """
+    payload = decision if isinstance(decision, dict) else {}
+    raw_index = payload.get("option_index")
+    index = raw_index if isinstance(raw_index, int) and 0 <= raw_index < len(options) else None
+    supplement = str(payload.get("supplement") or "").strip() or None
+    return {"option_index": index, "supplement": supplement}
+
+
 #----------------------工具审核节点--------------------
 class ReviewNode:
-    """逐条审批 pending 工具调用，按 tool.json 分流进编排/普通执行队列。
+    """逐条过审 pending 工具调用：按 tool.json 定处置（放行 / 挂起问人 / 回执），再按 source 分流。
+
+    本节点是**人机闸门的唯一落点**，两种载荷都在这里挂起（docs/MULTI_AGENT.md §6）：
+    - `tool_approval`：审批（need_review 的调用）；
+    - `ask_user`：agent 提问（source=ask 的调用，见 ASK_SOURCE）。
+
+    ⚠️ **interrupt 只能待在"挂起之前没有副作用"的节点里**——这条是承重约束，不是风格偏好。
+    LangGraph 的 resume 会**把整个节点从头重跑**（interrupt() 依次返回记录的 resume 值），
+    实测钉死于 2026-09-16：一个含 `print` + `interrupt()` 的节点，resume 后 print 出现第二次。
+    注意重跑丢弃的是**未提交的 state 写**，而节点里发生的**真实外部副作用不会回滚**
+    （写文件、起进程都会真切两次）——所以 `ask_user` 的 interrupt **不能**放进
+    `OrchestrateNode`（同批次里可能有 write_memory）。本节点满足该约束：interrupt 之前只有
+    一行日志 print；工具的执行与副作用一律交给下游执行器。
 
     与 ToolNode/OrchestrateNode 共用同一份 tool.json（_tool_config 整进程缓存）。
     """
 
     # "state 工具"在 tool.json 的 source 取值集合：命中即分流进 approved_orchestrate_calls，
     # 交 OrchestrateNode（通用 state 工具执行器）处理。plan=编排；notes=笔记读回；
+    # ask=向用户提问（见下 ASK_SOURCE 的说明）；
     # dispatch=并发资料收集派发（app/agent/tools.py::dispatch_subtasks）；
     # memory=长期记忆读写（同文件 write_memory/read_memory，靠注入的 workspace 定位记忆文件）；
     # skill=技能加载/卸载（同文件 get_skill/drop_skill）。
     # 注意：技能**带来**的工具不走这里——它们的 source 取 `skills/<name>`，不命中本集合 → 进普通
     # 工具队列。这正是想要的：get_skill 是编排动作，它带来的工具不是。
     ORCHESTRATE_SOURCES: frozenset[str] = frozenset(
-        {"plan", "notes", "dispatch", "memory", "skill"}
+        {"plan", "notes", "ask", "dispatch", "memory", "skill"}
     )
+
+    # 人机闸门的第二种载荷（docs/MULTI_AGENT.md §6）：source=ask 的工具（当前只有 ask_user）
+    # **除了走编排执行器，还要在本节点再挂一次 interrupt 向人提问**。分流进编排队列照旧——
+    # 回答经 state 的 ask_answers 交给工具体渲染成回执，见下面 __call__ 的 ASK 分支。
+    ASK_SOURCE = "ask"
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -539,14 +610,16 @@ class ReviewNode:
         with _TOOL_CONFIG_PATH.open("r", encoding="utf-8") as file:
             return json.load(file)
 
-    def __init__(self, log: bool = True, toolset=None) -> None:
+    def __init__(self, log: bool = True, toolset=None, allow_ask: bool = True) -> None:
         """log=False 供 stdio MCP server 型 worker 使用（stdout 即 JSON-RPC 协议，不能 print）。
 
-        toolset：给了才做"存在性 + 漏登记"那道防线（主图给；worker 与单测不给 → 行为与改造前一致）。
+        toolset：给了才做"存在性 + 漏登记"那道防线（主图给；worker 与单测不给 → 行为与改造前一致）；
+        allow_ask=False 供 worker 用：**本图不承载提问载荷**（见 __call__ 的 ASK 分支）。
         """
         self.tool_review = self._tool_config()
         self.log = log
         self.toolset = toolset
+        self.allow_ask = allow_ask
 
     def _known_names(self, state: AgentState) -> set[str] | None:
         """当前可用的工具名（含编排工具）；无 toolset（worker / 单测）→ None = 不判存在性。"""
@@ -641,26 +714,42 @@ class ReviewNode:
             return "review"
         return "free"
 
-    def _unknown_result(self, state: AgentState, current_tool: dict) -> dict:
-        """未知工具：兑现悬空 tool_call + 回一条可行动回执（既不打扰人、也不放行去执行）。"""
-        tool_name = current_tool.get("name")
+    def _receipt_result(
+        self, state: AgentState, current_tool: dict, content: str, error_type: str
+    ) -> dict:
+        """"回执而不执行"的通用返回切片：兑现悬空 tool_call + 给模型一条可行动的错误说明。
+
+        未知工具与参数非法的提问共用它——两者都是"这条调用不会被送去执行，但模型必须知道
+        为什么"。**以原 tool_call_id 兑现**是必须的：否则历史里会留下一条永远没有回应的
+        assistant tool_calls 块。
+        """
         return {
             "pending_tool_calls": list(state.get("pending_tool_calls", []))[1:],
             "approved_orchestrate_calls": list(state.get("approved_orchestrate_calls", [])),
             "approved_tool_calls": list(state.get("approved_tool_calls", [])),
             "messages": [
                 ToolMessage(
-                    name=tool_name,
+                    name=current_tool.get("name"),
                     tool_call_id=current_tool.get("id"),
-                    content=(
-                        f"工具不存在或未注册: {tool_name}"
-                        f"（不在本会话当前可用的工具表里——可能所属技能刚刚被卸载、或它的运行体"
-                        f"已断开）。若仍需要它，请先用 get_skill 重新加载对应技能；不要原样重试。"
-                    ),
-                    additional_kwargs={"error_type": "unknown_tool"},
+                    content=content,
+                    additional_kwargs={"error_type": error_type},
                 )
             ],
         }
+
+    def _unknown_result(self, state: AgentState, current_tool: dict) -> dict:
+        """未知工具：兑现悬空 tool_call + 回一条可行动回执（既不打扰人、也不放行去执行）。"""
+        tool_name = current_tool.get("name")
+        return self._receipt_result(
+            state,
+            current_tool,
+            (
+                f"工具不存在或未注册: {tool_name}"
+                f"（不在本会话当前可用的工具表里——可能所属技能刚刚被卸载、或它的运行体"
+                f"已断开）。若仍需要它，请先用 get_skill 重新加载对应技能；不要原样重试。"
+            ),
+            "unknown_tool",
+        )
 
     async def __call__(self, state: AgentState) -> dict | AgentState:
         pending = list(state.get("pending_tool_calls", []))
@@ -681,9 +770,10 @@ class ReviewNode:
             # 模型编出来的名字（本会话根本没绑定过它）：回执而不弹面板，见 _decide 的说明
             return self._unknown_result(state, current_tool)
 
+        ask_answers: dict | None = None
         if action == "review":
             payload = {
-                "type": "tool_approval",
+                "type": GATE_TOOL_APPROVAL,
                 "current_step": "1/1",
                 "tool_name": tool_name,
                 "tool_args": current_tool.get("args", {}),
@@ -710,6 +800,42 @@ class ReviewNode:
                     )
                 )
 
+        elif tool_cfg.get("source") == self.ASK_SOURCE and not self.allow_ask:
+            # worker：提问载荷在这张图里不成立（worker 是只读资料收集器、不该问用户）。它**结构性**
+            # 拿不到 ask_user（source=ask 不在 worker_tools 的规则里），但模型仍可能编出这个名字——
+            # 而 worker 的 ReviewNode 没有 toolset，"未知工具"那道防线不生效。真按提问挂起的话，
+            # 主侧会收到一张语义错乱的面板、人还得白答一次。回执让它把"该问什么"写进结论交回去。
+            return self._receipt_result(
+                state,
+                current_tool,
+                f"{tool_name} 在本图不可用：你不能向用户提问——把「需要用户定夺什么」写进"
+                "结论交回主 agent，由它来问。不要原样重试。",
+                "ask_not_available",
+            )
+        elif tool_cfg.get("source") == self.ASK_SOURCE:
+            # 人机闸门的第二种载荷：把问题摆给人、等回答（docs/MULTI_AGENT.md §6）。
+            # 参数先在弹面板**之前**校验——空问题 / 超限选项摆到人面前是最糟的形态。
+            request, problem = _ask_request(current_tool.get("args") or {})
+            if problem is not None:
+                return self._receipt_result(state, current_tool, problem, "invalid_ask")
+            # 不带 current_step：那是审批面板的遗留样式（恒为 "1/1"），提问面板不需要。
+            decision = interrupt(
+                {
+                    "type": GATE_ASK_USER,
+                    "why": request["why"],
+                    "question": request["question"],
+                    "options": request["options"],
+                    "tool_call_id": current_tool.get("id"),
+                }
+            )
+            # 回答**不回 messages**（不像被拒那样在此地造 ToolMessage）：写进 state 的 ask_answers，
+            # 由 ask_user 工具（下游 OrchestrateNode 执行）按 tool_call_id 取回、渲染成回执。
+            # 闸门的产出是 state，执行器消费 state——与 approved_* 队列同一条路子。
+            ask_answers = dict(state.get("ask_answers") or {})
+            ask_answers[current_tool.get("id")] = _normalize_ask_answer(
+                decision, request["options"]
+            )
+
         # 按 tool.json 的 source 分流：编排类进 orchestrate 队列，其余进普通工具队列
         is_orchestrate = tool_cfg.get("source") in self.ORCHESTRATE_SOURCES
 
@@ -725,6 +851,8 @@ class ReviewNode:
             "approved_orchestrate_calls": approved_orchestrate,
             "approved_tool_calls": approved_calls,
         }
+        if ask_answers is not None:
+            result["ask_answers"] = ask_answers
         if denied_messages:
             result["messages"] = denied_messages
         return result
@@ -883,18 +1011,20 @@ class OrchestrateNode:
 
 #----------------------审核队列处理节点-------------------
 class QueueNode:
+    """轮次开始时的队列复位：把模型这一轮要调的工具搬进 pending，并清空上一轮的放行/回答。
+
+    三个 approved_* 队列与 ask_answers 都是**单轮内**的东西（审批状态本身则持久在队列里，
+    见 docs/ARCHITECTURE.md）：新的一轮开始时它们必须归零，否则上一轮没执行完的调用会漏进
+    这一轮，而上一轮的回答会一直躺在 checkpoint 里。
     """
-    
-    """
-    def __init__(self) -> None:
-        pass 
 
     async def __call__(self,state: AgentState) -> dict | AgentState:
         tool_calls = getattr(state["messages"][-1], "tool_calls", None) or []
         return {
             "pending_tool_calls": tool_calls,
             "approved_tool_calls": [],
-            "approved_orchestrate_calls": []
+            "approved_orchestrate_calls": [],
+            "ask_answers": {},
         }
 
 

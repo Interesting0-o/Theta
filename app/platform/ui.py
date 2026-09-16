@@ -6,12 +6,13 @@
 契约要点：
 - `read_line` 会被基座拿去与"审批到达"竞速（`turn.py::_race`），**输的一方会被 cancel**：
   前端必须做到"被取消不丢输入"——终端靠"独立 reader 线程 + 队列"满足（app/tui/input.py）；
-- `decide` 是**唯一**能让 park 的 run 继续的入口：基座交出渲染所需的 value，前端负责问人
-  （终端 = 面板 + y/n；web = 推审批帧等回包），返回是否批准。决定权威在人，不在基座、也不在模型；
+- `decide` 是**唯一**能让 park 的 run 继续的入口：基座交出渲染所需的 value，前端负责问人，
+  返回 `Decision`（决定权威在人，不在基座、也不在模型）；
 - `emit` 只渲染，不得改基座状态、不得阻塞（同步方法）。
 """
 from typing import Protocol
 
+from app.schema.approval_schema import Decision
 from app.schema.ui_schema import Event
 
 
@@ -28,6 +29,17 @@ class UI(Protocol):
         """
         ...
 
-    async def decide(self, value: dict) -> bool:
-        """就一条待审请求询问人类，返回是否批准（value 与 ReviewNode interrupt 同构）。"""
+    async def decide(self, value: dict) -> Decision:
+        """就一条待决的闸门请求询问人类，返回他给的决定（value 与 ReviewNode interrupt 同构）。
+
+        **闸门有两种**，按 `value["type"]` 分派（见 `app/schema/approval_schema.py`）：
+        - `tool_approval`：工具审批 → 返回 `Decision(kind="approval", approved=…)`
+          （终端 = 面板 + y/n；web = 推审批帧等回包）；
+        - `ask_user`：agent 提问 → 返回 `Decision(kind="answer", …)`，回答**两段**
+          （选中的选项 + 一句自由补充，两段都可留空）。
+
+        **EOF 语义按 kind 分派**（没人能回答了）：审批 → 不批准（fail-closed，与"拒绝"同义）；
+        提问 → 未回答（`Decision(kind="answer")`，两段皆空），由模型自己收尾。这是刻意的差别：
+        "没人批"必须挡下动作，"没人答"只意味着模型得带着假设继续。
+        """
         ...

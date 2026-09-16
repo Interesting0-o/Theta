@@ -36,6 +36,11 @@ COMMAND_TITLE = """
 | Command |
 +---------+
 """
+QUESTION_TITLE = """
++----------+
+| Question |
++----------+
+"""
 
 
 def truncate(text: str, limit: int = 200) -> str:
@@ -94,6 +99,35 @@ def format_tool_approval(interrupts) -> str:
         if tool_call_id:
             lines.append(f"  调用ID: {tool_call_id}")
 
+    return "\n".join(lines)
+
+
+def format_ask(value: dict) -> str:
+    """把一条 agent 提问（闸门 type=ask_user）格式化成提问面板文本。
+
+    与 `format_tool_approval` 同族：**纯函数、等宽纯文本**（同样不走 markdown 渲染——这里要
+    精确、不能重排）。行序是刻意的：先"为什么问"、再"问题"、最后"选项"——用户靠第一行决定
+    要不要认真答，靠选项比较差别。选项**带序号**，因为终端侧就是靠序号选。
+    """
+    lines: list[str] = []
+    why = str(value.get("why") or "").strip()
+    question = str(value.get("question") or "").strip()
+    options = [str(item) for item in (value.get("options") or [])]
+
+    if why:
+        lines.append(f"  为什么问: {truncate(why)}")
+    lines.append(f"  问题: {truncate(question) if question else '（问题为空）'}")
+    if options:
+        lines.append("  选项:")
+        lines.extend(
+            f"    {index}. {truncate(item)}" for index, item in enumerate(options, start=1)
+        )
+    else:
+        lines.append("  （本次没有给定选项，直接写下你的想法即可）")
+
+    tool_call_id = value.get("tool_call_id", "")
+    if tool_call_id:
+        lines.append(f"  调用ID: {tool_call_id}")
     return "\n".join(lines)
 
 

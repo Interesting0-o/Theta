@@ -288,6 +288,81 @@ note_tools: List[BaseTool] = [
     read_note,
 ]
 
+# ------------------------- 向用户提问（ask，source="ask"）-------------------------
+# 人机闸门的第二种载荷（docs/MULTI_AGENT.md §6）：模型在需求不明确时把选项摆给用户、等回答。
+#
+# **interrupt 不在本函数里**，而在 `ReviewNode` 的闸门分支（app/agent/nodes.py）。为什么：
+# LangGraph 的 resume 会**整节点重跑**（实测见该处注释），interrupt 之前的外部副作用会被真切
+# 第二次；`OrchestrateNode` 同批次里可能有 write_memory，所以它不能承载 interrupt。
+# 分工是：**ReviewNode 提问并把人的回答写进 state 的 `ask_answers`**，本工具随后被
+# OrchestrateNode 按常规执行、只负责把两段回答渲染成回执——闸门的产出是 state，执行器消费 state。
+@tool
+def ask_user(
+    why: str,
+    question: str,
+    state: Annotated[AgentState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    options: list[str] | None = None,
+) -> dict:
+    """在动手之前，把"你判断不了、只能由用户定"的问题摆给用户选，并等他的回答。
+
+    回答是**两段**：用户选中哪个选项（可留空），以及一句自由补充（可留空）。两段都收得到——
+    **"没选任何选项、自己写了一段方案"同样是有效回答**，别当成没回答。
+
+    什么时候该问（先自问一句：这个答案我是不是自己就能查到？）
+    - 目标 / 范围 / 取舍不明确，且**猜错代价高**（白干一轮，或改动难以回退）；
+    - 用户给的信息互相矛盾，走哪条路会显著改变后续做法；
+    - 该由用户拍板的偏好（命名、风格、要不要兼容旧行为）——这类你猜就是错的。
+
+    什么时候别问
+    - 答案能靠工具查出来（读文件、检索、跑命令）——**先自己查**，别拿提问代替调研；
+    - 用户其实已经说清楚了，你只是想确认一下——重复提问最消耗耐心；
+    - 同一个问题你已经问过（本轮或上轮）——用户没答就按最佳判断继续，并在收尾时说明你的假设。
+
+    怎么问
+    - `why` 必填：一句话说清**为什么问**（卡在哪、答了会改变什么）。用户靠它决定要不要认真答；
+    - `options`：2–5 项为宜（最多 5 项；留空 = 纯开放式提问）。每项写清**差别**而不是只给名字
+      （如"浅克隆：只取最新一次提交，快，但看不了历史"）。把**你推荐的那项排第一**并写明理由；
+      用户还可以在选项之外补充自己的方案，所以别把选项做成"封闭三选一"。
+
+    Args:
+        why: 为什么问——卡在什么地方、这个回答会改变什么。
+        question: 要用户回答的问题本身，一句话说清。
+        options: 备选方案清单（0–5 项），每项写清与其他项的差别，推荐项排第一。
+        state: （系统自动注入，无需传入）取回用户在闸门处给出的两段回答。
+        tool_call_id: （系统自动注入，无需传入）本次调用 id，用来对上回答。
+
+    Returns:
+        一条 `[user_answer]` 回执：用户选了什么、补充了什么；无人作答时如实说明。
+    """
+    answer = (state.get("ask_answers") or {}).get(tool_call_id) or {}
+    index = answer.get("option_index")
+    supplement = (answer.get("supplement") or "").strip()
+    # ⚠️ 选项归一（去首尾空白 / 丢空项）**必须与闸门的 `nodes.py::_ask_request` 同口径**，且与
+    # 面板编号（`app/tui/ui.py::_ask` 拿的是闸门归一后那份清单）一致：序号是这三处各自算出来的，
+    # 口径一旦分叉，用户选的号会在其中一边越界、被静默当成"没选"。
+    # 序号合法性本身由闸门在写回前把关（它拿的就是同一份清单），此处按"没选中任何给定选项"降级即可。
+    opts = [str(item).strip() for item in (options or []) if str(item).strip()]
+    picked = opts[index] if isinstance(index, int) and 0 <= index < len(opts) else None
+
+    if picked and supplement:
+        content = f"[user_answer] 用户选择了：{index + 1}. {picked}\n用户补充：{supplement}"
+    elif picked:
+        content = f"[user_answer] 用户选择了：{index + 1}. {picked}"
+    elif supplement:
+        content = f"[user_answer] 用户未选任何给定选项，直接补充说明：{supplement}"
+    else:
+        content = (
+            "[user_answer] 用户未作答（直接回车或输入已结束）。不要重复提问同一个问题；"
+            "按你的最佳判断继续，并在收尾时说明你据此做的假设。"
+        )
+    return _tool_receipt("ask_user", tool_call_id, content)
+
+
+ask_tool: List[BaseTool] = [
+    ask_user,
+]
+
 # ------------------------- 派发子任务（dispatch，source="dispatch"）-------------------------
 # 仿 create_plan、走 orchestrate 层（不普通 MCP 工具）。设计：不静态绑 worker，每次调用按
 # 子任务"现场 spawn"独立 worker（mcp_service/sub_agent.py）跑 run_subtask，N 个经
@@ -1043,7 +1118,8 @@ skill_tool: List[BaseTool] = [
 # 编排工具（不走 tool.json 审批、也不在 MCP 工具表里）的名字集合——技能工具**不许与它们重名**：
 # 同名会让模型的两份 schema 指向同一个名字，而 tool.json 放不下两条同键登记。
 _ORCHESTRATE_TOOL_NAMES: frozenset[str] = frozenset(
-    t.name for t in (orchestrate_tool + note_tools + dispatch_tool + memory_tool + skill_tool)
+    t.name
+    for t in (orchestrate_tool + note_tools + ask_tool + dispatch_tool + memory_tool + skill_tool)
 )
 
 

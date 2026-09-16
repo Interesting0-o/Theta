@@ -13,10 +13,11 @@ import asyncio
 
 import pytest
 
+from app.schema.approval_schema import GATE_ASK_USER, Decision
 from app.schema.ui_schema import TurnFinished
 from app.tui import panels
 from app.tui import ui as tui_ui
-from app.tui.panels import format_tool_approval, render_markdown, truncate
+from app.tui.panels import format_ask, format_tool_approval, render_markdown, truncate
 from app.tui.runner import resolve_tui_workspace
 from app.tui.ui import TerminalUI
 
@@ -35,7 +36,13 @@ def test_terminal_ui_eof_makes_reads_return_immediately():
 
         assert await ui.read_line() is None
         assert await ui.read_line() is None  # 第二次也不再阻塞
-        assert await ui.decide({"tool_name": "write_file"}) is False  # 无人确认 → 按未批准
+        # 审批：无人确认 → 不批准；提问：无人作答 → 未回答（两段皆空，语义不同见 UI 协议）
+        assert await ui.decide({"tool_name": "write_file"}) == Decision(
+            kind="approval", approved=False
+        )
+        asked = await ui.decide({"type": GATE_ASK_USER, "question": "?", "options": ["甲"]})
+        assert asked == Decision(kind="answer")
+        assert asked.unanswered is True
 
     asyncio.run(asyncio.wait_for(go(), timeout=2))
 
@@ -55,9 +62,9 @@ def test_decide_holds_back_lines_typed_before_the_panel(capsys):
         task = asyncio.create_task(ui.decide({"tool_name": "run_command"}))
         await asyncio.sleep(0)  # 让 decide 走完打印、挪走预输入，停在等答案处
         ui._out_q.put_nowait("y")  # 用户看到面板后敲的答案
-        approved = await asyncio.wait_for(task, timeout=2)
+        decision = await asyncio.wait_for(task, timeout=2)
 
-        assert approved is True  # 答案是 y，没被预输入顶掉
+        assert decision == Decision(kind="approval", approved=True)  # 没被预输入顶掉
         assert ui._held == ["帮我改一下 X"]  # 预输入既没丢、也没被当答案
         assert await ui.read_line() == "帮我改一下 X"  # 按原样进下一个 turn
         assert "已留给下一个回合" in capsys.readouterr().out
@@ -113,6 +120,113 @@ def test_format_tool_approval_extracts_fields():
     assert "步骤 3" in text
     assert "调用ID: call_1" in text
     assert "已截断" in text  # 超长参数内容被 truncate
+
+
+# ------------------------- 提问面板（闸门 type=ask_user） -------------------------
+
+ASK = {
+    "type": GATE_ASK_USER,
+    "why": "工作区里有两个同名函数，猜错要重做",
+    "question": "改哪个？",
+    "options": ["a.py 里的", "c.py 里的"],
+    "tool_call_id": "call_ask",
+}
+
+
+async def _ask(lines: list[str | None], value: dict = ASK):
+    """驱动一次提问面板：`lines` 是用户**看到面板之后**依次敲的行（None = EOF）。
+
+    必须等面板画完再喂——面板出现**之前**排队的行会被 `_hold_pretyped` 留给下一个 turn
+    （见 `TerminalUI.decide`），直接预排队列会被当成预输入而拿不到。
+    """
+    ui = TerminalUI()
+    ui._out_q = asyncio.Queue()  # 白盒注入：不真起 stdin reader 线程
+
+    async def typist():
+        for line in lines:
+            await asyncio.sleep(0.01)  # 让 decide 打印完这一段提示、停在读行处
+            ui._out_q.put_nowait(line)
+
+    typist_task = asyncio.create_task(typist())
+    decision = await asyncio.wait_for(ui.decide(value), timeout=2)
+    await typist_task
+    return ui, decision
+
+
+def test_format_ask_renders_why_question_and_numbered_options():
+    text = format_ask(ASK)
+    assert "为什么问: 工作区里有两个同名函数，猜错要重做" in text
+    assert "问题: 改哪个？" in text
+    assert "1. a.py 里的" in text and "2. c.py 里的" in text  # 带序号：终端侧靠序号选
+    assert "调用ID: call_ask" in text
+
+
+def test_format_ask_without_options_says_free_form():
+    text = format_ask({"type": GATE_ASK_USER, "question": "还有别的想法吗？", "options": []})
+    assert "没有给定选项" in text
+    assert "为什么问" not in text  # why 为空就不打这一行，不留空壳
+
+
+def test_ask_takes_option_and_supplement_both():
+    """两段都收：选了第 2 项 + 补一句——两段一起带回（补充不是"替代选项"，是叠加）。"""
+    _, decision = asyncio.run(_ask(["2", "别动 b.py"]))
+
+    assert decision == Decision(
+        kind="answer", option_index=1, option_text="c.py 里的", supplement="别动 b.py"
+    )
+    assert decision.unanswered is False
+
+
+def test_ask_free_text_on_first_line_skips_second_question(capsys):
+    """第一行不是序号而是文本 → 用户懒得先选、直接说方案：当作补充，**不再问第二行**。"""
+    _, decision = asyncio.run(_ask(["两个都改"]))
+
+    assert decision == Decision(kind="answer", supplement="两个都改")
+    assert "补充说明" not in capsys.readouterr().out  # 第二问没问
+
+
+def test_ask_option_only_is_a_valid_half_answer():
+    _, decision = asyncio.run(_ask(["1", ""]))
+
+    assert decision.option_index == 0 and decision.option_text == "a.py 里的"
+    assert decision.supplement is None
+    assert decision.unanswered is False  # 只选不补是完整回答，不是没答
+
+
+def test_ask_supplement_only_is_a_valid_answer():
+    """**没选任何给定选项、只写了一段方案，是有效回答**——模型最容易在这里读成"没回答"。"""
+    _, decision = asyncio.run(_ask(["", "我改 t.py 里那个"]))
+
+    assert decision.option_index is None and decision.supplement == "我改 t.py 里那个"
+    assert decision.unanswered is False
+
+
+def test_ask_all_blank_is_unanswered():
+    _, decision = asyncio.run(_ask(["", ""]))
+
+    assert decision == Decision(kind="answer")
+    assert decision.unanswered is True
+
+
+def test_ask_out_of_range_index_treated_as_not_chosen(capsys):
+    _, decision = asyncio.run(_ask(["9", "还是改 a"]))
+
+    assert decision.option_index is None and decision.supplement == "还是改 a"
+    assert "序号超出范围" in capsys.readouterr().out
+
+
+def test_ask_eof_on_first_line_is_unanswered():
+    _, decision = asyncio.run(_ask([None]))
+
+    assert decision.unanswered is True
+
+
+def test_ask_eof_on_second_line_keeps_the_option_already_chosen():
+    """第二问 EOF：**半份回答比没有好**——已经选中的那项照常带回去。"""
+    _, decision = asyncio.run(_ask(["2", None]))
+
+    assert decision.option_index == 1 and decision.option_text == "c.py 里的"
+    assert decision.supplement is None
 
 
 # ------------------------- markdown 渲染（模型答复） -------------------------

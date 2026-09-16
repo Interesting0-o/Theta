@@ -3,7 +3,8 @@
 位置：`app/platform/loop.py`（run_tui 的那条循环自 2026-09-10 基座/前端分家后归此）。
 形状自 2026-09-07 事件化重构起未变（docs/MULTI_AGENT.md §6 统一审批视图）：
 
-- pending 审批**即服务**：`drain_approvals` 逐条交前端问人（`ui.decide`）；
+- pending 的**闸门请求即服务**（工具审批与 agent 提问一视同仁）：`drain_approvals` 逐条交前端
+  问人（`ui.decide`，它按载荷的 `type` 决定问法）；
 - 有 turn 在跑（含 park 挂起）→ 等它结束或新审批到达（`_race` 两路唤醒，不忙轮询）；
 - 空闲 → `emit(ReadyForInput())`，等一行输入起下一条 turn（新 worker 审批可插队服务）。
 

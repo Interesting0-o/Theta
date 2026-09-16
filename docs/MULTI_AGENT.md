@@ -109,6 +109,24 @@ worker = **常驻异步事件循环**（resident runtime），一个进程持有
 
 ## 6. 统一审批闸门
 
+> **已泛化为"人机闸门"（2026-09-16 · agent 提问）**：闸门现在承载**两种载荷**，靠 payload 的
+> `type` 区分——`tool_approval`（审批，回答是 y/n）与 `ask_user`（agent 提问，回答是"选项 +
+> 补充"两段）。骨架完全共用：同一个 `ReviewNode` interrupt、同一个 `ApprovalInbox` broker、
+> 同一条 `Command(resume=…)` 回程；前端只多一种面板（`app/tui/panels.py::format_ask`），
+> 人给的决定统一是 `Decision`（`app/schema/approval_schema.py`）。本节其余内容仍是对**审批**
+> 那一支的讨论。
+>
+> 落点与三条纪律：
+> - **闸门位置是承重约束**：interrupt 必须待在"挂起之前没有副作用"的节点里，因为 resume 会把
+>   节点**整体重跑**，而重跑不回滚外部副作用（写文件会真切两次）。该行为已实测钉死，结论写在
+>   `ReviewNode` 的 docstring 里——`ask_user` 因此**不能**把 interrupt 放进自己的工具体。
+> - **提问的载荷只可能来自本地主 agent**：`source: "ask"` 不在 `worker_tools()` 的规则里，
+>   worker 结构性拿不到 `ask_user`；HTTP 面与 `ApprovalInbox.status` 保留审批的 bool 投影。
+> - **"没人回答"与"没人批准"语义不同**：前者是"未作答"（模型带假设继续），后者是 fail-closed
+>   不放行。两者都不设超时。详见 `app/platform/ui.py::UI.decide` 的 EOF 契约。
+>
+> 决策与实现细节见 `docs/TODO.md` 的「agent 提问模式」条。
+
 > **现状修正（2026-09-15 · 终端下放给 worker）**：本节及 §5/§9 里"worker 只授只读、不授写/命令，
 > 故无需回传"的那套论证**已部分作废**——终端的 `run_command` 与四个进程管理工具**已下放给 worker**
 > （`tool.json` 的 `worker_allow` 逐条授权；`start_process` 不给）。触发原因：git 专用工具删除后

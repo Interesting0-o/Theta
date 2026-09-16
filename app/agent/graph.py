@@ -21,6 +21,7 @@ from app.agent.tools import (
     SessionToolset,
     orchestrate_tool,
     note_tools,
+    ask_tool,
     dispatch_tool,
     memory_tool,
     skill_tools_for,
@@ -88,7 +89,9 @@ async def get_main_agent_graph(workspace_path: str | None = None, session_id: st
     # 技能目录在**构图期**烤进 get_skill 的 docstring（§3.2）——装技能是低频事件，
     # "扫一次、重开会话生效"够用（同 AGENT.md 的实例内 memo）。
     skill_tools = skill_tools_for()
-    static_tools = orchestrate_tool + note_tools + dispatch_tool + memory_tool + skill_tools
+    static_tools = (
+        orchestrate_tool + note_tools + ask_tool + dispatch_tool + memory_tool + skill_tools
+    )
 
     # 动态工具集（§13.4）：技能加载/卸载会改工具表，三个节点共用这一份接线——技能对账
     # （state 说加载了、运行体没有 → 重建）也在它里面。
@@ -194,7 +197,9 @@ def get_sub_agent_graph(read_tools=None, workspace_path: str | None = None, mode
         ),
     )
     graph.add_node("queue_node", QueueNode())
-    graph.add_node("review_node", ReviewNode(log=review_log))
+    # allow_ask=False：worker 不承载提问载荷（它没有 ask_user，也不该问用户）——拦的是模型
+    # 编出这个名字的情形，见 ReviewNode.__call__ 的 ASK 分支。
+    graph.add_node("review_node", ReviewNode(log=review_log, allow_ask=False))
     graph.add_node("tool_node", ToolNode(list(read_tools or [])))  # type: ignore[arg-type]
 
     def route_after_llm(state: AgentState):

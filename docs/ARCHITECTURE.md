@@ -27,7 +27,8 @@ LangGraph 擅长的：把"一条 agent run"描述成带状态机、可中断、�
 4. **"临时注入"的语义定死**：向一条 **park 在 interrupt** 的 run 注入决定/消息（支持）；向未 park 的 run 硬塞输入（不做——run 应常驻在事件边界等唤醒，而不是被硬插）。
 5. **跨 run / 跨进程复用同一协议**：worker→主的审批回传已是 HTTP（收件箱 + 长轮询）；将来主→worker / @mention 复用同一套"事件 + resume"语义，只是换个送达方。
 6. **最小基座，先收敛命名、后引框架**：先把现有事件壳命名成清晰的"事件类型 + dispatch"，不急着上通用消息总线；仓库还小，够用再泛化。
-7. **基座不与前端耦合**：基座只经 `app/platform/ui.py::UI` 协议（三个方法：`emit` 渲染事件 / `read_line` 取一行输入 / `decide` 就一条待审请求问人）与外界说话，事件形状在 `app/schema/ui_schema.py`。基座**不 print、不读 stdin**；前端（`app/tui` 终端 / 将来的 web）只实现协议、不碰调度。**这层缝是为第二个前端而设**：换前端不该重写 run 生命周期与 park/resume 调度。`[已落地 · 终端一个前端]`
+7. **基座不与前端耦合**：基座只经 `app/platform/ui.py::UI` 协议（三个方法：`emit` 渲染事件 / `read_line` 取一行输入 / `decide` 就一条待决的**闸门请求**问人）与外界说话，事件形状在 `app/schema/ui_schema.py`。基座**不 print、不读 stdin**；前端（`app/tui` 终端 / 将来的 web）只实现协议、不碰调度。**这层缝是为第二个前端而设**：换前端不该重写 run 生命周期与 park/resume 调度。`[已落地 · 终端一个前端]`
+   - **闸门有两种**（2026-09-16）：`decide` 收到 `value["type"]` 决定怎么问——`tool_approval`（工具审批，终端画面板收 y/n）或 `ask_user`（agent 提问，终端收"选项 + 补充"两段）。回答统一是 `Decision` 值对象（`app/schema/approval_schema.py`），**决定权威在人**；两类闸门的"没人回答"语义不同（审批 fail-closed 不放行 / 提问记未作答），见该协议的 EOF 契约。
    - 推论：**用户命令（`/init`…）是基座的控制面事件**（`app/platform/commands/` 包：机制与命令表在 `__init__.py`，载荷在 `prompts.py`，各命令在 `session.py` 等），在"起 turn 之前"介入 `loop`——前端只负责把输入交上来、把 `Notice`/事件渲染出去，不解析命令。
 
 ## 3. 分层（放在上面的东西）
@@ -36,6 +37,7 @@ LangGraph 擅长的：把"一条 agent run"描述成带状态机、可中断、�
 ┌─────────────────────────────────────────────────────────┐
 │  前端（终端 TUI = app/tui；将来的 web 同协议）              │
 │  · 只实现 UI 协议：emit 渲染 / read_line 取输入 / decide 问人 │
+│    （decide 分两类闸门：工具审批 y/n、agent 提问选选项+补充） │
 │  · 终端形态：stdin 线程 + 面板渲染 [已落地]；web 前端 [设计]  │
 ├─────────────────────────────────────────────────────────┤
 │  事件基座（主程序 = app/platform）                          │

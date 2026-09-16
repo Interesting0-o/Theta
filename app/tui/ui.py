@@ -1,4 +1,5 @@
-"""终端前端：实现基座的 `UI` 协议——stdin 取输入、标准输出渲染事件、审批面板收 y/n。
+"""终端前端：实现基座的 `UI` 协议——stdin 取输入、标准输出渲染事件、闸门面板收人的决定
+（审批 = y/n；提问 = 选项序号 + 一句补充）。
 
 位置：`app/tui/ui.py`（2026-09-10 基座/前端分家后新增）。本类是**协议的唯一实现**（将来
 web 前端是另一个实现），基座（`app/platform/loop.py`）只认协议、不认识本类。
@@ -11,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import queue
 
+from app.schema.approval_schema import GATE_ASK_USER, Decision
 from app.schema.ui_schema import (
     Notice,
     ReadyForInput,
@@ -22,7 +24,9 @@ from app.tui.input import _pump_stdin, _start_stdin_reader
 from app.tui.panels import (
     AGENT_TITLE,
     COMMAND_TITLE,
+    QUESTION_TITLE,
     USER_TITLE,
+    format_ask,
     format_tool_approval,
     render_markdown,
 )
@@ -44,7 +48,7 @@ class TerminalUI:
         self._eof = False
         # **面板出现之前**就已排队的行（= 用户在模型思考时预打的下一条消息）。它们属于下一个
         # turn，不属于这张面板：decide 会把它们挪到这里，read_line 优先从这里取。不这么做的话
-        # 预输入会被当成 y/n 答案——不匹配就成了"拒绝"，而且那行字永久消失（2026-09-15 审计）。
+        # 预输入会被当成闸门的答案——不匹配就成了"拒绝"，而且那行字永久消失（2026-09-15 审计）。
         self._held: list[str] = []
 
     async def start(self) -> None:
@@ -109,32 +113,94 @@ class TerminalUI:
             return self._held.pop(0)
         return await self._take_line()
 
-    async def decide(self, value: dict) -> bool:
-        """画 Command 框 + 审批面板，向用户收 y/n；返回是否批准（决定权威在人）。
+    async def decide(self, value: dict) -> Decision:
+        """按闸门种类问人：审批收 y/n，提问收"选项 + 补充"两段；返回他给的决定。
 
         面板出现**之前**就已排队的行（用户在模型思考时预打的下一条消息）先挪进 `_held`，留给
-        下一个 turn——否则它们会被当成 y/n 答案：不匹配就成了"拒绝"，而且那行字永久消失。
+        下一个 turn——否则它们会被当成答案：不匹配就成了"拒绝"，而且那行字永久消失。
         这段挪动与下面的打印之间**没有 await**，pump 不可能插进来把答案混进这批旧的。
 
-        EOF（stdin 关了 / 管道耗尽）时没人能回答 → 按**不批准**处理并说明，让 run 能收尾；
-        否则这里会永久阻塞（pump 已结束，队列不会再有内容）。
+        EOF（stdin 关了 / 管道耗尽）时没人能回答，按各类闸门的 fail-closed 语义收场
+        （见 `app/platform/ui.py::UI.decide` 的 EOF 契约）：否则这里会永久阻塞
+        （pump 已结束，队列不会再有内容）。
         """
+        ask = value.get("type") == GATE_ASK_USER
         stale = self._out_q.qsize() if self._out_q is not None else 0
-        print(COMMAND_TITLE)
-        print(format_tool_approval([value]))
+        print(QUESTION_TITLE if ask else COMMAND_TITLE)
+        print(format_ask(value) if ask else format_tool_approval([value]))
         print()
-        if stale:
-            for _ in range(stale):
-                item = self._out_q.get_nowait()
-                if item is None:
-                    self._eof = True  # EOF 哨兵：别把它当成一行输入塞给下一个 turn
-                    break
-                self._held.append(item)
-            if self._held:
-                print(f"（面板出现前你已输入 {len(self._held)} 行，已留给下一个回合）")
-        print("是否批准该操作？(y/n): ", end="", flush=True)
-        line = await self._take_line()
+        self._hold_pretyped(stale)
+        return await (self._ask(value) if ask else self._approve())
+
+    def _hold_pretyped(self, stale: int) -> None:
+        """把面板出现**之前**就已排队的行挪进 `_held`，留给下一个 turn（见 `decide` 的说明）。
+
+        调用点必须紧跟在"面板已经打印完"之后、任何 await 之前：这样 pump 没机会把用户对面板的
+        回答混进这批旧行里。
+        """
+        if not stale:
+            return
+        for _ in range(stale):
+            if self._out_q is None:
+                return
+            item = self._out_q.get_nowait()
+            if item is None:
+                self._eof = True  # EOF 哨兵：别把它当成一行输入塞给下一个 turn
+                break
+            self._held.append(item)
+        if self._held:
+            print(f"（面板出现前你已输入 {len(self._held)} 行，已留给下一个回合）")
+
+    async def _prompt_line(self, prompt: str) -> str | None:
+        """打一行提示并取一行输入；返回 None = EOF（输入流结束，不会再有人回答）。"""
+        print(prompt, end="", flush=True)
+        return await self._take_line()
+
+    async def _approve(self) -> Decision:
+        """收 y/n；EOF 按**不批准**处理（fail-closed：没人批 = 不执行）。"""
+        line = await self._prompt_line("是否批准该操作？(y/n): ")
         if line is None:
             print("（输入已结束，无人确认——按未批准处理）")
-            return False
-        return line.strip().lower() in ("y", "yes", "是")
+            return Decision(kind="approval", approved=False)
+        return Decision(kind="approval", approved=line.strip().lower() in ("y", "yes", "是"))
+
+    async def _ask(self, value: dict) -> Decision:
+        """收回答的**两段**：先选选项（可跳过），再补一句（可留空）。
+
+        - 第一行是序号 → 选中该项；
+        - 第一行**不是序号但是文本** → 用户懒得先选、直接说了方案：直接当作补充，**跳过第二问**；
+        - 第一行空回车 / 序号越界 → 按未选择处理，继续问补充；
+        - 补充可留空。**两段皆空 = 未回答**（与 EOF 同语义），由模型自己带假设继续。
+
+        这里的 `value["options"]` 是**闸门归一后**那份清单（`nodes.py::_ask_request` 已去掉空白项），
+        所以面板上显示的序号与闸门回写 `ask_answers` 时校验的序号是同一套——别在这边再过滤一遍，
+        否则两边会错位。
+        """
+        options = [str(item) for item in (value.get("options") or [])]
+        line = await self._prompt_line("选择序号（回车 = 不选）: ")
+        if line is None:
+            print("（输入已结束，无人作答——按未回答处理）")
+            return Decision(kind="answer")
+
+        index: int | None = None
+        text = line.strip()
+        if text.isdigit():
+            candidate = int(text)
+            if 1 <= candidate <= len(options):
+                index = candidate - 1
+            else:
+                print(f"（序号超出范围，按未选择处理；本次共 {len(options)} 项）")
+        elif text:
+            return Decision(kind="answer", supplement=text)
+
+        supplement_line = await self._prompt_line("补充说明（可留空）: ")
+        if supplement_line is None and index is None:
+            print("（输入已结束，无人作答——按未回答处理）")
+            return Decision(kind="answer")
+        # 第二问 EOF 但第一行已选了：**保留那半份回答**（半份比没有好）
+        return Decision(
+            kind="answer",
+            option_index=index,
+            option_text=options[index] if index is not None else None,
+            supplement=(supplement_line or "").strip() or None,
+        )

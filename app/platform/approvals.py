@@ -1,23 +1,28 @@
-"""待审请求的队列 + 送达（统一审批 broker）；**本模块不做审批判定**。
+"""待决闸门请求的队列 + 送达（统一 broker）；**本模块不做判定**。
 
 位置：`app/platform/approvals.py`（从 app/tui/approval_inbox.py 平移；2026-09-10 基座/前端
-分家后归基座——审批队列与送达是 run 生命周期的事，与终端显示无关）。
+分家后归基座——闸门队列与送达是 run 生命周期的事，与终端显示无关）。
 
 职责边界（对齐 docs/MULTI_AGENT.md §6）：判定"要不要放行某动作"单点在**图的审核节点**
 （ReviewNode + interrupt）——人答 y/n 只发生在图的审核节点，经 interrupt→Command(resume)
-语义。本模块只承接"待审请求的排队 + 决定的送达"，是纯队列/收件箱，不是审批权威。
+语义；"这段回答够不够格当作选项被选中"也判在那边（`_normalize_ask_answer`）。本模块只承接
+"待决请求的排队 + 决定的送达"，是纯队列/收件箱，不是判定权威。
 
 **统一 broker 语义（2026-09-07 起）**：本地主 agent 的 graph interrupt 与远端 worker 的
 HTTP 审批请求**同入这一个队列**——差异只在 payload 的 `worker_id` 标记（本地="main"、
 远端=真实 worker id），决定路径一致：
 - 本地 park：agent turn 驱动 `enqueue(payload)` 拿 id → `await wait(id)` 挂起
-  （**阻塞 run、不阻塞进程**）；审核方 `complete(id, approved)` → wait 唤醒 → 以
-  `Command(resume={approved})` 续跑；
+  （**阻塞 run、不阻塞进程**）；审核方 `complete(id, decision)` → wait 唤醒 → 以
+  `Command(resume=…)` 续跑；
 - 远端 worker：HTTP POST /requests 入队 → 审核方 complete → worker 长轮询
   GET /requests/{id}?block=1 取回决定。
 
-"谁来问人"由前端定：`drain_approvals` 把每条待审交 `UI.decide`（终端 = 面板 + y/n），
-本模块只负责排队、回填与唤醒。
+**队列不关心闸门的种类**：载荷的 `type`（审批 / 提问）只影响前端怎么问与人答什么，
+回填一律是 `Decision`（`app/schema/approval_schema.py`）。HTTP 面**只承载审批**——
+worker 只会审批，提问在它那侧结构性不可达（`app/agent/tools.py::worker_tools`）。
+
+"谁来问人、怎么问"由前端定：`drain_approvals` 把每条待决请求交 `UI.decide`，它按载荷的
+`type` 选面板（终端：审批 = y/n 面板，提问 = 选项 + 补充两段），本模块只负责排队、回填与唤醒。
 
 - `ApprovalInbox`：纯异步、无网络/UI 的请求队列。enqueue 登记待审 → 等待者 wait 阻塞到
   审核方 complete(id, approved) 回填决定才返回。complete 只做记录 + 唤醒，不产生决定。
@@ -50,10 +55,13 @@ from app.platform.ui import UI
 from app.schema.approval_schema import (
     DEFAULT_INBOX_HOST,
     DEFAULT_INBOX_PORT,
+    GATE_ASK_USER,
+    GATE_TOOL_APPROVAL,
     INBOX_BLOCK_SECONDS,
     ApprovalRecord,
     ApprovalRequest,
     ApprovalStatus,
+    Decision,
 )
 
 # 本地主 agent 中断入 broker 时用的 worker_id 标记（远端 worker 用真实 id）
@@ -110,26 +118,32 @@ class ApprovalInbox:
         ]
 
     def status(self, approval_id: str) -> ApprovalStatus | None:
-        """某条请求的状态；未知 id → None。"""
+        """某条请求的状态；未知 id → None。
+
+        `approved` 是**审批的 bool 投影**：HTTP 长轮询只有 worker 在用，而 worker 只会审批
+        （提问在 worker 侧结构性不可达，见 app/agent/tools.py::worker_tools）——所以这里不随
+        Decision 一起泛化，未决与提问都投影成 None。
+        """
         item = self._items.get(approval_id)
         if item is None:
             return None
+        decided = item.record["decided"]
         return {
-            "status": "decided" if item.record["decided"] is not None else "pending",
-            "approved": item.record["decided"],
+            "status": "decided" if decided is not None else "pending",
+            "approved": decided.approved if decided is not None else None,
         }
 
-    def complete(self, approval_id: str, approved: bool) -> bool:
+    def complete(self, approval_id: str, decision: Decision) -> bool:
         """审核方回填一条请求的决定并唤醒其等待者。幂等：未知/已回填返回 False。
 
-        只做记录 + 唤醒，不做判定——approved 由调用方（图的审核节点/人审入口）给出。
+        只做记录 + 唤醒，不做判定——决定由调用方（人审入口 / worker 的 HTTP 回包）给出。
         """
         item = self._items.get(approval_id)
         if item is None or item.record["decided"] is not None:
             return False
-        item.record["decided"] = bool(approved)
+        item.record["decided"] = decision
         if not item.decision.done():
-            item.decision.set_result(bool(approved))
+            item.decision.set_result(decision)
         # 已回填的记录**保留一段历史**再回收：worker 拿到决定后可能再查一次状态（状态查询
         # 也有非阻塞形态），所以不能一回填就删。但若永不回收，长会话里 _items 会无界增长、
         # 而 pending() 每次都要全表扫描（2026-09-15 审计发现）。按回填顺序保留最近
@@ -139,31 +153,32 @@ class ApprovalInbox:
             self._items.pop(self._decided_order.popleft(), None)
         return True
 
-    async def wait(self, approval_id: str, timeout: float | None = None) -> bool:
-        """阻塞到该请求被 complete；返回是否批准。超时抛 asyncio.TimeoutError。"""
+    async def wait(self, approval_id: str, timeout: float | None = None) -> Decision:
+        """阻塞到该请求被 complete；返回人的决定。超时抛 asyncio.TimeoutError。"""
         item = self._items.get(approval_id)
         if item is None:
             raise KeyError(approval_id)
         if item.record["decided"] is not None:
-            return bool(item.record["decided"])
+            return item.record["decided"]
         if timeout is not None:
             return await asyncio.wait_for(asyncio.shield(item.decision), timeout)
         return await item.decision
 
     def deny_pending(self) -> int:
-        """把**仍未回填**的请求一律按拒绝回填，返回处理条数（收尾用）。
+        """把**仍未回填**的请求一律按"没人回答"回填，返回处理条数（收尾用）。
 
         进程要退出了，这些面板不会再有人回答。不这么做的话，远端 worker 会一直等到自己的
-        超时才失败，还会把"没人应答"记成网络错误——立刻回一个拒绝更准确，也让 worker 当场
-        收尾。语义上也是 fail-closed：**没人回答 = 不放行**。
+        超时才失败，还会把"没人应答"记成网络错误——立刻回一个决定更准确，也让 worker 当场
+        收尾。两种闸门各有自己的 fail-closed 语义（见 `app/platform/ui.py::UI.decide`）：
+        **审批 = 不放行**，**提问 = 未回答**（模型据此带假设继续，而不是被当成"用户否决"）。
         """
         undecided = [
-            item.record["approval_id"]
-            for item in self._items.values()
-            if item.record["decided"] is None
+            item for item in self._items.values() if item.record["decided"] is None
         ]
-        for approval_id in undecided:
-            self.complete(approval_id, False)
+        for item in undecided:
+            asked = (item.record["payload"] or {}).get("type") == GATE_ASK_USER
+            decision = Decision(kind="answer") if asked else Decision(kind="approval", approved=False)
+            self.complete(item.record["approval_id"], decision)
         return len(undecided)
 
     def clear_new(self) -> None:
@@ -215,10 +230,12 @@ def build_app(queue: ApprovalInbox) -> Starlette:
         if not block:
             return JSONResponse(queue.status(approval_id))
         try:
-            approved = await queue.wait(approval_id, timeout=INBOX_BLOCK_SECONDS)
-            return JSONResponse({"status": "decided", "approved": approved})
+            # 唤醒后**回查 status** 而不是直接用 wait 的返回值：wire 上要的是审批的 bool 投影，
+            # 而 wait 给的是 Decision——投影口径只在 status() 里写一份（见其 docstring）。
+            await queue.wait(approval_id, timeout=INBOX_BLOCK_SECONDS)
         except asyncio.TimeoutError:
             return JSONResponse({"status": "pending"})
+        return JSONResponse(queue.status(approval_id))
 
     async def post_decision(request: Request):
         approval_id = request.path_params["approval_id"]
@@ -231,7 +248,9 @@ def build_app(queue: ApprovalInbox) -> Starlette:
             return _bad_request("approved 必须是 bool")
         if queue.status(approval_id) is None:
             return JSONResponse({"error": "请求不存在"}, status_code=404)
-        queue.complete(approval_id, approved)
+        # HTTP 面**只承载审批**（worker 只会审批，提问在它那侧结构性不可达）——所以这里把
+        # wire 上的 bool 包成 Decision，broker 内部则只认 Decision 一种表示。
+        queue.complete(approval_id, Decision(kind="approval", approved=approved))
         return JSONResponse(queue.status(approval_id))
 
     return Starlette(
@@ -361,27 +380,34 @@ class ApprovalInboxServer:
 
 
 def _record_to_value(record: ApprovalRecord) -> dict:
-    """把 broker 里一条待审记录归一成 interrupt 同构的 value，交前端渲染。
+    """把 broker 里一条待决记录归一成 interrupt 同构的 value，交前端渲染与问人。
 
-    value 与 ReviewNode interrupt payload 对齐：{tool_name, current_step, tool_args,
-    description?, tool_call_id?}。
-    - 步骤：本地主 agent 中断带 driver 塞的 ReviewNode current_step（如 "1/1"，保持旧面板
-      样式）；远端 worker 无该字段时回退为来源标记（主 agent / worker:<id>）。
-    - tool_call_id：仅本地中断携带（纯展示）。
-    description 在 payload 层（ApprovalRequest 语义），前端主要展示 tool_args.description。
+    value 与 ReviewNode interrupt payload 对齐，**`type` 决定前端怎么问**（审批面板 / 提问面板）：
+    - 审批：{type, tool_name, current_step?, tool_args, description?, tool_call_id?}；
+    - 提问：{type, why, question, options, tool_call_id?}。
+
+    description 在 payload 层（ApprovalRequest 语义），前端主要展示 tool_args.description；
+    tool_call_id 仅本地中断携带，纯展示（审批面板的"调用ID"与提问的追溯都用它）。
     """
     payload = record.get("payload") or {}
     worker_id = payload.get("worker_id", "")
-    step = payload.get("current_step") or (
-        "主 agent" if worker_id == LOCAL_WORKER_ID else f"worker:{worker_id}"
-    )
-    value: dict = {
-        "tool_name": payload.get("tool_name", "?"),
-        "tool_args": payload.get("tool_args") or {},
-        "description": payload.get("description"),
-    }
-    if step:
-        value["current_step"] = step
+    kind = payload.get("type") or GATE_TOOL_APPROVAL
+    value: dict = {"type": kind}
+    if kind == GATE_ASK_USER:
+        value["why"] = payload.get("why") or ""
+        value["question"] = payload.get("question") or ""
+        value["options"] = list(payload.get("options") or [])
+    else:
+        value["tool_name"] = payload.get("tool_name", "?")
+        value["tool_args"] = payload.get("tool_args") or {}
+        value["description"] = payload.get("description")
+        # 步骤：本地主 agent 中断带 driver 塞的 current_step（保持旧面板 "步骤 1/1" 样式）；
+        # 远端 worker 无该字段时回退为来源标记（提问面板不用这一行，故只在审批分支里给）
+        step = payload.get("current_step") or (
+            "主 agent" if worker_id == LOCAL_WORKER_ID else f"worker:{worker_id}"
+        )
+        if step:
+            value["current_step"] = step
     if payload.get("tool_call_id"):
         value["tool_call_id"] = payload["tool_call_id"]
     # worker 的子任务原文透传给前端——人靠它判断"这个 worker 想跑的命令是否有来由"
@@ -391,12 +417,12 @@ def _record_to_value(record: ApprovalRecord) -> dict:
 
 
 async def drain_approvals(inbox: ApprovalInbox, ui: UI) -> None:
-    """排空 broker 里全部 pending（本地主 agent interrupt + worker HTTP 请求）。
+    """排空 broker 里全部 pending（本地主 agent 的两种 interrupt + worker 的 HTTP 请求）。
 
     逐条交前端问人（`ui.decide`）→ `inbox.complete` 回填（唤醒 park 的本地 run / 长轮询的
     worker）。判定权威在人；一条面板只服务一个请求，判定互不阻塞进程。
     """
     for entry in inbox.pending():
-        approved = await ui.decide(_record_to_value(entry))
-        inbox.complete(entry["approval_id"], approved)
+        decision = await ui.decide(_record_to_value(entry))
+        inbox.complete(entry["approval_id"], decision)
     inbox.clear_new()

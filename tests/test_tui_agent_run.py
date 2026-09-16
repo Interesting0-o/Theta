@@ -5,7 +5,7 @@ step——先返回若干 __interrupt__（模拟 ReviewNode 中断），由假 d
 ApprovalInbox complete 回填，再返回终态。断言：
 - interrupt 被入 broker、payload 带 worker_id="main" 标记；
 - park 期间 run 挂起（wait 阻塞到 complete）；
-- resume 以 Command(resume={"approved": bool}) 续跑，approved 透传决定；
+- resume 值按闸门种类造：审批 → Command(resume={"approved": bool})，提问 → 两段回答；
 - 多个中断依次处理；无中断直通终态。
 
 不 import app.agent → 无需 .env / WORKSPACE_PATH。
@@ -16,8 +16,13 @@ from langgraph.types import Command
 
 from app.platform.approvals import ApprovalInbox
 from app.platform.turn import _race, drive_turn
+from app.schema.approval_schema import Decision
 
 FINAL = {"messages": ["done"]}
+
+# 假 decider 的两个常用决定（审批）
+ALLOW = Decision(kind="approval", approved=True)
+DENY = Decision(kind="approval", approved=False)
 
 
 class FakeStep:
@@ -40,13 +45,13 @@ class FakeStep:
         return self.final
 
 
-async def _approve_next(queue: ApprovalInbox, approved: bool) -> str:
-    """假 decider：等下一条 pending 入队后 complete，返回其 approval_id。"""
+async def _decide_next(queue: ApprovalInbox, decision: Decision) -> str:
+    """假 decider：等下一条 pending 入队后 complete 回填该决定，返回其 approval_id。"""
     for _ in range(1000):
         pending = queue.pending()
         if pending:
             aid = pending[0]["approval_id"]
-            assert queue.complete(aid, approved) is True
+            assert queue.complete(aid, decision) is True
             return aid
         await asyncio.sleep(0)
     raise AssertionError("收件箱一直没收到请求")
@@ -68,7 +73,7 @@ def test_drive_turn_single_interrupt_approved():
         step = FakeStep([{"tool_name": "run_command", "tool_args": {"command": "rm -rf dist"}}])
 
         async def decider():
-            aid = await _approve_next(queue, True)
+            aid = await _decide_next(queue, ALLOW)
             rec = queue.status(aid)
             assert rec == {"status": "decided", "approved": True}
 
@@ -89,7 +94,7 @@ def test_drive_turn_single_interrupt_denied():
         step = FakeStep([{"tool_name": "write_file", "tool_args": {"path": "x.md"}}])
 
         async def decider():
-            await _approve_next(queue, False)
+            await _decide_next(queue, DENY)
 
         dec = asyncio.create_task(decider())
         result = await drive_turn(step, {"messages": []}, queue)
@@ -112,8 +117,8 @@ def test_drive_turn_multiple_interrupts_sequential():
         )
 
         async def decider():
-            await _approve_next(queue, True)
-            await _approve_next(queue, False)
+            await _decide_next(queue, ALLOW)
+            await _decide_next(queue, DENY)
 
         dec = asyncio.create_task(decider())
         result = await drive_turn(step, {"messages": []}, queue)
@@ -123,6 +128,65 @@ def test_drive_turn_multiple_interrupts_sequential():
         # 两次中断各自一次 resume，approved 分别透传
         assert step.resumes == [{"approved": True}, {"approved": False}]
         assert step.calls == 3  # 中断、中断、终态
+
+    asyncio.run(go())
+
+
+def test_drive_turn_ask_resumes_with_two_segments():
+    """提问闸门：resume 值运的是**两段回答**（选中的选项 + 补充），不是 bool。"""
+
+    async def go():
+        queue = ApprovalInbox()
+        step = FakeStep(
+            [
+                {
+                    "type": "ask_user",
+                    "why": "两条路差别很大，猜错要重做",
+                    "question": "用哪个测试框架？",
+                    "options": ["pytest（项目已有基建）", "unittest（stdlib）"],
+                    "tool_call_id": "call_ask",
+                }
+            ]
+        )
+        answer = Decision(
+            kind="answer",
+            option_index=0,
+            option_text="pytest（项目已有基建）",
+            supplement="记得带上覆盖率",
+        )
+
+        async def decider():
+            await _decide_next(queue, answer)
+
+        dec = asyncio.create_task(decider())
+        result = await drive_turn(step, {"messages": []}, queue)
+        await dec
+
+        assert result == FINAL
+        # 进图的只有两段回答：kind / option_text 是前端与闸门内部用的，图那侧要的是原始两段
+        assert step.resumes == [{"option_index": 0, "supplement": "记得带上覆盖率"}]
+
+    asyncio.run(go())
+
+
+def test_drive_turn_ask_unanswered_resumes_empty():
+    """未回答（EOF / 直接回车）：两段都是 None 照常 resume——不能让 run 卡在等人上。"""
+
+    async def go():
+        queue = ApprovalInbox()
+        step = FakeStep(
+            [{"type": "ask_user", "why": "问一句", "question": "?", "options": []}]
+        )
+
+        async def decider():
+            await _decide_next(queue, Decision(kind="answer"))
+
+        dec = asyncio.create_task(decider())
+        result = await drive_turn(step, {"messages": []}, queue)
+        await dec
+
+        assert result == FINAL
+        assert step.resumes == [{"option_index": None, "supplement": None}]
 
     asyncio.run(go())
 
@@ -143,7 +207,7 @@ def test_interrupt_payload_marks_main_worker():
                     assert payload["worker_id"] == "main"
                     assert payload["tool_name"] == "run_command"
                     assert payload["tool_args"] == {"command": "ls"}
-                    queue.complete(pending[0]["approval_id"], True)
+                    queue.complete(pending[0]["approval_id"], ALLOW)
                     return
                 await asyncio.sleep(0)
             raise AssertionError("收件箱一直没收到请求")

@@ -1,6 +1,6 @@
 from typing import TypedDict,Annotated,List,Any,Dict
 from langgraph.graph.message import add_messages,BaseMessage
-from app.schema.agent_schema import ImageRef,PlanStep,NoteEntry
+from app.schema.agent_schema import AskAnswer,ImageRef,PlanStep,NoteEntry
 
 class AgentState(TypedDict):
     #--------------会话的唯一标识------------
@@ -17,6 +17,13 @@ class AgentState(TypedDict):
     #--------------编排模式-----------------
     # 已批准待执行的编排类调用（source 命中 ReviewNode.ORCHESTRATE_SOURCES），由 orchestrate_node 消费
     approved_orchestrate_calls: List[dict[str, Any]]
+
+    #--------------人机闸门（agent 提问）-----------------
+    # 提问的回答：{tool_call_id: AskAnswer}。**闸门的产出是 state，执行器消费 state**——
+    # ReviewNode 拿到人的回答后写这里，ask_user 工具经 OrchestrateNode 执行时按 tool_call_id 取回
+    # 并渲染成回执（同 approved_* 队列的路子）。无 reducer → 写入方读改写合并；
+    # 每轮由 QueueNode 清空（回答是单轮内的东西，只有同回合的工具执行要读它）。
+    ask_answers: Dict[str, AskAnswer]
     # 当前计划：每步 {id: str, task: str, status: PlanStatus}
     # 由编排节点写回；模型通过编排工具（create_plan/update_plan_step/clear_plan）驱动
     current_plan: List[PlanStep]

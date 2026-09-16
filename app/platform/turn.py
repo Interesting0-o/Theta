@@ -5,7 +5,11 @@
 
 interrupt 的契约（docs/MULTI_AGENT.md §6 统一审批视图）：**阻塞图、不阻塞进程**。run 停在
 checkpoint、事件循环自由——本模块把一条 run 的中断送进统一 broker（approvals.py）park 住，
-等审核方 `complete` 唤醒后以 `Command(resume={"approved": …})` 续跑；审批面板由前端另画。
+等审核方 `complete` 唤醒后以 `Command(resume=…)` 续跑；闸门面板由前端另画。
+
+**闸门有两种载荷**（审批 / 提问，见 app/schema/approval_schema.py），本模块是它们在图与 broker
+之间的**唯一翻译点**：进去时 `_interrupt_value_to_request` 把 interrupt value 归成请求载荷，
+出来时 `decision_to_resume` 把人的决定翻成该载荷对应的 resume 值。
 """
 import asyncio
 
@@ -13,25 +17,58 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
 from app.platform.approvals import LOCAL_WORKER_ID
-from app.schema.approval_schema import ApprovalRequest
+from app.schema.approval_schema import (
+    GATE_ASK_USER,
+    GATE_TOOL_APPROVAL,
+    ApprovalRequest,
+    Decision,
+)
 
 
 def _interrupt_value_to_request(value: dict) -> ApprovalRequest:
-    """一条 graph interrupt value（ReviewNode payload 同构）→ 本地审批请求。
+    """一条 graph interrupt value（ReviewNode payload 同构）→ 基座的闸门请求。
 
-    worker_id="main" 标记本地来源（与远端 worker 区分，只用于渲染 provenance；
-    决定路径与远端完全一致——都走 broker 的 enqueue/wait 与 complete）。
+    **两种闸门载荷都从这里过**（见 app/schema/approval_schema.py）——`type` 决定前端怎么渲染，
+    也决定回来时 resume 值怎么造。worker_id="main" 标记本地来源（与远端 worker 区分，只用于
+    渲染 provenance；决定路径与远端完全一致——都走 broker 的 enqueue/wait 与 complete）。
     current_step / tool_call_id 是**纯展示字段**（复用 ReviewNode 的"步骤 1/1"与调用 ID，
-    让审批面板保持旧样式），不参与决定逻辑；远端 worker 不带。
+    让审批面板保持旧样式），不参与决定逻辑；远端 worker 不带。current_step 只有审批用得上
+    （提问面板不显示它），故只在审批那一支兜底"1/1"。
     """
-    return {
+    kind = value.get("type") or GATE_TOOL_APPROVAL
+    payload: ApprovalRequest = {
         "worker_id": LOCAL_WORKER_ID,
-        "tool_name": value.get("tool_name", "?"),
-        "tool_args": value.get("tool_args") or {},
-        "description": value.get("description"),
-        "current_step": value.get("current_step") or "1/1",
+        "type": kind,
         "tool_call_id": value.get("tool_call_id"),
     }
+    if kind == GATE_ASK_USER:
+        payload["why"] = value.get("why") or ""
+        payload["question"] = value.get("question") or ""
+        payload["options"] = list(value.get("options") or [])
+    else:
+        # current_step 只在审批这边兜底"1/1"：它是审批面板的遗留样式，提问面板不用它
+        payload["current_step"] = value.get("current_step") or "1/1"
+        payload["tool_name"] = value.get("tool_name", "?")
+        payload["tool_args"] = value.get("tool_args") or {}
+        payload["description"] = value.get("description")
+    return payload
+
+
+def decision_to_resume(decision: Decision) -> dict:
+    """`Decision` → 图的 resume 值。**这条形状是图侧的契约，消费者是 `ReviewNode`。**
+
+    两种载荷各一条分支；审批那条**刻意与历史逐字一致**（`{"approved": bool}`），
+    图侧既有的审批语义、mock 与测试都因此不必改动：
+
+    - `approval` → `{"approved": bool}`；
+    - `answer`   → `{"option_index": int | None, "supplement": str | None}`（两段都可空，
+      两段皆空即"未回答"）。
+
+    同一份映射也被 `evaluation/runner.py` 用——评估绕过 UI 协议，但走的是同一条图契约。
+    """
+    if decision.kind == "answer":
+        return {"option_index": decision.option_index, "supplement": decision.supplement}
+    return {"approved": bool(decision.approved)}
 
 
 async def drive_turn(step, initial, queue):
@@ -62,13 +99,14 @@ async def drive_turn(step, initial, queue):
             ]
             payload = {
                 "worker_id": LOCAL_WORKER_ID,
+                "type": GATE_TOOL_APPROVAL,
                 "tool_name": "多工具审批",
                 "tool_args": {},
                 "description": "一次请求审批多项工具：" + "、".join(names),
             }
         approval_id = queue.enqueue(payload)
-        approved = await queue.wait(approval_id)  # park：阻塞 run、不阻塞进程
-        inputs = Command(resume={"approved": approved})
+        decision = await queue.wait(approval_id)  # park：阻塞 run、不阻塞进程
+        inputs = Command(resume=decision_to_resume(decision))
 
 
 async def _race(*factories):
