@@ -196,6 +196,11 @@ resource/
   - **进度（2026-09-10）**：memory.md 格式 + `write_memory`/`read_memory` 工具 + tool.json/source + **LLMNode 每轮注入（§4）** + 单测 `[已落地]`（§3/§4/§5）——记忆闭环已通（写入 → 落盘 → 下轮注入），worker 侧不注入、工具也被 `worker_tools` 挡住。**同日续做**：AGENT.md 读取侧（`LLMNode.agent_md_block` + 注入）与 `/init` 命令（`app/platform/commands/`，投预设提示词）`[已落地]`（§4/§7）——画像闭环亦通（`/init` 生成 → 下个会话注入）。**尚未做**：SYSTEM_PROMPT 的"长期记忆/项目画像"纪律小节（§6）。会话三条命令（`/list session`/`/new session`/`/session`）与 `/help` 亦已落地（§7）。
 - **Phase C · 明确不做（后续再议）**：记忆压缩/分层摘要、记忆全文检索、跨工作区共享记忆、多会话选择 UI、reviewed.json 交互接线、把记忆 promote 进 repo（与 CONTEXT_ENGINEERING 的 promote 复用/分合另议）。
 
+> **2026-09-16：「跨工作区共享记忆」已被提起**——起因是 agent 至今不知道"这台机器上有什么"，
+> 判断"能不能跑某条命令"只能现场探，而每次探测都是一条过闸门的 `run_command`。待办与待拍清单见
+> [`docs/TODO.md`](TODO.md) 的「长期记忆分层化」条；**动这一层之前先读那条**，它把与本文件这几条
+> 既有纪律（§3 单文件格式 / `m1,m2,…` 编号 / §4 一份 cap / §5 路径不由模型指定）的冲突点列全了。
+
 ---
 
 ## 9. 开放问题 / 待定
