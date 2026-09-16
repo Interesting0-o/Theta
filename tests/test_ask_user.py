@@ -10,9 +10,7 @@
 import asyncio
 
 import pytest
-from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
@@ -20,6 +18,7 @@ import app.agent.nodes as nodes_module
 from app.agent.nodes import _MAX_ASK_OPTIONS, ReviewNode, _ask_request, _normalize_ask_answer
 from app.agent.tools import ask_user, worker_tools
 from app.schema.approval_schema import GATE_ASK_USER
+from evaluation.models import ReplayChatModel
 
 # ------------------------- 夹具 -------------------------
 
@@ -301,23 +300,6 @@ def test_worker_cannot_ask():
 # ------------------------- 端到端：挂起 → 回答 → 回模型 -------------------------
 
 
-class ScriptedChatModel(BaseChatModel):
-    """按序吐 AIMessage 的假模型（同 tests/test_command_review_e2e.py）。"""
-
-    replies: list
-
-    @property
-    def _llm_type(self) -> str:
-        return "scripted"
-
-    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
-        reply = self.replies[0] if len(self.replies) == 1 else self.replies.pop(0)
-        return ChatResult(generations=[ChatGeneration(message=reply)])
-
-    def bind_tools(self, tools, **kwargs):  # noqa: ARG002 —— 只认工具名，不必真绑定
-        return self
-
-
 def _ask_ai_message() -> AIMessage:
     return AIMessage(
         content="",
@@ -335,7 +317,7 @@ def _ask_ai_message() -> AIMessage:
     )
 
 
-async def _drive(workspace, session: str, resume: dict) -> tuple[dict, dict]:
+async def _drive(workspace, session: str, model, resume: dict) -> tuple[dict, dict]:
     """建真图（真 MCP 运行体）→ 脚本模型跑到挂起 → resume → 返回 (payload, 终态)。"""
     from app.agent.graph import get_main_agent_graph
     from app.agent.mcp import _reset_pools_for_tests, close_session_pool
@@ -343,7 +325,9 @@ async def _drive(workspace, session: str, resume: dict) -> tuple[dict, dict]:
 
     _reset_pools_for_tests()
     try:
-        graph = await get_main_agent_graph(workspace_path=str(workspace), session_id=session)
+        graph = await get_main_agent_graph(
+            workspace_path=str(workspace), session_id=session, model=model
+        )
         compiled = graph.compile(checkpointer=InMemorySaver())
         config = {"configurable": {"thread_id": session}}
         parked = await compiled.ainvoke(build_turn_state(session, "帮我改一下那个函数"), config)
@@ -354,16 +338,15 @@ async def _drive(workspace, session: str, resume: dict) -> tuple[dict, dict]:
         await close_session_pool(str(workspace), session)
 
 
-def _run_e2e(monkeypatch, tmp_path, session: str, resume: dict):
-    script = ScriptedChatModel(replies=[_ask_ai_message(), AIMessage(content="好，按你说的做")])
-    monkeypatch.setattr("app.agent.graph.get_main_chat_model", lambda: script)
-    return asyncio.run(_drive(tmp_path, session, resume))
+def _run_e2e(tmp_path, session: str, resume: dict):
+    """模型经 `get_main_agent_graph(model=…)` 注入——回放走的是同一条缝。"""
+    script = ReplayChatModel(replies=[_ask_ai_message(), AIMessage(content="好，按你说的做")])
+    return asyncio.run(_drive(tmp_path, session, script, resume))
 
 
-def test_e2e_ask_parks_then_answer_reaches_the_model(monkeypatch, tmp_path):
+def test_e2e_ask_parks_then_answer_reaches_the_model(tmp_path):
     """闭环：图真挂起（不再执行任何工具）→ 两段回答经工具体成 ToolMessage → 模型继续。"""
     payload, final = _run_e2e(
-        monkeypatch,
         tmp_path,
         "e2e-ask",
         {"option_index": 1, "supplement": "别动 b.py"},
@@ -382,10 +365,10 @@ def test_e2e_ask_parks_then_answer_reaches_the_model(monkeypatch, tmp_path):
     assert final["messages"][-1].content == "好，按你说的做"
 
 
-def test_e2e_unanswered_ask_still_returns_to_the_model(monkeypatch, tmp_path):
+def test_e2e_unanswered_ask_still_returns_to_the_model(tmp_path):
     """没人作答也必须收场：回执写明"未作答"，run 照常走完，不卡在等人上。"""
     _, final = _run_e2e(
-        monkeypatch, tmp_path, "e2e-ask-blank", {"option_index": None, "supplement": None}
+        tmp_path, "e2e-ask-blank", {"option_index": None, "supplement": None}
     )
 
     receipts = [m for m in final["messages"] if isinstance(m, ToolMessage) and m.name == "ask_user"]

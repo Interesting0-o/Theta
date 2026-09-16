@@ -3,6 +3,7 @@ from pathlib import Path
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from app.agent.state import AgentState
 from app.agent.nodes import (
@@ -63,7 +64,11 @@ def should_continue_after_orchestrate(state: AgentState):
     return "tool_node" if state.get("approved_tool_calls") else "llm_node"
 
 
-async def get_main_agent_graph(workspace_path: str | None = None, session_id: str | None = None):
+async def get_main_agent_graph(
+    workspace_path: str | None = None,
+    session_id: str | None = None,
+    model: BaseChatModel | None = None,
+):
     """
     返回未编译的 StateGraph（compile 由调用方完成，以支持挂 checkpointer 的 interrupt 审批）。
 
@@ -75,6 +80,10 @@ async def get_main_agent_graph(workspace_path: str | None = None, session_id: st
     见 app/agent/mcp.py）。TUI 传真实会话 id、evaluation 传任务名；零参入口（langgraph dev）
     为 None → 所有会话共享一组运行体（已知偏差）。worker 子图**不走本入口**——它走
     get_sub_agent_graph（签名里没有 session_id）。
+
+    model：不传 = `get_main_chat_model()`（生产路径）。给了就用它当**未绑定**的原始模型
+    （bind_tools 仍由 LLMNode 按工具集版本做，见下）——评估的录制/回放从这里注入模型替身；
+    与 `get_sub_agent_graph` 的同名参量一个路子。
     """
     workspace_path = _resolve_workspace(workspace_path)
     # 默认 tmp 工作区需存在：os.makedirs 属阻塞调用，放到线程执行（blockbuster 不拦）
@@ -99,7 +108,7 @@ async def get_main_agent_graph(workspace_path: str | None = None, session_id: st
 
     # 模型**不在这里 bind_tools**：交给 LLMNode 按工具集版本做（只在版本变化时重绑）。
     # 仍传未绑定的原始 model —— binding 上没有再 bind_tools 的能力。
-    model = get_main_chat_model()
+    model = model if model is not None else get_main_chat_model()
 
     graph.add_node(
         "llm_node", LLMNode(model=model, workspace_path=workspace_path, toolset=toolset)

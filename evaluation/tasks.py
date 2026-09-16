@@ -4,9 +4,13 @@ Task 是纯数据（prompt / 预置文件 / 审批策略 / 检查项），不感
 示例任务只做安全的文件读写与计划编排，配合 policy.allow_except 默认黑名单
 （terminal / 联网工具一律拒绝），跑真 LLM 也不会误伤环境。
 
+**层 A 回放不需要另一套任务类型**：同一份 Task 在回放模式下自动换成录制好的模型输出
+（`runner.run_suite(mode=…)`），所以这里只有"真跑用的任务"一种写法；配合它的是
+`evaluation/fixtures/<task>.json`。改动 task 的 prompt / setup 会让旧 fixture 作废（指纹比对），
+跑 `--record` 重录即可。
+
 TODO（骨架之后）：
-- 任务外置成 JSON/YAML（现在内联在 EXAMPLE_TASKS，便于先跑通）；
-- 增加"层 A"任务类型：直接给定期望的 tool_calls 序列做回放（无 LLM 成本）。
+- 任务外置成 JSON/YAML（现在内联在 EXAMPLE_TASKS，便于先跑通）。
 """
 from __future__ import annotations
 

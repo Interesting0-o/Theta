@@ -1,0 +1,28 @@
+{
+  "task": "read_and_summarize",
+  "recorded_at": "2026-09-16T22:29:05",
+  "model": "glm-5.3-flash",
+  "prompt": "请阅读工作区里的 README.md，用三句话总结它的内容。",
+  "setup": {
+    "README.md": "# 演示项目\n\n这是一个用于评估 Theta 的示例项目。\n\n核心能力：文件读写、目录管理、内容检索。\n\n所有写操作都需要人工审批。\n"
+  },
+  "replies": [
+    {
+      "content": "我先读取工作区里的 README.md。",
+      "tool_calls": [
+        {
+          "name": "read_file",
+          "args": {
+            "path": "README.md"
+          },
+          "id": "call_-7261862740514300977",
+          "type": "tool_call"
+        }
+      ]
+    },
+    {
+      "content": "已读完 README.md，内容概括如下：\n\n1. 这是一个名为\"演示项目\"的示例项目，专门用于评估 Theta 编码助手。\n2. 项目展示了 Theta 的核心能力：文件读写、目录管理和内容检索。\n3. 它特别强调安全机制——所有写操作（如新建、修改、删除文件）都需要人工审批后才能执行。",
+      "tool_calls": []
+    }
+  ]
+}

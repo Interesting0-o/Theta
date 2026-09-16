@@ -275,12 +275,30 @@ export WORKSPACE_PATH='C:\Users\<你>\AppData\Local\Temp'   # 见 python -c "imp
 
 ### 模型行为评估（evaluation/）
 
-`tests/` 守**机制**（沙箱 / guard / 审批路由等确定性单测）；`evaluation/` 守**模型行为**——用可编程审批策略（自动批准 / 自动拒绝 / 黑名单）替代 TUI 里的人工 `y/n`，跑真实 LLM 完成任务，再用确定性断言检查终态（文件 / 审批次数 / plan 状态），用于 prompt / 工具 docstring / tool.json 迭代时抓 LLM 涌现行为的静默回归。
+`tests/` 守**机制**（沙箱 / guard / 审批路由等确定性单测）；`evaluation/` 用可编程闸门策略
+（自动批准 / 自动拒绝 / 逐次脚本）替代 TUI 里的人工 `y/n`，跑任务再用确定性断言检查终态
+（文件 / 审批次数 / plan 状态）。**分两层**：
+
+| | 层 A · 回放（默认） | 层 B · 真跑 |
+| --- | --- | --- |
+| 模型 | 脚本（`evaluation/fixtures/<task>.json` 里**录制**下来的真实模型输出） | 真调 LLM |
+| 成本 | **零 token**（实测 1.5s/任务 vs 真跑 13–113s） | 真 token |
+| 守什么 | **除模型之外的一切**：图接线 / `tool.json` 策略 / 工具真执行 / 编排分流 / 闸门 / compact | 模型这次表现如何 |
+| 改了 prompt / 工具 docstring | ❌ **测不了** | ✅ 唯一验证手段 |
+
+层 A 不是"便宜的层 B"而是**另一条轴**：它把模型换成脚本、其余全是真的（真图、真 MCP 运行体、
+真工具执行），拿真实录制的输出当固定输入样本，抓"机制被改坏了"这类静默回归。
+**别把"回放全绿"当成"评估过了"**——prompt 类改动必须跑层 B。
 
 ```bash
-python -m evaluation                          # 跑默认示例任务集（耗真实 token）
-python -m evaluation --task write_and_verify  # 跑单个任务
+python -m evaluation                          # 层 A 回放（默认，零成本）
+python -m evaluation --task write_and_verify  # 只跑单个任务
+python -m evaluation --live                   # 层 B 真跑（花 token）
+python -m evaluation --record                 # 真跑并把模型输出录成 fixture（改动任务后重录）
+python -m evaluation --keep-workspace         # 保留临时工作区，人工复查失败现场
 ```
+
+任务的 prompt / setup 变了，旧 fixture 会被判定为陈旧并**跳过**（不计入通过率），跑 `--record` 重录即可。
 
 ### 本地部署 LangGraph
 
