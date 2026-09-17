@@ -61,13 +61,17 @@ def decision_to_resume(decision: Decision) -> dict:
     图侧既有的审批语义、mock 与测试都因此不必改动：
 
     - `approval` → `{"approved": bool}`；
-    - `answer`   → `{"option_index": int | None, "supplement": str | None}`（两段都可空，
-      两段皆空即"未回答"）。
+    - `answer`   → `{"option_indexes": list[int], "supplement": str | None}`（两段都可空，
+      两段皆空即"未回答"）。序号**恒为列表**（单选时长 0 或 1）——复选与单选同一条形状，
+      图侧只看这一份，不为两种模态分叉。
 
     同一份映射也被 `evaluation/runner.py` 用——评估绕过 UI 协议，但走的是同一条图契约。
     """
     if decision.kind == "answer":
-        return {"option_index": decision.option_index, "supplement": decision.supplement}
+        return {
+            "option_indexes": list(decision.option_indexes),
+            "supplement": decision.supplement,
+        }
     return {"approved": bool(decision.approved)}
 
 

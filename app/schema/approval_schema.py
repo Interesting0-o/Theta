@@ -5,7 +5,8 @@
 
 **闸门有两种载荷**（`ApprovalRequest.type`）：
 - `tool_approval`：工具审批，回答只有"批 / 不批"；
-- `ask_user`：agent 提问，回答是**两段**——选中的选项 + 一句自由补充。
+- `ask_user`：agent 提问，回答是**两段**——选中的选项（**单选或复选**，由题目的 `select`
+  声明）+ 一句自由补充。
 两者共用同一套 park/resume 骨架与同一个 broker（见 docs/MULTI_AGENT.md §6），
 差异只在载荷形状与 `Decision.kind`。取名仍留 `Approval*`（改名要横扫 schema +
 platform + sub_agent，与本条无关）：它是**闸门**域，不是只有审批。
@@ -14,7 +15,7 @@ platform + sub_agent，与本条无关）：它是**闸门**域，不是只有�
 （worker 的 env 是整体替换、不继承父进程，两边各写一个字面量迟早会漂）。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, NotRequired, TypedDict
 
 # 审批收件箱默认监听地址（仅本机）。
@@ -45,15 +46,18 @@ class Decision:
 
     - `kind="approval"`：只看 `approved`；
     - `kind="answer"`：回答是**两段**——选中的选项 + 一句自由补充，两段都可留空。
-      `option_index` / `option_text` 只在用户真选了某项时非 None；而"没选任何给定选项、
-      自己写了一段方案"落在 `supplement` 里，是**有效回答**，不是没回答（模型最容易在这里读错）。
+      `option_indexes` 只在用户真选了给定选项时非空；而"没选任何给定选项、自己写了一段方案"
+      落在 `supplement` 里，是**有效回答**，不是没回答（模型最容易在这里读错）。
       两段皆空 = 未回答（EOF 或直接回车），消费方只认 `unanswered` 这一条判据。
     """
 
     kind: Literal["approval", "answer"]
     approved: bool | None = None
-    option_index: int | None = None
-    option_text: str | None = None
+    # 选中的选项序号（**0 起始**，与 `AskAnswer` 同口径；展示时才 +1 给人看）。
+    # **单选也走这个字段**（长度 0 或 1），不并列一个标量字段——一个字段一种含义。
+    # 必须是 `list` 不能是 `tuple`：它经 `decision_to_resume` 的 resume 字典与 `AskAnswer`
+    # 落进 checkpoint，**tuple 过一遍序列化会变成 list**（类型漂移）。
+    option_indexes: list[int] = field(default_factory=list)
     supplement: str | None = None
 
     @property
@@ -61,7 +65,7 @@ class Decision:
         """提问是否"无人作答"（两段皆空）。审批不适用此判据（审批只看 approved）。"""
         return (
             self.kind == "answer"
-            and self.option_index is None
+            and not self.option_indexes
             and not (self.supplement or "").strip()
         )
 
@@ -90,6 +94,9 @@ class ApprovalRequest(TypedDict):
     question: NotRequired[str]
     options: NotRequired[list[str]]
     why: NotRequired[str]
+    # 题目的模态："one"（默认，单选）/ "many"（复选）。**纯展示与输入校验用**——面板据此
+    # 决定要不要提示"可多选"、以及输入多个序号时是重问还是收下。缺省 = "one"。
+    select: NotRequired[str]
 
 
 class ApprovalRecord(TypedDict):

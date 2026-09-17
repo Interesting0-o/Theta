@@ -150,8 +150,7 @@ def test_drive_turn_ask_resumes_with_two_segments():
         )
         answer = Decision(
             kind="answer",
-            option_index=0,
-            option_text="pytest（项目已有基建）",
+            option_indexes=[0],
             supplement="记得带上覆盖率",
         )
 
@@ -163,8 +162,8 @@ def test_drive_turn_ask_resumes_with_two_segments():
         await dec
 
         assert result == FINAL
-        # 进图的只有两段回答：kind / option_text 是前端与闸门内部用的，图那侧要的是原始两段
-        assert step.resumes == [{"option_index": 0, "supplement": "记得带上覆盖率"}]
+        # 进图的只有两段回答：kind 是前端与闸门内部用的，图那侧要的是序号列表 + 补充原文
+        assert step.resumes == [{"option_indexes": [0], "supplement": "记得带上覆盖率"}]
 
     asyncio.run(go())
 
@@ -186,7 +185,7 @@ def test_drive_turn_ask_unanswered_resumes_empty():
         await dec
 
         assert result == FINAL
-        assert step.resumes == [{"option_index": None, "supplement": None}]
+        assert step.resumes == [{"option_indexes": [], "supplement": None}]
 
     asyncio.run(go())
 

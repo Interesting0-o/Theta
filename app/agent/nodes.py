@@ -519,6 +519,10 @@ _SHELL_METACHARS: tuple[str, ...] = (";", "&&", "||", "|", "&", "`", "$(", ">", 
 # 选项上限：面板与人的注意力都有限，"5 个选项比 1 个问题更难答"。开放式提问（0 项）不限。
 _MAX_ASK_OPTIONS = 5
 
+# 题目的模态：单选 / 复选。面板据此决定提示语，以及"用户输入多个序号"时是收下还是重问。
+_ASK_SELECT_MODES: tuple[str, ...] = ("one", "many")
+_ASK_SELECT_DEFAULT = "one"
+
 
 def _ask_request(args: dict) -> tuple[dict | None, str | None]:
     """校验并归一提问参数，返回 `(归一后的请求, 问题说明)`；无问题时前者为 None。
@@ -536,6 +540,8 @@ def _ask_request(args: dict) -> tuple[dict | None, str | None]:
         if isinstance(raw_options, list)
         else []
     )
+    # 缺省 = 单选（也是历史行为的默认值，模型不传就一切照旧）
+    select = str(args.get("select") or _ASK_SELECT_DEFAULT).strip()
 
     problems: list[str] = []
     if not why:
@@ -544,27 +550,37 @@ def _ask_request(args: dict) -> tuple[dict | None, str | None]:
         problems.append("question（问题本身）为空")
     if len(options) > _MAX_ASK_OPTIONS:
         problems.append(f"options 给了 {len(options)} 项，超过上限 {_MAX_ASK_OPTIONS} 项")
+    if select not in _ASK_SELECT_MODES:
+        # fail-closed：模态说不清就不摆问题（与 why 为空同档），回执教它怎么改
+        problems.append(
+            f"select 只能是 {' / '.join(repr(m) for m in _ASK_SELECT_MODES)}，收到 {select!r}"
+        )
     if problems:
         return None, (
             "提问未发出：" + "；".join(problems) + "。请补齐后重发"
             f"（options 至多 {_MAX_ASK_OPTIONS} 项，也可以留空做开放式提问）。"
         )
-    return {"why": why, "question": question, "options": options}, None
+    return {"why": why, "question": question, "options": options, "select": select}, None
 
 
 def _normalize_ask_answer(decision, options: list[str]) -> dict:
     """把闸门收到的回答归一成 `AskAnswer`（写进 state.ask_answers 的形状）。
 
-    - **序号按 options 校验**：越界 / 非整数一律当作"没选"。取向同 `_decide` 的 fail-closed——
-      宁可让模型看到"用户没选"，也不能把一段对不上号的文本当成选项原文喂过去；
+    - **序号按 options 逐个校验**：越界的、非整数的**丢掉那一项**，保留其余合法的，并去重保序
+      （单选与复选走同一段代码，单选只是长度 0 或 1 的特例）。取向同 `_decide` 的 fail-closed
+      ——宁可让模型看到"用户没选这几项"，也不能把对不上号的序号当成有效选择喂过去。
+      面板侧在输入时就提示过越界（单选直接重问），所以这里**不把丢弃项回灌给模型**；
     - 补充去首尾空白，空串归一成 None——让"**两段皆空 = 未回答**"这条判据在 state 里直接可读，
       消费端不必各自再判一次空白。
     """
     payload = decision if isinstance(decision, dict) else {}
-    raw_index = payload.get("option_index")
-    index = raw_index if isinstance(raw_index, int) and 0 <= raw_index < len(options) else None
+    raw = payload.get("option_indexes")
+    indexes: list[int] = []
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, int) and 0 <= item < len(options) and item not in indexes:
+            indexes.append(item)
     supplement = str(payload.get("supplement") or "").strip() or None
-    return {"option_index": index, "supplement": supplement}
+    return {"option_indexes": indexes, "supplement": supplement}
 
 
 #----------------------工具审核节点--------------------
@@ -825,6 +841,8 @@ class ReviewNode:
                     "why": request["why"],
                     "question": request["question"],
                     "options": request["options"],
+                    # 模态透传给面板：它据此提示"可多选"、并决定输入多个序号时收下还是重问
+                    "select": request["select"],
                     "tool_call_id": current_tool.get("id"),
                 }
             )

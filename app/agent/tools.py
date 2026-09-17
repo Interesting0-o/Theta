@@ -30,7 +30,7 @@ from datetime import date
 from functools import lru_cache
 from importlib.machinery import PathFinder
 from pathlib import Path
-from typing import Annotated, List, get_args
+from typing import Annotated, List, Literal, get_args
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, InjectedToolArg, InjectedToolCallId, tool
@@ -301,10 +301,11 @@ def ask_user(
     state: Annotated[AgentState, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId],
     options: list[str] | None = None,
+    select: Literal["one", "many"] = "one",
 ) -> dict:
     """在动手之前，把"你判断不了、只能由用户定"的问题摆给用户选，并等他的回答。
 
-    回答是**两段**：用户选中哪个选项（可留空），以及一句自由补充（可留空）。两段都收得到——
+    回答是**两段**：用户选中哪些选项（可留空），以及一句自由补充（可留空）。两段都收得到——
     **"没选任何选项、自己写了一段方案"同样是有效回答**，别当成没回答。
 
     什么时候该问（先自问一句：这个答案我是不是自己就能查到？）
@@ -321,12 +322,17 @@ def ask_user(
     - `why` 必填：一句话说清**为什么问**（卡在哪、答了会改变什么）。用户靠它决定要不要认真答；
     - `options`：2–5 项为宜（最多 5 项；留空 = 纯开放式提问）。每项写清**差别**而不是只给名字
       （如"浅克隆：只取最新一次提交，快，但看不了历史"）。把**你推荐的那项排第一**并写明理由；
-      用户还可以在选项之外补充自己的方案，所以别把选项做成"封闭三选一"。
+      用户还可以在选项之外补充自己的方案，所以别把选项做成"封闭三选一"；
+    - `select`：这题是**单选**（默认）还是**复选**。选项之间**互相独立、可以同时要**时用 `"many"`
+      （"这几项里哪些要保留""还要补哪些"）——用户一次勾多项，你也不必自己造"两者都要"这种
+      组合选项。**互斥的取舍**（走哪条路、用哪个方案、要不要兼容旧行为）保持默认单选：
+      单选比多选省事，能单选就别多选。
 
     Args:
         why: 为什么问——卡在什么地方、这个回答会改变什么。
         question: 要用户回答的问题本身，一句话说清。
         options: 备选方案清单（0–5 项），每项写清与其他项的差别，推荐项排第一。
+        select: "one"（默认，单选）/ "many"（复选）。选项可叠加时用 many。
         state: （系统自动注入，无需传入）取回用户在闸门处给出的两段回答。
         tool_call_id: （系统自动注入，无需传入）本次调用 id，用来对上回答。
 
@@ -334,19 +340,26 @@ def ask_user(
         一条 `[user_answer]` 回执：用户选了什么、补充了什么；无人作答时如实说明。
     """
     answer = (state.get("ask_answers") or {}).get(tool_call_id) or {}
-    index = answer.get("option_index")
+    raw_indexes = answer.get("option_indexes")
+    indexes = raw_indexes if isinstance(raw_indexes, list) else []
     supplement = (answer.get("supplement") or "").strip()
     # ⚠️ 选项归一（去首尾空白 / 丢空项）**必须与闸门的 `nodes.py::_ask_request` 同口径**，且与
     # 面板编号（`app/tui/ui.py::_ask` 拿的是闸门归一后那份清单）一致：序号是这三处各自算出来的，
     # 口径一旦分叉，用户选的号会在其中一边越界、被静默当成"没选"。
     # 序号合法性本身由闸门在写回前把关（它拿的就是同一份清单），此处按"没选中任何给定选项"降级即可。
     opts = [str(item).strip() for item in (options or []) if str(item).strip()]
-    picked = opts[index] if isinstance(index, int) and 0 <= index < len(opts) else None
+    picked = [(index + 1, opts[index]) for index in indexes if 0 <= index < len(opts)]
 
-    if picked and supplement:
-        content = f"[user_answer] 用户选择了：{index + 1}. {picked}\n用户补充：{supplement}"
-    elif picked:
-        content = f"[user_answer] 用户选择了：{index + 1}. {picked}"
+    if picked:
+        # 序号展示是 **1 起始**（面板口径），内部一律 0 起始
+        chosen = "、".join(f"{number}. {text}" for number, text in picked)
+        if select == "many":
+            # **多选即使只勾 1 项也写明总数**：否则模型会怀疑"是不是丢了几项"
+            content = f"[user_answer] 用户选择了（多选，共 {len(picked)} 项）：{chosen}"
+        else:
+            content = f"[user_answer] 用户选择了：{chosen}"
+        if supplement:
+            content += f"\n用户补充：{supplement}"
     elif supplement:
         content = f"[user_answer] 用户未选任何给定选项，直接补充说明：{supplement}"
     else:

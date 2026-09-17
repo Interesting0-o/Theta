@@ -59,12 +59,15 @@ class AskAnswer(TypedDict):
     生产者 = `ReviewNode`（提问闸门），消费者 = `ask_user` 工具——**闸门的产出是 state，执行器消费
     state**，与 `approved_*` 队列同一条路子。工具靠它 + 自己的 options 渲染出给模型的回执。
 
-    回答是**两段**：`option_index` 是用户选中的选项序号（0 起始；没选任何给定选项时为 None），
-    `supplement` 是用户自己补的一段话（可空）。**两段皆空 = 未回答**，消费方只认这一条判据
-    （见 `app/schema/approval_schema.py::Decision.unanswered`）。
+    回答是**两段**：`option_indexes` 是用户选中的选项序号（**0 起始**；没选任何给定选项时为
+    空列表），`supplement` 是用户自己补的一段话（可空）。**两段皆空 = 未回答**，消费方只认
+    这一条判据（见 `app/schema/approval_schema.py::Decision.unanswered`）。
+
+    单选与复选**共用这一个字段**（单选时长 0 或 1），与 `Decision.option_indexes` 同形状——
+    它是跨 checkpoint 的值，**必须是 list 不能是 tuple**（tuple 过一遍序列化会变 list）。
     """
 
-    option_index: int | None
+    option_indexes: list[int]
     supplement: str | None
 
 

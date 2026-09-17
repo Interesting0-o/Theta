@@ -72,7 +72,7 @@ def test_scripted_accepts_shorthands():
 
 
 def test_scripted_accepts_full_decision_objects():
-    explicit = Decision(kind="answer", option_index=1, option_text="乙", supplement="带上覆盖率")
+    explicit = Decision(kind="answer", option_indexes=[1], supplement="带上覆盖率")
     assert scripted(explicit)(ASK) == explicit
 
 

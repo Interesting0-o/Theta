@@ -108,6 +108,7 @@ def format_ask(value: dict) -> str:
     与 `format_tool_approval` 同族：**纯函数、等宽纯文本**（同样不走 markdown 渲染——这里要
     精确、不能重排）。行序是刻意的：先"为什么问"、再"问题"、最后"选项"——用户靠第一行决定
     要不要认真答，靠选项比较差别。选项**带序号**，因为终端侧就是靠序号选。
+    `select="many"`（复选）时多一行提示：不给这行，人不会知道能一次输入多个序号。
     """
     lines: list[str] = []
     why = str(value.get("why") or "").strip()
@@ -122,6 +123,8 @@ def format_ask(value: dict) -> str:
         lines.extend(
             f"    {index}. {truncate(item)}" for index, item in enumerate(options, start=1)
         )
+        if value.get("select") == "many":
+            lines.append("  （这题**可多选**：逗号分隔多个序号，如 1,3）")
     else:
         lines.append("  （本次没有给定选项，直接写下你的想法即可）")
 

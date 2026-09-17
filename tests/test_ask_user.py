@@ -66,7 +66,7 @@ def captured_interrupts(monkeypatch):
 
 def test_ask_call_parks_the_gate_with_question_and_options(captured_interrupts):
     """source=ask 的调用要**在闸门处挂起**，payload 带齐 why/question/options 交前端。"""
-    seen = captured_interrupts({"option_index": 1, "supplement": "别动 b.py"})
+    seen = captured_interrupts({"option_indexes": [1], "supplement": "别动 b.py"})
 
     out = _run(ReviewNode(), _state([_ask_call()]))
 
@@ -75,6 +75,8 @@ def test_ask_call_parks_the_gate_with_question_and_options(captured_interrupts):
     assert seen[0]["question"] == "改哪个？"
     assert seen[0]["options"] == ["a.py 里的", "c.py 里的"]
     assert seen[0]["why"] == "两个同名函数"
+    # 模态透传给面板：它据此提示"可多选"、并决定多个序号是收下还是重问
+    assert seen[0]["select"] == "one"
     assert seen[0]["tool_call_id"] == "call_ask"
     # 提问面板不需要审批那套遗留字段
     assert "current_step" not in seen[0] and "tool_name" not in seen[0]
@@ -84,7 +86,7 @@ def test_ask_call_parks_the_gate_with_question_and_options(captured_interrupts):
 
 def test_ask_call_is_routed_to_orchestrate_queue(captured_interrupts):
     """回答拿到后调用照常进**编排队列**（由 OrchestrateNode 执行工具体）——路由零特例。"""
-    captured_interrupts({"option_index": 0})
+    captured_interrupts({"option_indexes": [0]})
 
     out = _run(ReviewNode(), _state([_ask_call()]))
 
@@ -95,22 +97,31 @@ def test_ask_call_is_routed_to_orchestrate_queue(captured_interrupts):
 
 def test_ask_answer_lands_in_state_slice(captured_interrupts):
     """回答写进 state 的 ask_answers（**闸门的产出是 state，执行器消费 state**）。"""
-    captured_interrupts({"option_index": 1, "supplement": "  别动 b.py  "})
+    captured_interrupts({"option_indexes": [1], "supplement": "  别动 b.py  "})
 
     out = _run(ReviewNode(), _state([_ask_call()]))
 
     assert out["ask_answers"] == {
-        "call_ask": {"option_index": 1, "supplement": "别动 b.py"}  # 补充已去首尾空白
+        "call_ask": {"option_indexes": [1], "supplement": "别动 b.py"}  # 补充已去首尾空白
     }
+
+
+def test_ask_multi_select_keeps_every_chosen_option(captured_interrupts):
+    """多选：序号是一份**列表**，闸门原样收下（越界校验见下）——单选是它的长度 1 特例。"""
+    captured_interrupts({"option_indexes": [0, 1], "supplement": None})
+
+    out = _run(ReviewNode(), _state([_ask_call()]))
+
+    assert out["ask_answers"]["call_ask"]["option_indexes"] == [0, 1]
 
 
 def test_ask_without_any_answer_is_recorded_as_unanswered(captured_interrupts):
     """两段皆空（EOF / 直接回车）也照常放行——回执由工具体写成"未作答"，模型据此继续。"""
-    captured_interrupts({"option_index": None, "supplement": None})
+    captured_interrupts({"option_indexes": [], "supplement": None})
 
     out = _run(ReviewNode(), _state([_ask_call()]))
 
-    assert out["ask_answers"] == {"call_ask": {"option_index": None, "supplement": None}}
+    assert out["ask_answers"] == {"call_ask": {"option_indexes": [], "supplement": None}}
 
 
 def test_option_numbering_is_stable_across_gate_panel_and_tool(captured_interrupts):
@@ -119,7 +130,7 @@ def test_option_numbering_is_stable_across_gate_panel_and_tool(captured_interrup
     口径一旦分叉，用户选的号会在其中一边越界、被静默当成"没选"——这条把它钉住：乱糟糟的原始
     选项清单（空白项、首尾空格）经过往返，编号仍然对得上。
     """
-    seen = captured_interrupts({"option_index": 1, "supplement": None})
+    seen = captured_interrupts({"option_indexes": [1], "supplement": None})
     raw_options = ["  甲  ", "   ", "乙"]
 
     out = _run(
@@ -129,7 +140,7 @@ def test_option_numbering_is_stable_across_gate_panel_and_tool(captured_interrup
 
     # 面板编号依据的是闸门归一后的清单
     assert seen[0]["options"] == ["甲", "乙"]
-    assert out["ask_answers"]["call_ask"]["option_index"] == 1
+    assert out["ask_answers"]["call_ask"]["option_indexes"] == [1]
     # 工具体用自己的 args 渲染，也必须指着同一项
     content = ask_user.func(
         why="w", question="q", options=raw_options, state=out, tool_call_id="call_ask"
@@ -138,15 +149,33 @@ def test_option_numbering_is_stable_across_gate_panel_and_tool(captured_interrup
 
 
 def test_ask_out_of_range_option_is_recorded_as_not_chosen(captured_interrupts):
-    """序号对上不 options 就当没选（fail-closed）——不能把错位的文本当成选项原文喂给模型。"""
-    captured_interrupts({"option_index": 9, "supplement": "还是改 a"})
+    """序号对不上 options 就当没选（fail-closed）——不能把错位的序号当成有效选择喂给模型。"""
+    captured_interrupts({"option_indexes": [9], "supplement": "还是改 a"})
 
     out = _run(ReviewNode(), _state([_ask_call()]))
 
     assert out["ask_answers"]["call_ask"] == {
-        "option_index": None,
+        "option_indexes": [],
         "supplement": "还是改 a",
     }
+
+
+def test_ask_drops_only_the_out_of_range_indexes(captured_interrupts):
+    """多选越界：**只丢越界那几项，保留合法的**（面板在选择时就用同一口径提示过）。"""
+    captured_interrupts({"option_indexes": [1, 9], "supplement": None})
+
+    out = _run(ReviewNode(), _state([_ask_call()]))
+
+    assert out["ask_answers"]["call_ask"]["option_indexes"] == [1]
+
+
+def test_ask_dedupes_repeated_indexes(captured_interrupts):
+    """同一项连选两次只记一次（`1,1` 是手抖，不是"选了两次"）。"""
+    captured_interrupts({"option_indexes": [1, 1, 0], "supplement": None})
+
+    out = _run(ReviewNode(), _state([_ask_call()]))
+
+    assert out["ask_answers"]["call_ask"]["option_indexes"] == [1, 0]
 
 
 # ------------------------- 闸门前的参数校验 -------------------------
@@ -181,12 +210,12 @@ def test_invalid_ask_never_reaches_the_human(monkeypatch, args, hint):
 
 
 def test_ask_request_normalizes_and_caps():
-    """归一：去空白、丢掉空选项；5 项刚好放行、6 项拦下。"""
+    """归一：去空白、丢掉空选项；5 项刚好放行、6 项拦下；select 缺省 = 单选。"""
     ok, problem = _ask_request(
         {"why": " w ", "question": " q ", "options": ["  甲  ", "", "乙"]}
     )
     assert problem is None
-    assert ok == {"why": "w", "question": "q", "options": ["甲", "乙"]}
+    assert ok == {"why": "w", "question": "q", "options": ["甲", "乙"], "select": "one"}
 
     _, problem = _ask_request(
         {"why": "w", "question": "q", "options": [str(i) for i in range(_MAX_ASK_OPTIONS + 1)]}
@@ -194,11 +223,58 @@ def test_ask_request_normalizes_and_caps():
     assert problem is not None
 
 
+def test_ask_request_accepts_multi_select():
+    ok, problem = _ask_request({"why": "w", "question": "q", "select": "many"})
+
+    assert problem is None and ok["select"] == "many"
+
+
+def test_ask_request_rejects_unknown_select():
+    """模态说不清就**不摆问题**（fail-closed，与 why 为空同档）——回执教它合法的取值。"""
+    ok, problem = _ask_request({"why": "w", "question": "q", "select": "all"})
+
+    assert ok is None
+    assert problem is not None and "'one'" in problem and "'many'" in problem
+
+
 def test_normalize_ask_answer_rejects_non_integer_index():
-    assert _normalize_ask_answer({"option_index": "1", "supplement": ""}, ["甲"]) == {
-        "option_index": None,
+    """非整数序号只丢**那一项**（不是整条作废）——同一段归一同时服务单选与复选。"""
+    assert _normalize_ask_answer({"option_indexes": ["1"], "supplement": ""}, ["甲"]) == {
+        "option_indexes": [],
         "supplement": None,
     }
+
+
+def test_normalize_ask_answer_tolerates_a_malformed_payload():
+    """上游形状给歪（裸标量 / 缺字段 / 整个不是 dict）也不能炸：一律按"没选"降级。"""
+    assert _normalize_ask_answer({"option_indexes": 1}, ["甲"])["option_indexes"] == []
+    assert _normalize_ask_answer({}, ["甲"])["option_indexes"] == []
+    assert _normalize_ask_answer(None, ["甲"])["option_indexes"] == []
+
+
+def test_ask_multi_select_reaches_the_panel(captured_interrupts):
+    """`select` 是给面板的输入（提示语与重问逻辑都依赖它），必须随载荷透传。"""
+    seen = captured_interrupts({"option_indexes": [0]})
+
+    _run(
+        ReviewNode(),
+        _state(
+            [
+                {
+                    "name": "ask_user",
+                    "args": {
+                        "why": "w",
+                        "question": "q",
+                        "options": ["甲", "乙"],
+                        "select": "many",
+                    },
+                    "id": "call_ask",
+                }
+            ]
+        ),
+    )
+
+    assert seen[0]["select"] == "many"
 
 
 # ------------------------- 工具体：四档回执 -------------------------
@@ -206,18 +282,19 @@ def test_normalize_ask_answer_rejects_non_integer_index():
 OPTS = ["pytest（项目已有基建）", "unittest（stdlib）"]
 
 
-def _receipt(answer, options=OPTS):
+def _receipt(answer, options=OPTS, select="one"):
     return ask_user.func(
         why="两条路差别很大",
         question="用哪个测试框架？",
         state={"ask_answers": {"call_ask": answer}},
         tool_call_id="call_ask",
         options=options,
+        select=select,
     )["messages"][0]
 
 
 def test_receipt_reports_both_segments():
-    msg = _receipt({"option_index": 1, "supplement": "带上覆盖率"})
+    msg = _receipt({"option_indexes": [1], "supplement": "带上覆盖率"})
 
     assert msg.name == "ask_user" and msg.tool_call_id == "call_ask"
     assert "2. unittest（stdlib）" in msg.content  # 序号是**给人看的 1 起始**
@@ -225,20 +302,43 @@ def test_receipt_reports_both_segments():
 
 
 def test_receipt_reports_option_only():
-    content = _receipt({"option_index": 0, "supplement": None}).content
+    content = _receipt({"option_indexes": [0], "supplement": None}).content
     assert "1. pytest（项目已有基建）" in content
     assert "补充" not in content
 
 
+def test_receipt_single_select_wording_is_unchanged():
+    """单选是**兼容路径**：加多选不该改动它一个字（模型侧的历史行为零变化）。"""
+    content = _receipt({"option_indexes": [0], "supplement": None}).content
+
+    assert content == "[user_answer] 用户选择了：1. pytest（项目已有基建）"
+
+
+def test_receipt_reports_multi_select_with_the_count():
+    """多选回执必须写明**共几项**——否则模型会以为用户只答了一半。"""
+    content = _receipt({"option_indexes": [0, 1], "supplement": None}, select="many").content
+
+    assert "1. pytest（项目已有基建）" in content
+    assert "2. unittest（stdlib）" in content
+    assert "共 2 项" in content
+
+
+def test_receipt_multi_select_with_one_pick_still_says_multi():
+    """多选下只勾 1 项**也要**写明总数：不写，模型会怀疑"是不是丢了几项"。"""
+    content = _receipt({"option_indexes": [1], "supplement": None}, select="many").content
+
+    assert "共 1 项" in content and "2. unittest（stdlib）" in content
+
+
 def test_receipt_reports_supplement_only_as_a_real_answer():
     """**只补充、没选项是有效回答**——回执必须写清"用户没选选项但给了方案"。"""
-    content = _receipt({"option_index": None, "supplement": "我改 t.py 里那个"}).content
+    content = _receipt({"option_indexes": [], "supplement": "我改 t.py 里那个"}).content
     assert "未选" in content and "我改 t.py 里那个" in content
     assert "未作答" not in content
 
 
 def test_receipt_reports_unanswered():
-    content = _receipt({"option_index": None, "supplement": None}).content
+    content = _receipt({"option_indexes": [], "supplement": None}).content
     assert "未作答" in content
     assert "不要重复提问" in content  # 可行动：别再把同一个问题问一遍
 
@@ -349,7 +449,7 @@ def test_e2e_ask_parks_then_answer_reaches_the_model(tmp_path):
     payload, final = _run_e2e(
         tmp_path,
         "e2e-ask",
-        {"option_index": 1, "supplement": "别动 b.py"},
+        {"option_indexes": [1], "supplement": "别动 b.py"},
     )
 
     # 挂起时交给人看到的正是问题本身
@@ -368,10 +468,24 @@ def test_e2e_ask_parks_then_answer_reaches_the_model(tmp_path):
 def test_e2e_unanswered_ask_still_returns_to_the_model(tmp_path):
     """没人作答也必须收场：回执写明"未作答"，run 照常走完，不卡在等人上。"""
     _, final = _run_e2e(
-        tmp_path, "e2e-ask-blank", {"option_index": None, "supplement": None}
+        tmp_path, "e2e-ask-blank", {"option_indexes": [], "supplement": None}
     )
 
     receipts = [m for m in final["messages"] if isinstance(m, ToolMessage) and m.name == "ask_user"]
     assert len(receipts) == 1
     assert "未作答" in receipts[0].content
     assert final["messages"][-1].content == "好，按你说的做"
+
+
+def test_e2e_multi_select_round_trip(tmp_path):
+    """多选闭环：两个序号经 resume 进 state、再经工具体渲染成回执——形状一路是 list。"""
+    _, final = _run_e2e(
+        tmp_path, "e2e-ask-many", {"option_indexes": [0, 1], "supplement": None}
+    )
+
+    receipts = [m for m in final["messages"] if isinstance(m, ToolMessage) and m.name == "ask_user"]
+    assert len(receipts) == 1
+    content = receipts[0].content
+    assert "1. a.py 里的" in content and "2. c.py 里的" in content
+    # 这是单选调用（`_ask_ai_message` 没传 select），所以文案里**不该**出现多选字样
+    assert "多选" not in content

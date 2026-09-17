@@ -109,12 +109,12 @@ worker = **常驻异步事件循环**（resident runtime），一个进程持有
 
 ## 6. 统一审批闸门
 
-> **已泛化为"人机闸门"（2026-09-16 · agent 提问）**：闸门现在承载**两种载荷**，靠 payload 的
-> `type` 区分——`tool_approval`（审批，回答是 y/n）与 `ask_user`（agent 提问，回答是"选项 +
-> 补充"两段）。骨架完全共用：同一个 `ReviewNode` interrupt、同一个 `ApprovalInbox` broker、
-> 同一条 `Command(resume=…)` 回程；前端只多一种面板（`app/tui/panels.py::format_ask`），
-> 人给的决定统一是 `Decision`（`app/schema/approval_schema.py`）。本节其余内容仍是对**审批**
-> 那一支的讨论。
+> **已泛化为"人机闸门"（2026-09-16 · agent 提问；09-17 补复选）**：闸门现在承载**两种载荷**，
+> 靠 payload 的 `type` 区分——`tool_approval`（审批，回答是 y/n）与 `ask_user`（agent 提问，
+> 回答是"选项 + 补充"两段，其中**选项可单选或复选**，由提问侧的 `select` 声明）。骨架完全共用：
+> 同一个 `ReviewNode` interrupt、同一个 `ApprovalInbox` broker、同一条 `Command(resume=…)` 回程；
+> 前端只多一种面板（`app/tui/panels.py::format_ask`），人给的决定统一是 `Decision`
+> （`app/schema/approval_schema.py`）。本节其余内容仍是对**审批**那一支的讨论。
 >
 > 落点与三条纪律：
 > - **闸门位置是承重约束**：interrupt 必须待在"挂起之前没有副作用"的节点里，因为 resume 会把

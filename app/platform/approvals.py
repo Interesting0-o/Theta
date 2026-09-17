@@ -384,7 +384,7 @@ def _record_to_value(record: ApprovalRecord) -> dict:
 
     value 与 ReviewNode interrupt payload 对齐，**`type` 决定前端怎么问**（审批面板 / 提问面板）：
     - 审批：{type, tool_name, current_step?, tool_args, description?, tool_call_id?}；
-    - 提问：{type, why, question, options, tool_call_id?}。
+    - 提问：{type, why, question, options, select, tool_call_id?}。
 
     description 在 payload 层（ApprovalRequest 语义），前端主要展示 tool_args.description；
     tool_call_id 仅本地中断携带，纯展示（审批面板的"调用ID"与提问的追溯都用它）。
@@ -397,6 +397,9 @@ def _record_to_value(record: ApprovalRecord) -> dict:
         value["why"] = payload.get("why") or ""
         value["question"] = payload.get("question") or ""
         value["options"] = list(payload.get("options") or [])
+        # 模态：面板据此提示"可多选"，并决定输入多个序号时收下还是重问。缺省 = 单选，
+        # 与 `nodes.py::_ask_request` 的默认值同源（那里是唯一权威，这里只做透传兜底）。
+        value["select"] = payload.get("select") or "one"
     else:
         value["tool_name"] = payload.get("tool_name", "?")
         value["tool_args"] = payload.get("tool_args") or {}

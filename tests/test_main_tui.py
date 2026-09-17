@@ -19,7 +19,7 @@ from app.tui import panels
 from app.tui import ui as tui_ui
 from app.tui.panels import format_ask, format_tool_approval, render_markdown, truncate
 from app.tui.runner import resolve_tui_workspace
-from app.tui.ui import TerminalUI
+from app.tui.ui import TerminalUI, parse_option_indexes
 
 
 def test_terminal_ui_eof_makes_reads_return_immediately():
@@ -132,6 +132,9 @@ ASK = {
     "tool_call_id": "call_ask",
 }
 
+# 复选题（`select="many"`）：选项互相独立，用户可一次勾多项
+ASK_MANY = {**ASK, "options": ["a.py 里的", "b.py 里的", "c.py 里的"], "select": "many"}
+
 
 async def _ask(lines: list[str | None], value: dict = ASK):
     """驱动一次提问面板：`lines` 是用户**看到面板之后**依次敲的行（None = EOF）。
@@ -172,7 +175,7 @@ def test_ask_takes_option_and_supplement_both():
     _, decision = asyncio.run(_ask(["2", "别动 b.py"]))
 
     assert decision == Decision(
-        kind="answer", option_index=1, option_text="c.py 里的", supplement="别动 b.py"
+        kind="answer", option_indexes=[1], supplement="别动 b.py"
     )
     assert decision.unanswered is False
 
@@ -188,16 +191,18 @@ def test_ask_free_text_on_first_line_skips_second_question(capsys):
 def test_ask_option_only_is_a_valid_half_answer():
     _, decision = asyncio.run(_ask(["1", ""]))
 
-    assert decision.option_index == 0 and decision.option_text == "a.py 里的"
+    assert decision.option_indexes == [0]
     assert decision.supplement is None
     assert decision.unanswered is False  # 只选不补是完整回答，不是没答
+    # 选项原文不再随决定走（工具自己持有 options，消费端按序号取）——字段被删掉，别加回来
+    assert not hasattr(decision, "option_text")
 
 
 def test_ask_supplement_only_is_a_valid_answer():
     """**没选任何给定选项、只写了一段方案，是有效回答**——模型最容易在这里读成"没回答"。"""
     _, decision = asyncio.run(_ask(["", "我改 t.py 里那个"]))
 
-    assert decision.option_index is None and decision.supplement == "我改 t.py 里那个"
+    assert decision.option_indexes == [] and decision.supplement == "我改 t.py 里那个"
     assert decision.unanswered is False
 
 
@@ -208,11 +213,15 @@ def test_ask_all_blank_is_unanswered():
     assert decision.unanswered is True
 
 
-def test_ask_out_of_range_index_treated_as_not_chosen(capsys):
+def test_ask_out_of_range_index_is_reasked(capsys):
+    """单选严格：越界序号**提示并重问**，不是静默丢成"没选"（重输一次比丢一半强）。"""
     _, decision = asyncio.run(_ask(["9", "还是改 a"]))
 
-    assert decision.option_index is None and decision.supplement == "还是改 a"
-    assert "序号超出范围" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "序号超出范围" in out
+    assert out.count("选择序号") == 2, "第一问应该被重问一次"
+    # 第二次敲的不是序号而是文本 → 整串当补充，语义与"首行就是文本"完全一致
+    assert decision.option_indexes == [] and decision.supplement == "还是改 a"
 
 
 def test_ask_eof_on_first_line_is_unanswered():
@@ -225,8 +234,87 @@ def test_ask_eof_on_second_line_keeps_the_option_already_chosen():
     """第二问 EOF：**半份回答比没有好**——已经选中的那项照常带回去。"""
     _, decision = asyncio.run(_ask(["2", None]))
 
-    assert decision.option_index == 1 and decision.option_text == "c.py 里的"
+    assert decision.option_indexes == [1]
     assert decision.supplement is None
+
+
+# ------------------------- 提问面板：复选（select="many"） -------------------------
+
+
+def test_ask_many_takes_several_indexes():
+    _, decision = asyncio.run(_ask(["1,3", ""], ASK_MANY))
+
+    assert decision.option_indexes == [0, 2]
+    assert decision.unanswered is False
+
+
+@pytest.mark.parametrize("typed", ["1,3", "1，3", "1 3", " 1 , 3 "])
+def test_ask_many_accepts_the_three_separators(typed):
+    """分隔符容错：半角逗号 / 全角逗号 / 空格——中文输入法下最容易敲出的就这三种。"""
+    _, decision = asyncio.run(_ask([typed, ""], ASK_MANY))
+
+    assert decision.option_indexes == [0, 2]
+
+
+def test_ask_many_drops_out_of_range_indexes_and_keeps_the_rest(capsys):
+    """复选宽容：**丢掉越界项、保留合法的**（单选那边是重问，两种模态容错空间不同）。"""
+    _, decision = asyncio.run(_ask(["1,9", ""], ASK_MANY))
+
+    assert decision.option_indexes == [0]
+    # 宽容但**不静默**：得告诉人丢了什么，否则他会以为 9 也算数了
+    assert "9" in capsys.readouterr().out
+
+
+def test_ask_many_dedupes_repeated_indexes():
+    _, decision = asyncio.run(_ask(["1,1,2", ""], ASK_MANY))
+
+    assert decision.option_indexes == [0, 1]
+
+
+def test_ask_many_blank_means_no_selection_and_supplement_still_counts():
+    """复选下"一个都不选"与单选同语义：空选择 + 补充**仍是有效回答**（全局只留一条判据）。"""
+    _, decision = asyncio.run(_ask(["", "两个都别动"], ASK_MANY))
+
+    assert decision.option_indexes == [] and decision.supplement == "两个都别动"
+    assert decision.unanswered is False
+
+
+def test_ask_single_reasks_when_the_user_gives_several_indexes(capsys):
+    """单选遇多值：**提示并重问**——静默取第一个会把用户明确表达的第二个意图吞掉。"""
+    _, decision = asyncio.run(_ask(["1,2", "2", ""], ASK))  # ASK 只有 2 项，且是单选
+
+    out = capsys.readouterr().out
+    assert "单选题" in out
+    assert decision.option_indexes == [1], "重问后第二次输入的那个序号才作数"
+
+
+def test_ask_single_reask_can_be_escaped_by_eof():
+    """重问**必须可逃逸**：人在重问处 EOF（或干脆不答）不能把面板锁死成死循环。"""
+    _, decision = asyncio.run(_ask(["9", None], ASK))
+
+    assert decision.unanswered is True
+
+
+@pytest.mark.parametrize(
+    ("typed", "expected"),
+    [
+        ("²", None),  # isdigit() 会放它进来，但 int("²") 抛 ValueError——面板不能因此炸掉
+        ("1²", None),
+        ("１", [1]),  # 全角数字照收（isdecimal 为真且 int() 认）；返回的是**1 起始**原始序号
+        ("abc", None),
+        ("1个", None),
+        (",", []),
+    ],
+)
+def test_parse_option_indexes_never_crashes_and_never_misreads(typed, expected):
+    """解析器的两条底线：**不抛异常**（面板不该被一个怪字符炸掉）、**不误判**（不像就放行当文本）。"""
+    assert parse_option_indexes(typed) == expected
+
+
+def test_format_ask_hints_multi_select_only_on_many_questions():
+    """不给这行提示，人不会知道能一次输入多个序号；单选那边则不该出现这句噪音。"""
+    assert "可多选" in format_ask(ASK_MANY)
+    assert "可多选" not in format_ask(ASK)
 
 
 # ------------------------- markdown 渲染（模型答复） -------------------------

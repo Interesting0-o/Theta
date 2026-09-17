@@ -131,8 +131,9 @@ asyncio.run(main())
 
 > 💡 遇到 `__interrupt__` 挂起时，先看 `payload["type"]` 再决定回什么（`resume` 的值随闸门种类变，见 `app/platform/turn.py::decision_to_resume`）：
 > - `tool_approval`（工具审批）→ `Command(resume={"approved": True/False})`；
-> - `ask_user`（agent 提问）→ `Command(resume={"option_index": 1, "supplement": "另外……"})`，
->   两段都可为 `None`（选项序号 0 起始）。
+> - `ask_user`（agent 提问）→ `Command(resume={"option_indexes": [1], "supplement": "另外……"})`，
+>   两段都可空：序号是**列表**（0 起始；单选也走它，长度 0 或 1；复选题可给多个），
+>   补充为 `None` 或字符串。
 >
 > 详见 [工具审批流程](#-进阶内容)。
 

@@ -154,9 +154,7 @@ def test_loop_parks_and_resumes_on_question(tmp_path, monkeypatch):
     ui = FakeUI(
         ["帮我改一下那个函数", None],
         answers=[
-            Decision(
-                kind="answer", option_index=1, option_text="改 c.py", supplement="别动 b.py"
-            )
+            Decision(kind="answer", option_indexes=[1], supplement="别动 b.py")
         ],
     )
     step = FakeStep(
@@ -176,7 +174,7 @@ def test_loop_parks_and_resumes_on_question(tmp_path, monkeypatch):
     assert value["type"] == "ask_user"
     assert value["question"] == "改哪个？"
     assert value["options"] == ["a.py 里的", "c.py 里的"]
-    assert step.resumes == [{"option_index": 1, "supplement": "别动 b.py"}]
+    assert step.resumes == [{"option_indexes": [1], "supplement": "别动 b.py"}]
     assert [type(e) for e in ui.events].count(TurnFinished) == 1
 
 
