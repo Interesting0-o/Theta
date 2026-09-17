@@ -386,7 +386,8 @@ def read_file(
     lo = start_line if start_line is not None else 1
     hi = end_line if end_line is not None else total
 
-    if total == 0 or lo > total:
+    # lo ≥ 1（上游已校验），故空文件（total == 0）天然落在 lo > total 里
+    if lo > total:
         return ToolResult(
             success=True,
             content=f"（{path} 共 {total} 行；请求的行区间 {lo}-{hi} 落在文件之外，无内容）",

@@ -55,8 +55,19 @@ def render_task(
 def print_report(
     runs: List[Tuple[Task, EvalResult, Optional[Path]]],
     mode: str = MODE_REPLAY,
-) -> None:
-    """打印整批评估的汇总表 + 通过率。"""
+) -> bool:
+    """打印整批评估的汇总表 + 通过率，并返回**整批是否通过**（CLI 拿它定退出码）。
+
+    判据（`True` = 放行）——三条同时成立：
+
+    1. 每个**跑起来**的任务都没报错（`result.ok`，图 / MCP 运行体本身失败）；
+    2. 且它们的检查项全过；
+    3. 且**至少有一个任务真的跑了**。全部 SKIP 返回 False：一行都没验证过却报绿，正是
+       "零成本评估进不了 CI"要堵的那个洞（fixture 缺失或陈旧，应当被人看见并去 `--record`）。
+
+    SKIP 本身**不算失败**——fixture 不是模型的锅（同"不计入通过率"的口径）。注意第 1 条：
+    图报错的任务往往一条检查都没有（`outcomes` 为空），光看通过率会漏掉它，所以单独判。
+    """
     print(MODE_TITLES.get(mode, mode))
     print()
 
@@ -66,12 +77,15 @@ def print_report(
 
     total_checks = passed_checks = 0
     skipped: List[Tuple[Task, EvalResult]] = []
+    all_good = True
     for task, result, workspace in runs:
         if result.skipped:
             skipped.append((task, result))
         outcomes, lines = render_task(task, result, workspace)
         total_checks += len(outcomes)
         passed_checks += sum(1 for o in outcomes if o.passed)
+        if not result.skipped and (not result.ok or any(not o.passed for o in outcomes)):
+            all_good = False
         for line in lines:
             print(line)
 
@@ -87,3 +101,14 @@ def print_report(
         print("跳过的任务（不计入通过率）：")
         for task, result in skipped:
             print(f"  - {task.name}: {result.skip_reason}")
+
+    if not checked:
+        all_good = False
+    print()
+    if all_good:
+        print("结论：通过。")
+    elif not checked:
+        print("结论：不通过——没有任何任务真正跑起来（fixture 缺失或陈旧？先跑 --record 重录）。")
+    else:
+        print("结论：不通过（详见上表逐条失败项）。")
+    return all_good

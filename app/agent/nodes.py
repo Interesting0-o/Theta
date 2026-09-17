@@ -1035,8 +1035,6 @@ _CONTEXT_BUDGET_DEFAULT = 60000
 
 # 归档正文截断上限（字符）
 _NOTE_MAX = 8000
-# 摘要 SystemMessage 的标题头
-
 
 
 def needs_compact(state, budget: int) -> bool:

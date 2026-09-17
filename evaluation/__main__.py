@@ -7,6 +7,9 @@
 前提与 TUI 相同：.env 存在（model.py 顶层 get_settings）、TAVILY 可空。
 安全默认：terminal 与四个联网工具在审批策略层一律拒绝（policy.DEFAULT_DENY_TOOLS），
 文件写入隔离在每任务临时工作区。
+
+**退出码**（层 A 零成本，故可当回归闸门用）：`0` 通过 / `1` 不通过（有检查红、有任务报错、
+或一个任务都没跑成——全 SKIP 也算不通过，见 report.print_report）/ `2` 用法错误（`--task` 名不存在）。
 """
 import argparse
 import asyncio
@@ -40,7 +43,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def main() -> None:
+async def main() -> int:
+    """跑一整批并返回**退出码**（0 通过 / 1 不通过 / 2 用法错误，见模块 docstring）。"""
     args = parse_args()
     mode = MODE_RECORD if args.record else (MODE_LIVE if args.live else MODE_REPLAY)
 
@@ -51,16 +55,17 @@ async def main() -> None:
     )
     if not tasks:
         print(f"未找到任务: {args.task}（现有: {', '.join(t.name for t in EXAMPLE_TASKS)}）")
-        return
+        return 2
 
     runs = await run_suite(tasks, workspace_root=args.workspace_root, mode=mode)
     try:
         # 报告里的检查项要读工作区里的终态文件，所以清理必须在这之后（见 cleanup_workspaces）
-        print_report(runs, mode=mode)
+        ok = print_report(runs, mode=mode)
     finally:
         if not args.keep_workspace:
             cleanup_workspaces(runs)
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

@@ -1,7 +1,7 @@
 """会话域纯数据结构：一个会话（= 一份 checkpoint 库）在列表里的样子。
 
 放 app/schema 的理由同 approval_schema.py / ui_schema.py：**只有属性、可序列化、跨模块**
-（`app/platform/commands/session.py` 产出 → 同包 `__init__.py` 渲染成给用户的文本）。
+（产出与渲染同在 `app/platform/commands/session.py`：它自己把行文本包成 `Notice` 交前端）。
 """
 from dataclasses import dataclass
 

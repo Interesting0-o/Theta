@@ -114,6 +114,43 @@ worker 侧的提问通道（结构性不需要）。
 
 **不阻塞别的**：现在这版（单选 + 补充）已经能用，多选是表达力增量。
 
+## [x] 低危清理第二批 + 评估 CLI 退出码（2026-09-17）
+
+**动机**：两件都是"已有性质没兑现"的收口——① 低危清理是 2026-09-15 减法审计的**剩余清单**
+（清单本身见下「减法审计遗留」）；② 评估的层 A 回放**零成本**却进不了 CI，因为 CLI 没有退出码。
+
+**落地**：
+
+- **评估退出码三档**：`0` 通过 / `1` 不通过 / `2` 用法错误（`--task` 名不存在）。判据收在
+  `evaluation/report.py::print_report` 的**返回值**里（打印与判定同一函数，避免两处口径漂移），
+  三条同时成立才算通过：**检查全过** ∧ **图本身没报错** ∧ **至少有一个任务真跑了**。
+  后两条是刻意加的——它们正是"光看通过率会漏成绿色"的口子：图报错的任务往往一条检查都没有
+  （`0/0` 看着像满分），而全部 SKIP（fixture 缺失/陈旧）更是什么都没验证。SKIP 单条仍不算失败
+  （同"不计入通过率"的口径）。用法侧写在 README「模型行为评估」。
+- **低危清理**：
+  - **重复真相**：`tools.py::PLAN_STATUSES` 改为 `get_args(PlanStatus)` 派生；`known_names` 里
+    `{…} or set(_ORCHESTRATE_TOOL_NAMES)` 的空表兜底**删除**——`_static_tools` 生产恒由构图期
+    传入（`graph.py:101` 组装、`:107` 构造 `SessionToolset`），兜底只会把接线 bug 藏成
+    "编排调用被判成未知工具"，症状更难查；
+  - **校验口径拉齐**（`mcp_service/web_search.py`）：`extract_urls.format` 与
+    `crawl_website.extract_depth` 按各自 docstring 的声明补校验（此前只有
+    `extract_urls.extract_depth`、`crawl_website.max_depth`、`deep_research.model` 有），
+    并删掉空的 `# ... 其他校验 ...` 占位。**`deep_research.citation_format` 不加**：它的
+    docstring 写的是"**如** numbered/mla/apa/chicago"= 举例而非枚举，加了就是凭空收紧。
+  - **恒假条件**：`mcp_service/file_io.py` 的 `if total == 0 or lo > total` 前半删除
+    （`lo ≥ 1` 由上游保证，空文件天然落在 `lo > total` 里）；
+  - **过时注释三处**：`needs_compact` 上方错位的 `_FOLD_HEADER` 注释（它早已搬进类体）、
+    `ui_schema.Notice` 的"**将来的**帮助/会话切换"（早已落地）、`session_schema` 把渲染者指成
+    `commands/__init__.py`（实际是 `commands/session.py` 自己把行文本包成 `Notice`）。
+
+**验证**：新增 `tests/test_eval_report.py`（6 例：通过判据的三种红 + 部分 SKIP 仍绿 + 用法错误
+退出码）；全量 **528 passed / 7 skipped**；层 A 真跑 `python -m evaluation` = 8/8、退出码 `0`，
+`--task nope` 退出码 `2`。
+
+**未做**（都还在「减法审计遗留」的遗留清单里，均低危）：`read_body` 删除（需同步改 4 条用例）、
+`MCPToolSpec.metadata` 去留、`file_io` ↔ `mcp.py::_validate_workspace` 的 `WORKSPACE_PATH` 去重、
+`file_io:699-700` 的 `ext_set`、github server 的 GBK 半防线。
+
 ## [ ] 工具面缺口：一次真实运行的实测（2026-09-13）
 
 **样本**：一个会话、3 轮用户请求（克隆 Luna-Agent → uv 补环境 → 查/拉分支），共 **55 次**工具调用。
@@ -139,7 +176,8 @@ worker 侧的提问通道（结构性不需要）。
    **全部**是这类。
 3. **github skill 结构性地插不上手**：它只有 7 个**只读平台**工具，没有克隆/分支/拉取——那些在核心
    `git_*` 里，而 `git_*` 又不支持上面那些参数。**模型没加载它是对的**（"克隆+补环境"本来就不是
-   GitHub 平台操作）。
+   GitHub 平台操作）。（**数字是当日快照**：七天后的 2026-09-14 三期已长到 **14 只读 + 3 写**，
+   见 `docs/SKILL_DESIGN.md` §13.10；"没有克隆/分支/拉取"这条**结论不变**——那族至今不在技能里。）
 
 **收敛清单（原按日志频次排序）—— ❌ 已整条作废（2026-09-15）**：
 
@@ -173,13 +211,16 @@ ToolMessage 进 history（token，由 compact 折叠兜底）。实测里还有*
 
 **待拍板（两条，二选一或都要）**：
 
-- **① 克隆落点**：`git_clone` 的 `dest` 改成**必填**（审批面板必须看得见落点——现在 `dest` 可空时
-  人只看到 `url`），docstring 写清"**工作区是空的 → 传 `.`**（工作区即项目根：之后每条命令都不必
-  `cd`，画像/记忆/沙箱也都在对的地方）；**工作区已有内容 → 给子目录名**"，回执再点明"这是不是工作区
-  根"。`dest="."` 已验证可用（工作区非空时会被"目标非空"拒掉，回执教它改用子目录名）。
+- ~~**① 克隆落点**：`git_clone` 的 `dest` 改成**必填**~~ —— **已作废（2026-09-15）**：`git_clone`
+  随 `mcp_service/git.py` 一起删了，克隆现在走 `run_command`，**工具面已不存在"落点参数"可改**。
+  原来的两个诉求**都没接住**（2026-09-17 核）：审批面板看得见落点这件事，随工具一起消失
+  （`run_command` 的命令行本来就整条可见，勉强算兑现）；而"工作区空就别套一层子目录"这条
+  **提示词里没有**——`prompt.py:130` 只有一句"**clone 的目标目录要落在工作区内**"，管的是
+  "别越界"，对"落根还是落子目录"**没有口径**。所以 ① 现在要么在 prompt 里补一句，
+  要么只能靠 ② 的机制（后者不依赖模型自觉）。
 - **② 更根本**：空工作区**默认**落根（零操作，但面板看不到落点）；或加 `/workspace <path>` **切换
   工作区**（工作区是"项目容器"时用它；要动基座：关旧运行体 → 换 `ws_key` → 重建图与库），后者顺带
-  解决"TUI 起在了错的目录"。
+  解决"TUI 起在了错的目录"。**这条是现在唯一还成立的解法**——克隆走 shell 之后，②不再有替代品。
 
 **副作用（记在案）**：工作区=项目根时，`/init` 写的 `AGENT.md` 会落进**克隆下来的那个仓库**，成为
 它的未跟踪文件。这跟"在一个项目里起 agent"的常态一样（想不提交就 gitignore），只是值得知道。
@@ -332,9 +373,11 @@ GitPython 起 git 时显式设了 `stdin=(istream or DEVNULL)`，所以**只有 
 "不进 messages"的对应语义）。**"跨轮保留思考"是另一件事**：它要求把思考**逐字原样回传**，
 与"不占历史"直接冲突，要做得重新拍板。
 
-## [~] 技能（skill）：按需加载的"领域包"——**两期均已落地**（见 docs/SKILL_DESIGN.md）
+## [~] 技能（skill）：按需加载的"领域包"——**三期均已落地**（见 docs/SKILL_DESIGN.md）
 
 > **设计已独立成文** → [[docs/SKILL_DESIGN]]。本条只留指针与当前状态，**别再往这里堆内容**。
+> ⚠️ 下面按日期追加，**读最新一条**（`docs/README.md` 的写作约定）——中间那几段标着"当前状态
+> （2026-09-12）"的是当日快照，其中"`skills/github/` 没有 `server.py`、当前是知识型"**已被三期取代**。
 
 一句话：把某个领域要用的**工具**和这个领域的**纪律**打成一包、按需加载。典型 = **GitHub**（推送 /
 PR / issue / 搜索 / 不克隆就读远端代码，外加"先开分支""master 不能随便提"等约束）。差异化在
@@ -474,6 +517,17 @@ turn，处置（未找到 / 过大>5MB / 超 4 张 / 读取失败）写进正文
   只写不读的进程状态、`graph.py` 的 `from app.agent.nodes import *`（连带 31 个无关名灌进建图
   模块的命名空间）、9 处未使用 import。
 
+**2026-09-17 第二批已清**（同属低危，顺手做掉）：逐条改动与验证搬到了独立条目
+「低危清理第二批 + 评估 CLI 退出码（2026-09-17）」，**本节只留"还剩什么没做"**（见下面「遗留」）。
+
+**同时作废（引用的代码已删/早已修，不必再做）**：
+
+- ~~`app/schema/__init__.py` 漏导 `ImageRef` / `SkillPreflight`~~——**早已导出**（`__init__.py:4,10`）；
+- ~~`QueueNode` 空 docstring + 空 `__init__`~~——docstring 已写全（`nodes.py:1014`），且它本就没有 `__init__`；
+- ~~`mcp_service/git.py:110` 的 `_get_repos()` 双扫~~——`git.py` 已于 2026-09-15 整体删除；
+- ~~`file_io._resolve_path` ↔ `git._resolve_repo_path` 逐字同构~~——只剩下面那条 `file_io` /
+  `mcp.py::_validate_workspace` 的两份近亲。
+
 **遗留（均为低危）**：
 
 - **只被测试用的生产函数**：`app/agent/skills.py::read_body`——生产路径走 `get_meta`/`body_of`，
@@ -482,55 +536,48 @@ turn，处置（未找到 / 过大>5MB / 超 4 张 / 读取失败）写进正文
   `tests/test_skills.py` 里 4 条用例的调用。
 - **自我标注的 YAGNI 字段**：`app/schema/agent_schema.py::MCPToolSpec.metadata`（注释自述
   "当前无消费者，保留以备将来"）。留就换成具体计划，删就顺带清 `app/agent/mcp.py` 两处透传。
-- **重复真相**：`app/agent/tools.py:54::PLAN_STATUSES` 与 `agent_schema.py::PlanStatus` Literal
-  是同一份取值表的两处副本（可由 `get_args(PlanStatus)` 派生）；`tools.py:1100` 的
-  `{…} or set(_ORCHESTRATE_TOOL_NAMES)` 右半在生产**永不求值**（同源同内容，只有测试传空表时生效）。
-- **导出缺口**：`app/schema/__init__.py` 漏了 `ImageRef` / `SkillPreflight`，与"app.schema 导出
-  全部纯数据结构"的口径不符（目前全仓都从 `agent_schema` 直连 import，故不报错，
-  但 `from app.schema import ImageRef` 会 ImportError）。
-- **跨文件重复**：`file_io._resolve_path` ↔ `git._resolve_repo_path` 逐字同构；`WORKSPACE_PATH`
-  的"取 env + resolve + 存在性校验 + **同文案** `ConfigError`"在 file_io 与 git 各一份，
-  `app/agent/mcp.py::_validate_workspace` 是第三份近亲。抽到 `mcp_service/utils.py` 即可
-  ——那里没有 import 期 env 校验，两个 server 都能 import（技能侧已 import 它）。
-- **小冗余**：`mcp_service/file_io.py:389` 的 `if total == 0 or lo > total`（`lo ≥ 1` 已被上游
-  保证，前半恒假）；同文件 698-699 的 `ext_set` 两次赋值可合一；
-  `mcp_service/git.py:110` 的 `_get_repos() or _get_repos(refresh=True)` 在未命中时**必然**
-  全量扫两次（缓存为空时的第一次调用尤其白扫）。
-- **校验口径不一**：`mcp_service/web_search.py` 里 `extract_urls` 有取值校验，而同族的
-  `crawl_website.extract_depth` / `format` 没有；同文件另有一处占位注释 `# ... 其他校验 ...`
-  下面是空的。
+- **跨文件重复**：`WORKSPACE_PATH` 的"取 env + resolve + 存在性校验 + **同文案** `ConfigError`"
+  在 `mcp_service/file_io.py`（import 期校验）与 `app/agent/mcp.py::_validate_workspace`（构图期）
+  各一份。抽到 `mcp_service/utils.py` 前先想清楚：file_io 那份是 **import 期**触发的，搬过去会
+  把"import 即校验"也一起搬走——要么只抽纯函数（校验时机留在各调用点），要么显式拍板改时机。
+- **小冗余**：`mcp_service/file_io.py:699-700` 的 `ext_set` 两次赋值可合一
+  （`(e if e.startswith(".") else f".{e}").lower()` 一次到位）。
 - **远端 GBK**：`skills/github/server.py::github_file_read` 只做了二进制那半防线（NUL 探测），
   GBK 文本仍会 `errors="replace"` 成一片替换字符喂给模型——本地 `read_file` 2026-09-14 已补
   第二半，这里是漏掉的孪生。
-- **过时注释**：`app/agent/nodes.py` 的 `QueueNode` 空 docstring + 空 `__init__`（与不写等价），
-  以及 `needs_compact` 上方一条与被注释物错位（描述 `_FOLD_HEADER`，而它早已搬进类体）；
-  `app/schema/ui_schema.py` 的"**将来的**帮助/会话切换"（早已落地）；`app/schema/session_schema.py`
-  把渲染者指成 `commands/__init__.py`（实际在 `session.py` 自己）。
 
-**待拍（一条）**：`app/agent/tools.py:785` 的 `meta.name != meta.dir_name` 分支**生产不可达**
+**待拍（一条）**：`app/agent/tools.py:872` 的 `meta.name != meta.dir_name` 分支**生产不可达**
 （扫盘期已保证能力型两者相等），但 `tests/test_skill_runtime.py:467` 自述是"安全网…即便拿到
 构造出来的 meta，加载期也必须拒绝"。二选一：① 删掉该分支 + 同步删那条用例；② 按安全网保留
 ——保留的话请在注释里点明它不可达，并修掉 `app/agent/skills.py:174` 那处把校验位置指向
 "get_skill 的校验"的指针（实际执行处是**扫描期**）。
 
-## [ ] 评估框架的已知缺口（2026-09-16 记）
+## [ ] 评估框架的已知缺口（2026-09-16 记，09-17 更新）
 
 **背景**：2026-09-16 给 `evaluation/` 补了**层 A 录制回放**（零 token，拿真实录制的模型输出当
 固定输入样本，断言"除模型之外的一切"没变）与**闸门策略能力**（`deny_all` / `scripted` /
 `allow_except(answers=…)`），默认命令从此不花钱。用法与两条层的分工见 README「模型行为评估」。
-下面四件事当时**显式没做**，记在这里免得下次重新勘察：
+下面的事当时**显式没做**（2026-09-17 又核出"C 仓库里还没有 CI"一条），记在这里免得下次重新勘察：
 
 - **任务集与断言覆盖面**：示例任务只有 3 个（读 / 写 / 计划），断言工厂只有 6 个。未覆盖：拒绝
   路径之后模型怎么办、`ask_user` 提问闸门、长期记忆写入、技能加载、`dispatch_subtasks`、compact
   触发。**策略侧已经能表达了**（`deny_all()` 测拒绝、"`allow_except(answers=[…])`" 答提问），
   缺的只是任务与断言本身。
 - **量化与闸门**：`EvalResult` 只记次数与耗时，**不记 token**（要从 `AIMessage.response_metadata`
-  聚合）；`__main__` **没有退出码**，所以这套默认零成本的评估目前**进不了 CI**——"零成本"这个
-  性质还没兑现成"能自动拦住回归"。基线快照对比（本次 vs 上次）同样没做。
+  聚合）。~~`__main__` 没有退出码，进不了 CI~~ **[已落地 2026-09-17]**：退出码三档
+  （`0` 通过 / `1` 不通过 / `2` 用法错误），判据与理由记在独立条目
+  「低危清理第二批 + 评估 CLI 退出码（2026-09-17）」。**仍缺两件**：① 上面这条 token 聚合；
+  ② **基线快照对比（本次 vs 上次）**——退出码能拦"变红"，还拦不住"悄悄变慢、审批变多"。
+- **仓库里还没有 CI**（2026-09-17 核）：**有了退出码 ≠ 接进了 CI**——全仓一个 CI 配置文件都没有
+  （既无 `.github/` 也无 `.gitlab-ci.yml`）。真要把层 A 当回归闸门，缺的是那条流水线本身
+  （跑 `python -m evaluation` 吃它的退出码；顺带跑 `-m pytest` 的 528 例——**注意测试那两条前提**：
+  必须 `python -m pytest`、且 `WORKSPACE_PATH` 要经 `WSLENV` 传对，见 README / CLAUDE.md）。
 - **按工作区复用编译图**：每任务建一次图、各拉一组 MCP 子进程（`runner.py` 模块 docstring 的 TODO）。
 - **evaluation/ 自己的测试仍不完整**：同日补了 `tests/test_eval_{policy,fixtures,runner}.py`（策略
-  语义 / fixture 读写与指纹 / SKIP 装配与清理顺序），但**真图回放**只有 `python -m evaluation`
-  手工跑——没有人守着"回放这条路本身没坏"。
+  语义 / fixture 读写与指纹 / SKIP 装配与清理顺序），2026-09-17 又补了 `tests/test_eval_report.py`
+  （通过判据的三种红 + 用法错误退出码），但**真图回放**只有 `python -m evaluation` 手工跑
+  ——没有人守着"回放这条路本身没坏"（这是最值得补的一环：它是唯一能守住
+  "回放≠坏掉"的手段，且零成本）。
 
 **顺带修掉的既有 bug（同日）**：`run_suite` 曾在返回前就 `rmtree` 掉临时工作区，而检查项要到报告
 阶段才跑——于是**文件类断言恒失败**（`--keep-workspace` 时 8/8、默认 6/8）。清理已挪到

@@ -30,7 +30,7 @@ from datetime import date
 from functools import lru_cache
 from importlib.machinery import PathFinder
 from pathlib import Path
-from typing import Annotated, List
+from typing import Annotated, List, get_args
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, InjectedToolArg, InjectedToolCallId, tool
@@ -48,10 +48,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 logger = logging.getLogger(__name__)
 
 
-
-
-# 计划步骤允许的状态取值（与 PlanStatus Literal 保持一致）
-PLAN_STATUSES: tuple[str, ...] = ("pending", "in_progress", "done")
+# 计划步骤允许的状态取值——**从 PlanStatus 派生**，不另抄一份（同源才能保证校验与类型不漂移）
+PLAN_STATUSES: tuple[str, ...] = get_args(PlanStatus)
 
 # ------------------------- worker（子 agent）可用工具子集 -------------------------
 # worker 定位 = 主 agent 的并发资料收集助手，其可用工具按 tool.json 过滤：
@@ -1187,7 +1185,10 @@ class SessionToolset:
     def known_names(self, state: AgentState) -> set[str]:
         """给 ReviewNode：当前工具表里的名字集合（含编排工具）。同步、纯内存。"""
         session = state.get("session_id")
-        static = {tool.name for tool in self._static_tools} or set(_ORCHESTRATE_TOOL_NAMES)
+        # `_static_tools` 生产恒为构图期传入的那张表（graph.py），恒非空——不设空表兜底：
+        # 真出现空表是接线错了，兜底只会把 bug 藏起来（`known_names` 少名字 → 编排调用被判成
+        # "未知工具"，症状比这里直接暴露更难查）。
+        static = {tool.name for tool in self._static_tools}
         return mcp.session_tool_names(self.workspace, session) | static
 
     async def _reconcile(self, state: AgentState, session: str | None) -> None:

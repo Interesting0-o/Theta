@@ -105,10 +105,11 @@ async def extract_urls(
         format (str): 输出格式,"markdown"或"text",默认为"markdown"
         query (str): 一个查询字符串，用于在提取时过滤和优先处理与查询相关的内容,默认为None
     """
-    # 参数校验
+    # 参数校验：docstring 声明了取值的参数都在这里拦（口径同 crawl_website / deep_research）
     if extract_depth not in ["basic", "advanced"]:
         raise InvalidArgumentError("extract_depth must be 'basic' or 'advanced'")
-    # ... 其他校验 ...
+    if format not in ["markdown", "text"]:
+        raise InvalidArgumentError("format must be 'markdown' or 'text'")
 
     # 每次调用动态创建工具实例
     tool = TavilyExtract(
@@ -148,9 +149,11 @@ async def crawl_website(
         extract_depth (str): 提取深度,只允许"basic", "advanced"默认"basic"
         instructions (str): 爬取指令,默认为None
     """
-    # 参数校验
+    # 参数校验：docstring 声明了取值的参数都在这里拦（口径同 extract_urls / deep_research）
     if max_depth < 1:
         raise InvalidArgumentError("max_depth must be at least 1")
+    if extract_depth not in ["basic", "advanced"]:
+        raise InvalidArgumentError("extract_depth must be 'basic' or 'advanced'")
 
     tool = TavilyCrawl(
         api_key=TAVILY_API_KEY,

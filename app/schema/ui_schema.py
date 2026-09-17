@@ -40,7 +40,7 @@ class TurnFailed:
 
 @dataclass(frozen=True)
 class Notice:
-    """基座主动对用户说的一句话（控制面命令的回显：未识别命令提示、将来的帮助/会话切换）。
+    """基座主动对用户说的一句话（控制面命令的回显：`/help`、`/list session`、未识别命令提示）。
 
     单独成一个事件而不是复用 TurnFinished：它不是某轮对话的产物，而是基座自己的输出
     ——前端按"提示"渲染，别与模型答复混为一谈。
