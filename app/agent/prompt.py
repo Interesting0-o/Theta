@@ -20,6 +20,7 @@ worker 只有**项目画像与长期记忆两样**不注入（`inject_session_co
 loaded_skills 天然为空，所以一样不会出现。
 见 app/agent/nodes.py::LLMNode.__call__。
 """
+from pathlib import Path
 
 SYSTEM_PROMPT = """\
 你是 Theta——一个运行在 LangGraph 状态机上的编码助手智能体。你会被逐轮推进：
@@ -321,4 +322,27 @@ def workspace_context_block(workspace_path: str) -> str:
         "- 注意：终端执行并没有被沙箱锁死——用 `cd ..` 或绝对路径仍可触达工作区之外"
         "（包括 Theta 源码所在的项目根）。执行 rm / mv / 删除目录 / git reset --hard "
         "等破坏性命令前，先 `pwd` 确认当前位置与目标路径，不要波及工作区之外的重要文件。"
+    )
+
+
+# 工作区根的交接材料文件名（project-handoff 技能的保存落点，见 skills/project-handoff/SKILL.md）
+HANDOFF_MD_FILENAME = "HANDOFF.md"
+
+_HANDOFF_POINTER_HEADER = "# 交接材料（工作区根 HANDOFF.md）\n\n"
+
+
+def handoff_pointer_block(workspace_path: str) -> str:
+    """工作区根存在 HANDOFF.md（project-handoff 技能的交接材料）时，注入一段指针。
+
+    只 stat 文件、**不读正文**——正文由模型按需 read_file 取回（口径同画像/记忆的
+    "文件即真值"：注入的是"它存在"这个事实，不是内容）。没有 → ""（不注入）。
+    新会话由此知道"有交接可接"；这正是 project-handoff 技能"提醒 → 保存 → 接续"
+    三步里"接续"的入口。调用方：LLMNode 每轮 to_thread 里跑（blockbuster 不拦线程内阻塞）。
+    """
+    if not (Path(workspace_path) / HANDOFF_MD_FILENAME).is_file():
+        return ""
+    return (
+        _HANDOFF_POINTER_HEADER
+        + "工作区根有一份跨会话交接材料（HANDOFF.md，由 project-handoff 技能整理）。"
+        "若用户要接续之前的工作，先 read_file 读它再动工；若它明显过时，可在下次交接时整份重写。"
     )

@@ -18,7 +18,7 @@ from app.agent.memory import memory_block
 from app.agent.skills import skills_block
 from app.agent.state import AgentState
 from app.agent.utils import coerce_tool_result, format_tool_result
-from app.agent.prompt import SYSTEM_PROMPT, workspace_context_block
+from app.agent.prompt import SYSTEM_PROMPT, handoff_pointer_block, workspace_context_block
 from app.schema.agent_schema import ImageRef, NoteEntry, PlanStep
 from app.schema.approval_schema import GATE_ASK_USER, GATE_TOOL_APPROVAL
 
@@ -188,6 +188,11 @@ class LLMNode:
             block = await asyncio.to_thread(memory_block, self.workspace_path)
             if block:
                 system_messages.append(SystemMessage(content=block))
+            # 交接材料指针（project-handoff 技能的"接续"入口）：只 stat 存在性、不读正文，
+            # 正文由模型按需 read_file。新会话靠这一行知道"有交接可接"。
+            pointer = await asyncio.to_thread(handoff_pointer_block, self.workspace_path)
+            if pointer:
+                system_messages.append(SystemMessage(content=pointer))
 
         # 技能正文**独立于 inject_session_context**：它不是"这个项目/用户是谁"那类会话背景，
         # 而是模型自己按需取来的领域纪律。worker 没有 get_skill，loaded_skills 天然为空，
