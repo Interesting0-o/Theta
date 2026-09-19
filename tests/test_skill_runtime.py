@@ -59,12 +59,23 @@ def skills_dir(tmp_path, monkeypatch) -> Path:
 
 
 def _fake_cfg(monkeypatch, mapping: dict[str, str]) -> None:
-    """把 tool.json 换成 {工具名: source} 的假表（校验缝见 tools._tool_config）。"""
-    monkeypatch.setattr(
-        tools_module,
-        "_tool_config",
-        lambda: {name: {"need_review": False, "source": src} for name, src in mapping.items()},
-    )
+    """把"审批登记"落成各技能目录自己的 skill.json（2026-09-19 起声明随技能走）。
+
+    mapping 保留旧形状 {工具名: "skills/<目录>"}（source 值不再参与判定，只用来定位目录），
+    逐条写成 {"need_review": false}——要测 need_review:true / 形状错误，直接改那个目录的
+    skill.json。monkeypatch 参数仅为调用点兼容保留，这里什么都不 patch（读盘不缓存，
+    _check_skill_tools 每次加载都重新读文件）。
+    """
+    by_dir: dict[str, dict] = {}
+    for name, source in mapping.items():
+        by_dir.setdefault(source.split("/")[-1], {})[name] = {"need_review": False}
+    for dir_name, tool_decls in by_dir.items():
+        path = skills.SKILLS_DIR / dir_name / "skill.json"
+        config = {}
+        if path.is_file():
+            config = json.loads(path.read_text(encoding="utf-8"))
+        config["tools"] = tool_decls
+        path.write_text(json.dumps(config), encoding="utf-8")
 
 
 def _fake_specs(monkeypatch, mapping: dict[str, list[str]]) -> list[str]:
@@ -182,7 +193,7 @@ def test_reload_reraises_missing_runtime(skills_dir, monkeypatch):
 
 
 def test_reload_reports_reason_when_runtime_cannot_be_rebuilt(skills_dir, monkeypatch):
-    """重试仍失败 → 回的是**可行动的原因**（工具没登记），不是干巴巴的"已在加载中"。"""
+    """重试仍失败 → 回的是**可行动的原因**（工具没声明），不是干巴巴的"已在加载中"。"""
     mcp._reset_pools_for_tests()
     _make_skill(skills_dir, "demo")
     _fake_cfg(monkeypatch, {"demo_tool": "skills/demo"})
@@ -191,10 +202,10 @@ def test_reload_reports_reason_when_runtime_cannot_be_rebuilt(skills_dir, monkey
     _load("demo")
 
     mcp._EXTRA_TOOLS.clear()
-    _fake_cfg(monkeypatch, {})  # 工具登记被撤掉（等价于 tool.json 没登记）
+    (skills_dir / "demo" / "skill.json").write_text("{}", encoding="utf-8")  # 声明被撤掉
     out = _load("demo", ["demo"])
 
-    assert "tool.json" in out["messages"][0].content
+    assert "skill.json" in out["messages"][0].content
     assert "重新拉起" not in out["messages"][0].content
 
 
@@ -257,7 +268,6 @@ def test_startup_failure_receipt_carries_child_traceback(monkeypatch, tmp_path):
     monkeypatch.setattr(
         mcp_module, "PROJECT_ROOT", f"{_FIXTURE_ROOT}{os.pathsep}{mcp_module.PROJECT_ROOT}"
     )
-    _fake_cfg(monkeypatch, {"broken_tool": "skills_pkg/broken"})
     _fake_settings(monkeypatch)
 
     out = asyncio.run(
@@ -407,10 +417,10 @@ def test_knowledge_skill_registers_nothing(skills_dir, monkeypatch):
 
 
 def test_unregistered_tool_is_rejected_with_actionable_receipt(skills_dir, monkeypatch):
-    """工具没在 tool.json 登记（或 source 不对）→ **拒绝加载**，且不留半截状态。"""
+    """工具没在技能自己的 skill.json 里声明（或形状不对）→ **拒绝加载**，且不留半截状态。"""
     mcp._reset_pools_for_tests()
     _make_skill(skills_dir, "demo")
-    _fake_cfg(monkeypatch, {})  # 表里什么都没有
+    _fake_cfg(monkeypatch, {})  # 什么都不声明
     _fake_specs(monkeypatch, {"skills/demo": ["demo_tool"]})
     _fake_settings(monkeypatch)
 
@@ -418,11 +428,92 @@ def test_unregistered_tool_is_rejected_with_actionable_receipt(skills_dir, monke
 
     assert list(out) == ["messages"]  # 没有 loaded_skills
     content = out["messages"][0].content
-    assert "demo_tool" in content and "skills/demo" in content and "tool.json" in content
+    assert "demo_tool" in content and "skill.json" in content
     assert mcp.registered_servers(_WS, _SESSION) == set()  # 回滚干净：没留下工具
     assert mcp.session_tool_names(_WS, _SESSION) == set()
     # 版本会前进两格（注册 +1、回滚注销再 +1）——它只是"该重绑了"的信号，不参与任何判定，
     # 多推一格换来"回滚路径不搞特例"，这是划算的；这里不复位，就是为了把这条口径钉住。
+
+
+def test_declared_but_unexposed_tool_is_rejected(skills_dir, monkeypatch):
+    """声明了 server 没暴露的工具 → 拒绝（拼错名字的静默形态：政策看似有、工具实不存在）。"""
+    mcp._reset_pools_for_tests()
+    _make_skill(skills_dir, "demo")
+    (skills_dir / "demo" / "skill.json").write_text(
+        json.dumps(
+            {
+                "tools": {
+                    "demo_tool": {"need_review": False},
+                    "ghost_tool": {"need_review": False},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _fake_specs(monkeypatch, {"skills/demo": ["demo_tool"]})
+    _fake_settings(monkeypatch)
+
+    out = _load("demo")
+
+    content = out["messages"][0].content
+    assert "ghost_tool" in content and "没有暴露" in content
+    assert "loaded_skills" not in out
+
+
+def test_bad_shape_declaration_is_rejected(skills_dir, monkeypatch):
+    """need_review 不是布尔 → 拒绝（fail-closed：宁可不加载，不留一个政策含糊的工具）。"""
+    mcp._reset_pools_for_tests()
+    _make_skill(skills_dir, "demo")
+    (skills_dir / "demo" / "skill.json").write_text(
+        json.dumps({"tools": {"demo_tool": {"need_review": "yes"}}}),
+        encoding="utf-8",
+    )
+    _fake_specs(monkeypatch, {"skills/demo": ["demo_tool"]})
+    _fake_settings(monkeypatch)
+
+    out = _load("demo")
+
+    content = out["messages"][0].content
+    assert "形状不对" in content and "demo_tool" in content
+    assert "loaded_skills" not in out
+
+
+def test_review_node_resolves_skill_declaration(skills_dir, monkeypatch):
+    """ReviewNode 两级查询：技能声明生效、内置表优先、"在表里却两头无政策"仍 fail-closed。"""
+    from app.agent.nodes import ReviewNode
+
+    class _StubToolset:
+        def known_names(self, state):
+            return {"demo_tool", "walled_tool", "mystery_tool"}
+
+    _make_skill(skills_dir, "demo")
+    _make_skill(skills_dir, "walled")
+    _fake_cfg(monkeypatch, {"demo_tool": "skills/demo", "walled_tool": "skills/walled"})
+    # 把 walled 的声明改成 need_review:true（_fake_cfg 只会写 false）
+    walled_json = skills_dir / "walled" / "skill.json"
+    walled_json.write_text(
+        json.dumps({"tools": {"walled_tool": {"need_review": True}}}), encoding="utf-8"
+    )
+
+    node = ReviewNode(toolset=_StubToolset())
+    demo_state = {"loaded_skills": ["demo"]}
+
+    # 技能声明 need_review:false → free；need_review:true → review
+    assert node._decide("demo_tool", node._tool_cfg("demo_tool", demo_state), demo_state) == "free"
+    walled_state = {"loaded_skills": ["walled"]}
+    assert (
+        node._decide("walled_tool", node._tool_cfg("walled_tool", walled_state), walled_state)
+        == "review"
+    )
+    # 在工具表里、却两头都没有政策 → 第二道防线兜住（review，不静默放行）
+    assert node._decide("mystery_tool", node._tool_cfg("mystery_tool", demo_state), demo_state) == "review"
+
+    # 内置表优先：同名条目以 tool.json 为准（加载期重名已拒载，这是防御性口径）
+    node.tool_review = {"demo_tool": {"need_review": True, "source": "mcp_service/x"}}
+    assert node._tool_cfg("demo_tool", demo_state) == {
+        "need_review": True,
+        "source": "mcp_service/x",
+    }
 
 
 def test_missing_env_is_rejected_before_any_spawn(skills_dir, monkeypatch):
@@ -494,7 +585,7 @@ def test_clashing_tool_names_are_rejected(skills_dir, monkeypatch):
     """与编排工具同名、或与已加载技能的工具同名 → 拒绝（同名让审批与模型都无法区分两者）。"""
     mcp._reset_pools_for_tests()
     _make_skill(skills_dir, "demo")
-    _fake_cfg(monkeypatch, {"get_skill": "orchestrate", "demo_tool": "skills/demo"})
+    _fake_cfg(monkeypatch, {"demo_tool": "skills/demo"})
     _fake_specs(monkeypatch, {"skills/demo": ["get_skill"]})
     _fake_settings(monkeypatch)
 
@@ -628,7 +719,7 @@ def test_reconcile_failed_rebuild_backs_off(skills_dir, monkeypatch, caplog):
     """
     mcp._reset_pools_for_tests()
     _make_skill(skills_dir, "demo")
-    monkeypatch.setattr(tools_module, "_tool_config", lambda: {})  # 工具没登记 → 必失败
+    # 技能没写 skill.json 的 tools 声明（_make_skill 默认）→ 校验必失败
     calls: list[str] = []
 
     async def fake(workspace, server, connection):
@@ -667,7 +758,7 @@ def test_reconcile_failed_backoff_is_per_session(skills_dir, monkeypatch):
     """
     mcp._reset_pools_for_tests()
     _make_skill(skills_dir, "demo")
-    monkeypatch.setattr(tools_module, "_tool_config", lambda: {})  # 工具没登记 → 必失败
+    # 技能没写 skill.json 的 tools 声明（_make_skill 默认）→ 校验必失败
     calls: list[str] = []
 
     async def fake(workspace, server, connection):
@@ -817,7 +908,7 @@ def test_real_skill_server_spawns_serves_tools_and_is_reaped(tmp_path, monkeypat
     _real_root = mcp_module.PROJECT_ROOT
     # 子进程的 PYTHONPATH 要同时含两个根：fixture 根（找 skills_pkg）+ 真实项目根（找 app/mcp_service）
     monkeypatch.setattr(mcp_module, "PROJECT_ROOT", f"{_FIXTURE_ROOT}{os.pathsep}{_real_root}")
-    _fake_cfg(monkeypatch, {"demo_echo": "skills_pkg/echo"})
+    # 审批声明在 fixture 自己的 skill.json 里（tests/fixtures/skills_pkg/echo/skill.json），不在这写
     _fake_settings(monkeypatch)
 
     workspace = str(tmp_path)

@@ -20,7 +20,7 @@
 
 **Skill = 按需加载的"领域包"**：把某个领域要用的**工具**和这个领域的**纪律**打成一包，平时既不占上下文、也不起进程，需要时才整个拉进来。
 
-**本设计的差异化只有一处**：**约束三分法**——软约束走 `SKILL.md` 正文（host 读取、加载期注入系统提示）、硬闸门走 `tool.json`、结构性拒绝**写死在工具里**。这一条写不清楚，skill 就塌缩成"`opencode-lazy-loader` 的重新实现"（§7）。
+**本设计的差异化只有一处**：**约束三分法**——软约束走 `SKILL.md` 正文（host 读取、加载期注入系统提示）、硬闸门走审批声明（**2026-09-19 修订：技能自带工具的 `need_review` 声明在技能目录自己的 `skill.json`，见 §13.11；`tool.json` 只管内置 MCP 工具与编排工具**）、结构性拒绝**写死在工具里**。这一条写不清楚，skill 就塌缩成"`opencode-lazy-loader` 的重新实现"（§7）。
 
 ---
 
@@ -186,13 +186,13 @@
 | 种类 | 例子 | 落点 | 强度 |
 | --- | --- | --- | --- |
 | **方法 / 行动指导** | "推送前先开分支""PR 描述写清动机与验证" | **`SKILL.md` 正文**（host 读取，加载期经 state 注入系统提示，§3.5） | 软：模型读了照做，可被忽略 |
-| **审批闸门** | "合并 PR 必须人批""推送要人点头" | **`tool.json` `need_review: true` → interrupt** | 硬：结构性挂起 |
+| **审批闸门** | "合并 PR 必须人批""推送要人点头" | **技能自带工具：`skill.json` `tools` 段声明 `need_review: true` → interrupt；内置工具：`tool.json`** | 硬：结构性挂起 |
 | **结构性拒绝** | "master / protected 分支不许直接提交" | **工具内部直接拒绝**（`InvalidArgumentError`） | 最硬：压根不问人 |
 
 - 第二、三类**绝不能只写进 `SKILL.md` 正文**——那等于把闸门降级成提示词纪律，与本项目"写操作要点头是**结构性前提**、不是提示词纪律"的立身之本相悖（同 [[docs/TODO]]「验证门」那条的结论）。
 - 第三类有**现成先例可抄**：`mcp_service/terminal.py::_deny_sudo` `[已落地]` 在 spawn 前直接 raise——"不做提权"是结构性的，不是问人。`github_push` 判定目标是 protected branch 就该照此直接拒。
-- **所以：skill 的硬约束 = 它的 `tool.json` 登记行 + 工具内的拒绝逻辑；`SKILL.md` 正文只装软的那半。**
-- **skill 不得自己造审批**：skill 只是"把工具与指导一起送到"，**不得**声明"用了本 skill 就免审"——决定权仍在 `tool.json` 与闸门（同 [[docs/TODO]]「反思节点」那条纪律）。
+- **所以：skill 的硬约束 = 它的 `skill.json` 声明行（§13.11）+ 工具内的拒绝逻辑；`SKILL.md` 正文只装软的那半。**
+- **skill 不得自己造审批**：skill 只是"把工具与指导一起送到"，**不得**声明"用了本 skill 就免审"——决定权仍在审批声明与闸门（同 [[docs/TODO]]「反思节点」那条纪律）。**自报政策的信任前提是技能源 first-party（同仓库）**：若将来开放外部技能源，外部技能的政策声明 host 不认、一律按 `need_review: true` 兜底。
 
 ---
 
@@ -889,3 +889,25 @@ issue / PR 通吃的**对话楼层**，带楼层号与翻页）与 `github_pr_re
 | `app/platform/commands/prompts.py` | `/init`、`/fast readme` 载荷——§10 待收敛 |
 | `docs/MULTI_AGENT.md` §6 | "子 agent 写权限下放"是 §6 的前置里程碑 |
 | `docs/TODO.md`「反思节点」 | 与本文 §6 打通：fork 本身就是反思载体 |
+
+### 13.11 修订：审批声明随技能走（2026-09-19）
+
+技能自带工具的 `need_review` 从中心表 `tool.json` **搬到技能目录自己的 `skill.json`**（新键
+`tools`：`{"<tool_name>": {"need_review": bool}}`）。动机：约束三分法的收尾——软约束在
+SKILL.md、能力声明与硬闸门在 skill.json（env / requirements / preflight 早就在那儿），
+**加技能 = 落一个目录**，不再需要动中心文件；`tool.json` 回归"内置 MCP 工具 + 编排工具 +
+worker 下放规则"这些 host 结构性决定。
+
+- **fail-closed 强度不变，且从单向变三向**（`tools.py::_check_skill_tools`，加载期）：
+  server 暴露的工具没声明 → 拒载（原契约）；声明形状不对（`need_review` 非布尔）→ 拒载；
+  声明了 server 没暴露的工具 → 拒载（拼错名字的静默形态——旧中心表结构上查不出这一向）。
+- **ReviewNode 两级查询**（`_tool_cfg`）：内置表优先，其次已加载技能的声明；"在工具表里却
+  两头无政策"仍判 review（§13.4 的第二道防线原样保留）。声明**读盘不缓存**——改 skill.json
+  重新 get_skill 即可，不必重启进程（比旧 tool.json 的"改完要重启"还少一步）。
+- **信任条款**：自报政策可信的前提是**技能源 first-party（同仓库）**。若将来开放外部技能源，
+  外部技能的政策声明 host 不认、一律按 `need_review: true` 兜底——这条写在 §2.2 的"不得自己
+  造审批"旁边，是同一纪律的另一面。
+- worker 规则（`worker_allow`）、编排工具的 `source` 分流、内置工具政策**留 tool.json**——
+  那些是 host 的结构性决定，不随技能走。技能工具本来就被 worker 结构性排除，不受影响。
+- 迁移：`skills/github/skill.json` 声明全部 17 条（14 免审 + 3 写），`tool.json` 相应删去
+  17 行；`tests/fixtures/skills_pkg/echo/skill.json` 随 fixture 落一份。

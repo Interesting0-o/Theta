@@ -8,12 +8,12 @@
   echo 夹具（无 env、无网络、无凭证）；
 - **本文件**补中间那段**真技能**的链路：真 spawn 子进程 → 凭证经 `skill_env` 转发进子进程
   （server 在 **import 期**就要求 `GITHUB_TOKEN`，缺了它进程直接起不来——所以"加载成功"本身
-  就是"凭证转发通了"的证明）→ server 真暴露的工具名与 `app/agent/tool.json` 的登记**逐字一致**
+  就是"凭证转发通了"的证明）→ server 真暴露的工具名与技能 `skill.json` 的声明**逐字一致**
   → 工具真能经 shim 取到数据、上游失败真被分类成 `upstream_error` 回传给模型、写工具真发得出 POST。
 
 **不联网**：`GITHUB_API_URL` 与体检端点都指向本进程起的 stdlib HTTP 桩。技能 server 在**子进程**里，进程内
 monkeypatch `_request` 打不到它（那正是上面第一条测试走的另一条路），所以只能从"地址"这一侧
-给缝。**用真的 `skills/` 源与真的 `tool.json`**——那两样正是要验证的东西，一条都不许假掉。
+给缝。**用真的 `skills/` 源与真的 `skill.json`**——那两样正是要验证的东西，一条都不许假掉。
 """
 import asyncio
 import json
@@ -33,7 +33,7 @@ from app.agent.utils import format_tool_result
 from app.schema.agent_schema import SkillPreflight
 
 _SESSION = "github-e2e"
-_TOOL_JSON = Path(tools_module.__file__).with_name("tool.json")
+_SKILL_JSON = Path(tools_module.__file__).parent.parent.parent / "skills" / "github" / "skill.json"
 
 # 桩返回的仓库元信息：字段与 `github_repo_view` 的 render 一一对应
 _REPO_BODY = {
@@ -50,10 +50,9 @@ _REPO_BODY = {
 
 
 def _expected_github_tools() -> set[str]:
-    """`tool.json` 里登记为 `skills/github` 的工具名（真表，不假）。"""
-    with _TOOL_JSON.open("r", encoding="utf-8") as file:
-        cfg = json.load(file)
-    return {name for name, conf in cfg.items() if conf.get("source") == "skills/github"}
+    """技能 `skill.json` 里声明的工具名（真表，不假——2026-09-19 起审批声明随技能走）。"""
+    cfg = json.loads(_SKILL_JSON.read_text(encoding="utf-8"))
+    return set(cfg.get("tools") or {})
 
 
 @pytest.fixture
@@ -158,8 +157,8 @@ def test_get_skill_github_spawns_real_server_and_serves_tools(github_api, tmp_pa
             receipt = out["messages"][0].content
             assert "凭证体检" in receipt and "可用" in receipt, receipt
 
-            # ① 技能真暴露的工具名 == tool.json 的登记（§13.3 最后一关"工具名"的端到端版本：
-            #    加工具忘了登记、或登记了不存在的工具，都在这里红）
+            # ① 技能真暴露的工具名 == skill.json 的声明（§13.3 最后一关"工具名"的端到端版本：
+            #    加工具忘了声明、或声明了不存在的工具，都在这里红）
             loaded_names = {n for n in mcp.session_tool_names(workspace, _SESSION) if n.startswith("github_")}
             assert loaded_names == _expected_github_tools()
             assert len(loaded_names) == 17

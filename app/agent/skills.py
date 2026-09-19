@@ -301,6 +301,24 @@ def read_preflight(meta: SkillMeta) -> SkillPreflight | None:
     return SkillPreflight(url=url, bearer_env=bearer_env)
 
 
+def read_tool_policies(meta: SkillMeta) -> dict:
+    """读技能为**它自带工具**声明的审批策略（`skill.json` 的 `tools` 键）；未声明 / 不是对象 → {}。
+
+    2026-09-19 起，技能自带工具的 `need_review` 改在技能目录的 skill.json 里声明
+    （约束跟能力走：软约束在 SKILL.md 正文、能力声明与硬闸门在 skill.json）；`tool.json`
+    只管内置 MCP 工具与编排工具。本函数只做**解析**：fail-closed 校验（server 暴露的工具
+    必须逐条声明）在 `tools.py::_check_skill_tools`，查询在 `ReviewNode._tool_cfg`。
+    形状：`{"<tool_name>": {"need_review": bool}}`。
+    """
+    raw = _read_skill_config(meta).get("tools")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("技能 %s 的 tools 不是对象，按未声明处理：%r", meta.name, raw)
+        return {}
+    return raw
+
+
 def body_of(meta: SkillMeta) -> str | None:
     """读某个已解析技能的正文（已剥 frontmatter）；读取失败 → None。"""
     try:

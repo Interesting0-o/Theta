@@ -179,6 +179,33 @@ checkpoint 里，长期记忆又只收"约束/偏好/项目事实"、不收**任
 **相关背景**：docs/SKILL_DESIGN.md §11（知识型通道）、上文「运行中 compact」（压缩锚点若
 落地，本技能触发点可搭同一班车）、「长期记忆分层化」（交接材料落点的分层语义别打架）。
 
+## [x] 技能工具的审批声明随技能走：tool.json → skill.json（2026-09-19）
+
+**动机**：用户问"既然技能工具的存在性随技能走（加载出现、卸载消失），为什么审批策略反而
+放在中心的 tool.json？"——约束三分法确实没收尾：软约束在 SKILL.md、env/requirements/
+preflight 声明在 skill.json，唯独硬闸门要跑中心表登记，加技能得动两处。拍板：**搬到
+skill.json**（同日）。
+
+**落地**（详见 docs/SKILL_DESIGN.md §13.11）：
+
+- `skill.json` 新键 `tools`：`{"<tool_name>": {"need_review": bool}}`；
+  `skills.py::read_tool_policies` 是解析单点。
+- `_check_skill_tools` 从"查 tool.json 的 source"改为三向校验：**暴露未声明 → 拒载**（原
+  fail-closed 契约）；**声明形状不对 → 拒载**；**声明了没暴露的工具 → 拒载**（拼错名字的
+  静默形态——旧中心表结构上查不出这一向）。
+- `ReviewNode._tool_cfg` 两级查询：内置表优先 → 已加载技能的声明；`_decide` 的第二道防线
+  改为"在工具表里却**两头**无政策 → review"（原语义保留）。读盘不缓存：改 skill.json
+  **重新 get_skill 即可**，比旧 tool.json 的"改完要重启"少一步。
+- **留 tool.json 的**：内置 MCP 工具政策、编排工具 `source` 分流、worker 的 `worker_allow`
+  ——host 的结构性决定不随技能走。
+- **信任条款**：自报政策可信的前提是技能源 first-party（同仓库）；将来开放外部技能源时，
+  外部声明 host 不认、一律 `need_review: true` 兜底。
+- **迁移**：github 17 条（14 免审 + 3 写）搬进 `skills/github/skill.json`；echo fixture
+  落 `tests/fixtures/skills_pkg/echo/skill.json`。
+- **验证**：`tests/test_skill_runtime.py`（未声明拒载 / 声明了没暴露拒载 / 形状不对拒载 /
+  ReviewNode 两级查询四连断言）+ e2e 的"真表"改读 skill.json。全量 **566 passed /
+  7 skipped**；层 A 8/8 退出码 0。
+
 ## [ ] 运行中 compact：工具循环中间的上下文收口
 
 **问题**（2026-09-07 长回合实测）：主 agent 一轮里大量工具调用（如一次 jupyter 审计

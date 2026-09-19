@@ -938,7 +938,15 @@ async def _register_skill_runtime(
 def _check_skill_tools(
     meta: SkillMeta, server: str, names: list[str], existing_names: set[str]
 ) -> str | None:
-    """校验技能带来的工具名（登记 / 重名 / 自重复）；有问题 → 可行动的错误正文。"""
+    """校验技能带来的工具名（声明 / 重名 / 自重复）；有问题 → 可行动的错误正文。
+
+    审批策略的声明处（2026-09-19 起）是**技能目录自己的 skill.json**（`tools` 键）——约束跟
+    能力走，加技能不再需要动中心表。fail-closed 强度不变：server 暴露的**每一个**工具都必须
+    逐条声明 `need_review`，缺一个就拒载（否则"未声明 = 免审"会静默放行一次没人看过的动作）。
+    另外两向也拦：声明形状不对（need_review 非布尔）与声明了 server 没暴露的工具（拼写错误
+    的静默形态——声明者以为有政策兜着，实际那工具根本不存在）。
+    读盘不缓存：改完 skill.json **重新 get_skill 即可**，不必重启进程。
+    """
     duplicated = sorted({n for n in names if names.count(n) > 1})
     if duplicated:
         return f"技能 {meta.name} 暴露了重名工具 {duplicated}，已拒绝加载。"
@@ -950,15 +958,37 @@ def _check_skill_tools(
             f"请改名后重新 get_skill（同名会让模型与审批策略都无法区分两者）。"
         )
 
-    cfg = _tool_config()
-    unregistered = [n for n in names if cfg.get(n, {}).get("source") != server]
-    if unregistered:
+    declared = skills.read_tool_policies(meta)
+    undeclared = [n for n in names if n not in declared]
+    if undeclared:
         return (
-            f"技能 {meta.name} 的工具没有在 app/agent/tool.json 里按要求登记：{unregistered}。"
-            f'请在 tool.json 为每个工具加一行 {{"need_review": true/false, "source": "{server}"}}，'
-            f"改完**需要重启进程**（它是进程内只读一次的），再重新 get_skill。"
+            f"技能 {meta.name} 的工具没有在它自己的 skill.json 里声明审批策略：{undeclared}。"
+            f'请在技能目录的 skill.json 加 "tools" 段，为每个工具声明 {{"need_review": true/false}}，'
+            f"改完**重新 get_skill 即可**（技能配置每次加载时读取，不必重启进程）。"
             f"**这是技能配置问题、不是你的调用方式问题**——请把这条回执告知用户，"
             f"不要自己绕道（例如改用 read_file 去读技能目录）。"
+        )
+
+    bad_shape = sorted(
+        n
+        for n, conf in declared.items()
+        if not isinstance(conf, dict) or not isinstance(conf.get("need_review"), bool)
+    )
+    if bad_shape:
+        return (
+            f"技能 {meta.name} 的 skill.json 里 {bad_shape} 的 need_review 声明形状不对"
+            f"（必须是 {{\"need_review\": true/false}}），已拒绝加载。"
+            f"改好**重新 get_skill 即可**。"
+            f"**这是技能配置问题、不是你的调用方式问题**——请把这条回执告知用户。"
+        )
+
+    unexposed = sorted(n for n in declared if n not in set(names))
+    if unexposed:
+        return (
+            f"技能 {meta.name} 的 skill.json 声明了 server 没有暴露的工具：{unexposed}，"
+            f"已拒绝加载（多半是拼写错误——声明了政策却不存在那个工具，等于政策落空）。"
+            f"改好**重新 get_skill 即可**。"
+            f"**这是技能配置问题、不是你的调用方式问题**——请把这条回执告知用户。"
         )
     return None
 

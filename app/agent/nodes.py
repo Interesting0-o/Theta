@@ -15,7 +15,7 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 from app.agent.memory import memory_block
-from app.agent.skills import skills_block
+from app.agent.skills import get_meta, read_tool_policies, skills_block
 from app.agent.state import AgentState
 from app.agent.utils import coerce_tool_result, format_tool_result
 from app.agent.prompt import SYSTEM_PROMPT, handoff_pointer_block, workspace_context_block
@@ -663,6 +663,31 @@ class ReviewNode:
             return None
         return self.toolset.known_names(state)
 
+    def _tool_cfg(self, tool_name: str | None, state: AgentState) -> dict:
+        """一条工具调用的策略条目：**内置表（tool.json）优先，其次已加载技能的 skill.json 声明**。
+
+        2026-09-19 起技能自带工具的 `need_review` 声明在技能目录自己的 skill.json（约束跟能力
+        走，见 skills.read_tool_policies）；tool.json 只管内置 MCP 工具与编排工具。技能工具能
+        走到本查询的前提是它已被加载——加载期 `_check_skill_tools` 已逐条校验过声明形状，这里
+        信任那份声明。两级都没有 → {}（`_decide` 把"在工具表里却两头无政策"判成 review，
+        fail-closed 第二道防线不变）。读盘不缓存：与加载期校验同一口径，改 skill.json 立即生效。
+        """
+        if not tool_name:
+            return {}
+        cfg = self.tool_review.get(tool_name)
+        if cfg is not None:
+            return cfg
+        if self.toolset is None:
+            return {}
+        for skill_name in state.get("loaded_skills") or []:
+            meta = get_meta(skill_name)
+            if meta is None:
+                continue
+            conf = read_tool_policies(meta).get(tool_name)
+            if conf is not None:
+                return conf
+        return {}
+
     @staticmethod
     def _free_shell_verdict(tool_args: dict) -> bool:
         """run_command 的免审判定：这条命令是名单里的**只读**形态 → True（不弹审批面板）。
@@ -732,10 +757,11 @@ class ReviewNode:
         - **free（命令级）**：tool.json 标了 `free_when: readonly_shell` 的工具（当前只有
           run_command），**还要它的参数**判为只读终端命令才算数，见 `_free_shell_verdict`。
           判定不过就落回 review —— 这条路是加宽免审面的唯一入口，失败方向必须是收紧。
-        - **review**：`tool.json` 说要审批；**或**它在工具表里却没登记 —— 这条是 §13.4 的第二道防线
-          （fail-closed）：有人往 MCP server 加了个写工具却忘了登记，旧行为是"未登记 = 免审"，
-          等于静默放行一次写操作。限定在"在表里"是为了不误伤模型编出来的名字。
-        - **free**：登记过且 `need_review: false`。
+        - **review**：策略说 `need_review: true`（内置表或技能自己的 skill.json）；**或**它在
+          工具表里却两头都没有政策条目 —— 这条是 §13.4 的第二道防线（fail-closed）：有人往
+          MCP server 加了个写工具却忘了声明，旧行为是"未声明 = 免审"，等于静默放行一次写操作。
+          限定在"在表里"是为了不误伤模型编出来的名字（那是 unknown，回执而不弹面板）。
+        - **free**：有政策条目且 `need_review: false`。
         """
         if tool_name is None:
             return "free"
@@ -746,7 +772,7 @@ class ReviewNode:
             return "free"
         if tool_cfg.get("need_review"):
             return "review"
-        if known is not None and tool_name not in self.tool_review:
+        if known is not None and not tool_cfg:
             return "review"
         return "free"
 
@@ -797,7 +823,7 @@ class ReviewNode:
         if self.log:
             # 工具调用日志：每条待审调用过审核节点时打一行（含需要人工审批与免审放行者）
             print(_tool_call_log(current_tool))
-        tool_cfg = self.tool_review.get(tool_name, {}) if tool_name else {}
+        tool_cfg = self._tool_cfg(tool_name, state)
         approved = True
         denied_messages: list[ToolMessage] = []
 
