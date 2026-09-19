@@ -13,13 +13,14 @@ AGENT_INBOX_PORT=0 让 OS 选空闲端口（避免与正在跑的 TUI 抢 8010�
 import asyncio
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import Command
 
 import app.platform.commands as commands_mod
 import app.resource as resource
 from app.platform.commands import PROMPT_COMMANDS
 from app.platform.loop import AgentPlatform
+from app.platform.runtime import UserMailbox
 from app.schema.approval_schema import GATE_ASK_USER, Decision
 from app.schema.ui_schema import Notice, ReadyForInput, SessionStarted, TurnFailed, TurnFinished
 
@@ -92,23 +93,54 @@ class FakeStep:
         return {"messages": [AIMessage(content=REPLY)]}
 
 
-def _factory(step):
-    """把假 step 包成基座要的 step_factory（返回 (connection, step)）。"""
+class SteerStep:
+    """假 step：模拟"信箱有货 → 收口拍"的真图行为（真图闭环在 tests/test_steering.py）。
+
+    先让出几拍再查信箱——给主循环的 race 留出把运行中输入投进信箱的时间窗；有货 =
+    图在 llm 边界 peek 到信号 → 返回收口态（is_inject + 尾部是 ToolMessage，无新答复）；
+    没货 = 正常答复。
+    """
+
+    def __init__(self, mailbox, delay: float = 0.05) -> None:
+        self.mailbox = mailbox
+        self.delay = delay
+        self.inputs: list[dict] = []
+        self.calls = 0
+
+    async def __call__(self, inputs):
+        self.calls += 1
+        if not isinstance(inputs, Command):
+            self.inputs.append(inputs)
+        await asyncio.sleep(self.delay)
+        if self.mailbox.has_pending():
+            return {
+                "is_inject": True,
+                "messages": [ToolMessage(content="在途批回执", tool_call_id="t1")],
+            }
+        return {"messages": [AIMessage(content=REPLY)]}
+
+
+def _factory(step, mailbox=None):
+    """把假 step 包成基座要的 step_factory（返回 (connection, step, mailbox) 三件套）。
+
+    测试要往信箱里看/塞东西时自己建一个传进来，否则工厂代建。
+    """
+    box = mailbox if mailbox is not None else UserMailbox()
 
     async def build(workspace: str, session_id: str):
-        return None, step  # 假 step 不需要 db 连接
+        return None, step, box  # 假 step 不需要 db 连接
 
     return build
 
 
-def _platform(tmp_path, monkeypatch, ui, step):
+def _platform(tmp_path, monkeypatch, ui, step, mailbox=None):
     monkeypatch.setattr(resource, "RESOURCE_ROOT", tmp_path / "res")  # 不碰真实 resource
     monkeypatch.setenv("AGENT_INBOX_PORT", "0")  # 让 OS 选空闲端口，别抢 8010
     return AgentPlatform(
         workspace=str(tmp_path / "ws"),
         session_id="s1",
         ui=ui,
-        step_factory=_factory(step),
+        step_factory=_factory(step, mailbox),
     )
 
 
@@ -329,3 +361,63 @@ def test_loop_reports_turn_failure_without_swallowing(tmp_path, monkeypatch):
     assert len(failed) == 1
     assert "RuntimeError" in failed[0].message and "图炸了" in failed[0].message
     assert [type(e) for e in ui.events].count(ReadyForInput) == 2  # 出错后仍回到空闲
+
+
+# ---------------- 运行中转向：基座侧（race 第三路 / 信箱续轮 / 收口呈现） ----------------
+
+
+def test_steered_line_ends_turn_and_starts_next_with_it(tmp_path, monkeypatch):
+    """turn 运行中敲的行：投信箱 + 即时回执；本回合收口（Notice 而非 TurnFinished），
+    该行成为下一轮输入（真图那侧的行为由 test_steering.py 钉）。"""
+    box = UserMailbox()
+    ui = FakeUI(["跑A", "改走B", None])
+    step = SteerStep(box)
+
+    asyncio.run(_platform(tmp_path, monkeypatch, ui, step, box).run())
+
+    assert [m.content for m in step.inputs[0]["messages"]] == ["跑A"]
+    assert [m.content for m in step.inputs[1]["messages"]] == ["改走B"]
+    assert step.calls == 2
+    texts = [e.text for e in ui.events if isinstance(e, Notice)]
+    assert any("已收到" in t and "改走B" in t for t in texts)  # 即时回执（不承诺收口形态）
+    assert any("回合已按你的新消息收口" in t for t in texts)  # 收口提示
+    # 收口回合没有 TurnFinished：ToolMessage 的"在途批回执"不能当答复
+    finished = [e for e in ui.events if isinstance(e, TurnFinished)]
+    assert [e.text for e in finished] == [REPLY]
+
+
+def test_two_queued_lines_chain_two_sealed_turns(tmp_path, monkeypatch):
+    """连敲两行 = 前一轮空转收口、最后一行才真正进模型（所有行都在历史里）——
+    这是"取第一行、其余留队"与入口跳过叠加的净效果，钉成刻意行为。"""
+    box = UserMailbox()
+    ui = FakeUI(["跑A", "第一行", "第二行", None])
+    step = SteerStep(box)
+
+    asyncio.run(_platform(tmp_path, monkeypatch, ui, step, box).run())
+
+    # 三轮：跑A（收口）→ 第一行（信箱还有第二行，立即收口）→ 第二行（正常答复）
+    contents = [[m.content for m in turn["messages"]] for turn in step.inputs]
+    assert contents == [["跑A"], ["第一行"], ["第二行"]]
+    assert step.calls == 3
+    texts = [e.text for e in ui.events if isinstance(e, Notice)]
+    assert sum("已收到" in t for t in texts) == 2  # 两行各一条即时回执
+    assert sum("回合已按你的新消息收口" in t for t in texts) == 2  # 前两轮都是收口
+    finished = [e for e in ui.events if isinstance(e, TurnFinished)]
+    assert [e.text for e in finished] == [REPLY]  # 只有最后一轮有答复
+
+
+def test_switch_session_drops_pending_mailbox_lines_with_notice(tmp_path, monkeypatch):
+    """切会话 = 旧信箱作废：真有残留行就明说丢弃（防御分支——正常流程下信箱在空闲分支
+    优先消费，读到 /session 时必空；这里直接构造残留钉住语义）。"""
+    platform = _platform(tmp_path, monkeypatch, FakeUI([None]), FakeStep())
+    box = UserMailbox()
+    box.put("残留行1")
+    box.put("残留行2")
+    platform._mailbox = box
+
+    asyncio.run(platform.switch_session("aaaa1111bbbb2222"))
+
+    assert box.pending_count() == 0
+    assert platform._mailbox is None  # 旧信箱作废
+    notices = [e for e in platform.ui.events if isinstance(e, Notice)]
+    assert any("丢弃 2 行未消费的运行中输入" in e.text for e in notices)

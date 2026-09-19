@@ -68,6 +68,7 @@ async def get_main_agent_graph(
     workspace_path: str | None = None,
     session_id: str | None = None,
     model: BaseChatModel | None = None,
+    mailbox=None,
 ):
     """
     返回未编译的 StateGraph（compile 由调用方完成，以支持挂 checkpointer 的 interrupt 审批）。
@@ -84,6 +85,10 @@ async def get_main_agent_graph(
     model：不传 = `get_main_chat_model()`（生产路径）。给了就用它当**未绑定**的原始模型
     （bind_tools 仍由 LLMNode 按工具集版本做，见下）——评估的录制/回放从这里注入模型替身；
     与 `get_sub_agent_graph` 的同名参量一个路子。
+
+    mailbox：运行中转向信箱（app/platform/runtime.py::UserMailbox），**基座持有内容**、
+    图侧只在 LLMNode 入口 peek 布尔决定是否提前收口（docs/TODO.md「运行中转向」）。
+    None = 无转向能力——worker / evaluation / langgraph dev 全部不传，行为与从前一致。
     """
     workspace_path = _resolve_workspace(workspace_path)
     # 默认 tmp 工作区需存在：os.makedirs 属阻塞调用，放到线程执行（blockbuster 不拦）
@@ -111,7 +116,8 @@ async def get_main_agent_graph(
     model = model if model is not None else get_main_chat_model()
 
     graph.add_node(
-        "llm_node", LLMNode(model=model, workspace_path=workspace_path, toolset=toolset)
+        "llm_node",
+        LLMNode(model=model, workspace_path=workspace_path, toolset=toolset, mailbox=mailbox),
     )
     graph.add_node("queue_node", QueueNode())
     # dispatch_subtasks（spawn worker）与 memory 读写（定位 memory.md）都需要工作区，

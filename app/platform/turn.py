@@ -136,10 +136,13 @@ async def _race(*factories):
 
 
 def build_turn_state(session_id: str, user_input: str) -> dict:
-    """一轮 turn 的初始 state（新用户消息 + 清空的审批队列）。"""
+    """一轮 turn 的初始 state（新用户消息 + 清空的审批队列 + 重置转向标记）。"""
     return {
         "session_id": session_id,
         "messages": [HumanMessage(content=user_input)],
         "pending_tool_calls": [],
         "approved_tool_calls": [],
+        # is_inject 是**上一轮**的收口痕迹（checkpoint 里有），新 turn 必须显式归零：
+        # 否则上一轮收过口，这一轮的 LLMNode 一进来就又跳过（死循环式空转）。
+        "is_inject": False,
     }

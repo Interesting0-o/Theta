@@ -89,6 +89,7 @@ class LLMNode:
         inject_session_context: bool = True,
         attach_images: bool = True,
         toolset=None,
+        mailbox=None,
     ) -> None:
         # `model` 是**未绑定**的原始模型：给了 toolset 就由本节点按工具集版本调 bind_tools
         # （技能加载/卸载会改工具集）。没给 toolset（worker、单测）就用原样传进来的 model。
@@ -106,6 +107,10 @@ class LLMNode:
         self._profile_block: str | None = None
         # 动态工具集（app/agent/tools.py::SessionToolset）：None = 静态绑定，行为与改造前一致
         self.toolset = toolset
+        # 运行中转向信箱（app/platform/runtime.py::UserMailbox）：**基座持有内容**，本节点只在
+        # 入口 peek 布尔信号。None = 无转向能力（worker / 评估 / 未接线的调用方全部不变）——
+        # worker 结构性没有用户，恒传 None；不设标记就永不触发。
+        self.mailbox = mailbox
         # ⚠️ 当前 binding 与"未绑定 model"**必须分开存**：`RunnableBinding` 上**没有** bind_tools
         # （那只定义在 BaseChatModel 上），若把 binding 覆盖回 self.model，第二次版本变化就会
         # AttributeError: 'RunnableBinding' object has no attribute 'bind_tools'。
@@ -153,6 +158,16 @@ class LLMNode:
         用户消息里的 @图片路径走**调用期附图通道**（attach_images_to_payload）：base64 只临时
         进请求体副本，state 里的消息永远是带 @路径 的纯文本。
         """
+        # 运行中转向（docs/TODO.md「运行中转向」）：信箱有货 = 用户在 turn 运行中发来新输入。
+        # 本拍**整体跳过**——不拼系统提示、不读画像/记忆/技能（两次 to_thread 读盘也不花）、
+        # 不调模型、不加任何消息——返回标记后，既有 route_after_llm 看到"末条非
+        # AIMessage(tool_calls)"，沿既有 compact/END 把当前轮提前收口；基座随后把信箱里的行
+        # 当**下一轮输入**新起 turn（内容全程不进图）。刻意放在函数第一条语句：收口拍的唯一
+        # 成本就是这一次 peek；也刻意**跳过而非在出口拦截**——出口收口会让模型本拍刚吐的
+        # tool_calls 悬空（无兑现 ToolMessage，下一轮 API 400），入口跳过天然没有这个问题。
+        if self.mailbox is not None and self.mailbox.has_pending():
+            return {"is_inject": True}
+
         system_messages = [SystemMessage(content=self.system_prompt)]
         if self.workspace_path:
             system_messages.append(

@@ -73,6 +73,9 @@ class AgentPlatform:
         self._step_factory = step_factory or build_session_runtime
         self._connection = None  # AsyncSqliteSaver 连接；首次交互创建，退出时关闭
         self._step = None  # compiled.ainvoke 闭包；首次交互创建后复用
+        # 运行中转向信箱（app/platform/runtime.py::UserMailbox）：随会话运行体懒建（首次交互
+        # 才有），基座投递/消费内容，图侧只 peek。切会话随旧运行体一并作废。
+        self._mailbox = None
 
     async def run(self) -> None:
         """跑到退出（EOF / 退出词）：收尾 inbox、取消在跑的 turn、关会话连接。"""
@@ -81,6 +84,7 @@ class AgentPlatform:
         inbox = ApprovalInboxServer()
         turn: asyncio.Task | None = None
         turn_done = asyncio.Event()
+        input_eof = False  # 运行中收输入时遇到 EOF：输入臂从此撤下（None 秒回会变成忙轮询）
         try:
             # 先起收件箱再宣告会话就绪：收件箱起不来（端口被占等）会抛 ConfigError，
             # 那时不该先打一句"会话 session_id=…"让用户以为已经跑起来了。
@@ -93,18 +97,37 @@ class AgentPlatform:
                     await drain_approvals(inbox.queue, self.ui)
                     continue
 
-                # 2) 有 turn 在跑（含 park 挂起）→ 等它结束或新审批到达
+                # 2) 有 turn 在跑（含 park 挂起）→ 等它结束、新审批到达、或用户运行中来输入
                 if turn is not None and not turn.done():
                     inbox.queue.clear_new()  # pending 已空，清掉过期 set 再等
-                    await _race(turn_done.wait, inbox.queue.new_pending.wait)
+                    arms: list = [turn_done.wait, inbox.queue.new_pending.wait]
+                    if not input_eof:
+                        arms.append(self.ui.read_line)
+                    idx, line = await _race(*arms)
+                    if idx == 2:
+                        if line is None:
+                            input_eof = True  # EOF：撤下输入臂，别让 None 秒回变忙轮询
+                        elif line and self._mailbox is not None:
+                            # 运行中转向：投信箱，图在下一个 llm 边界 peek 到就提前收口。
+                            # 措辞刻意不承诺"收口"——若本回合已进收尾（最后一次 peek 之后
+                            # 才到），这一行只会成为下一条消息。
+                            self._mailbox.put(line)
+                            self.ui.emit(Notice(text=f"已收到，将在最近边界生效：{line}"))
                     continue
 
-                # 3) 空闲 → 提示可输入，等一行有效输入（新 worker 审批可插队服务）
+                # 3) 空闲 → 先取运行中收下的转向行（有就不等输入），否则提示可输入等一行
                 inbox.queue.clear_new()
-                self.ui.emit(ReadyForInput())
-                idx, line = await self._read_user_line(inbox.queue)
-                if idx == 1:  # 审批先到 → 回顶部 drain
-                    continue
+                if self._mailbox is not None and self._mailbox.pending_count():
+                    # 转向行当下一轮输入（命令解析与退出词判定在下方共用）。此刻信箱里可能
+                    # 还有第 2..N 行——它们会让下一轮 LLMNode 入口立即跳过、再收口一轮：
+                    # 连敲 N 行 = 前 N-1 轮空转收口、只有最后一行真正进模型（所有行都在
+                    # 历史里，模型一并看到）。测试钉住这是刻意行为，不是 bug。
+                    line = self._mailbox.take_first()
+                else:
+                    self.ui.emit(ReadyForInput())
+                    idx, line = await self._read_user_line(inbox.queue)
+                    if idx == 1:  # 审批先到 → 回顶部 drain
+                        continue
                 if line is None or line in EXIT_WORDS:
                     break  # EOF / 退出
 
@@ -123,7 +146,7 @@ class AgentPlatform:
 
                 # 首次交互才建库/checkpoint/图（之后各轮复用同一 runtime）
                 if self._step is None:
-                    self._connection, self._step = await self._step_factory(
+                    self._connection, self._step, self._mailbox = await self._step_factory(
                         self.workspace, self.session_id
                     )
                 turn_done.clear()
@@ -156,7 +179,12 @@ class AgentPlatform:
 
         旧会话的 MCP 常驻运行体也在这里关：它按 (工作区, 会话) 隔离，不关就会每切一次会话
         多攒一组常驻子进程（terminal 的受管进程表也会跨会话可见——那正是要避免的泄漏）。
+        转向信箱随旧运行体一并作废：正常流程下到不了"信箱有残留"（空闲分支优先消费它，
+        读到 /session 时必空），这里防御性钉住语义——真有残留就明说丢弃，不悄悄消失。
         """
+        if self._mailbox is not None and self._mailbox.pending_count():
+            dropped = self._mailbox.clear()
+            self.ui.emit(Notice(text=f"切换会话：丢弃 {dropped} 行未消费的运行中输入"))
         if self._step is not None:
             await _close_mcp_session(self.workspace, self.session_id)
         if self._connection is not None:
@@ -164,6 +192,7 @@ class AgentPlatform:
             self._connection = None
         self.session_id = session_id
         self._step = None
+        self._mailbox = None  # 旧信箱作废；下一条消息懒建新运行体时配新信箱
 
     async def _read_user_line(self, inbox: ApprovalInbox) -> tuple[int, str | None]:
         """等一行**有效**输入；空行保持同一提示继续等，审批先到则返回 (1, None) 让上层回顶。
@@ -190,9 +219,15 @@ class AgentPlatform:
         """
         try:
             result = await drive_turn(self._step, initial, queue)
-            messages = result.get("messages") or []
-            if messages:
-                self.ui.emit(TurnFinished(text=str(messages[-1].content)))
+            if result.get("is_inject"):
+                # 被转向收口的回合**没有模型答复**：messages[-1] 是 ToolMessage（在途批的
+                # 回执），不能当 TurnFinished 正文打出来。翻成专门提示；信箱里的行由主循环
+                # 当下一轮输入（见 run() 第 3 步）。
+                self.ui.emit(Notice(text="回合已按你的新消息收口，正在继续"))
+            else:
+                messages = result.get("messages") or []
+                if messages:
+                    self.ui.emit(TurnFinished(text=str(messages[-1].content)))
         except asyncio.CancelledError:
             raise  # 关闭清理主动取消，放行
         except Exception as exc:  # noqa: BLE001 —— 用户态提示，不让任务静默失败

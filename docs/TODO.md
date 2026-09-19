@@ -3,6 +3,158 @@
 > 当前工作树仍在演进：文档与代码不一致时以代码为准（约定同 CLAUDE.md 与 docs/README.md）。
 > 每条记录动机/现状，避免"当初为什么没做"再次翻车；勾掉前应能指到验证它的提交。
 
+## [ ] 运行中转向：用户消息队列（输入不等整轮结束才递进）（2026-09-19）
+
+**场景**：用户给 agent 派了任务、指了 A 方向，agent 已开跑；跑到一半用户发现 A 不合意图、
+想改 B——今天的现实是：**输入必须等整个图路由跑完才被写入**（现状见下），agent 把 A 一路
+做完，仓库被写了一堆要删/回滚的东西，token 白烧一整段。目标 = 运行中敲的消息**进队列、
+在最近的安全点递进图**，模型带着"用户改向 B"继续，而不是等整轮结束后才看到。
+
+**现状**（三段都核过，2026-09-19）：
+
+- 前端**已经在收**：stdin 单 reader 线程 + pump（`app/tui/input.py`）整轮不停，运行中敲的行
+  就躺在 `_out_q` 里；面板出现前的预输入由 `TerminalUI._hold_pretyped` 挪进 `_held`
+  （2026-09-15 审计），留给**下一个** turn——所以捕获这半已经在了，缺的是消费。
+- 基座**不消费**：turn 在跑时主循环只 `_race(turn_done.wait, inbox.new_pending.wait)`
+  （`app/platform/loop.py::run` 第 2 步），不读用户输入 → 这些行必然等到 turn 结束才被
+  `read_line` 取走、起新 turn。
+- 图内**没有承接通道**：state 没有"运行中插入的用户消息"切片，`LLMNode` 没有对应注入点；
+  interrupt 的 resume 载荷只运闸门决定（审批的 `approved` / 提问的回答）。
+
+**要点（2026-09-19 对齐后细化；库行为已按 langgraph 1.1.10 探针实测——一次性脚本
+`tmp/probe_astream.py`（tmp/ 不入库），结论以本条为准）**：
+
+- **封闭性只对入向成立**：出向库有现成通道、我们没用——`drive_turn` 现在是裸
+  `await compiled.ainvoke` 拿终态（`app/platform/turn.py`），每个 superstep 发生了什么一概
+  不可见。换 `astream(stream_mode="updates"|"custom")` 即可逐拍观察；`drive_turn` 的
+  park/resume 循环形状不变，消费方式从"等终态"改"逐拍"。**这半与消息队列独立，可先行**——
+  顺带为流式显示与「长回合止损」的活性观察铺路。**已实测**：interrupt 处流出
+  `{"__interrupt__": (Interrupt(value,…),)}` 一拍后流**正常耗尽**（无异常、无残余拍）；
+  resume = `astream(Command(resume=…), cfg)` 重进，续流含被中断节点**整节点重跑**的一拍 +
+  余下节点，终态正确。
+- **入向选型，定 (c)；形状定「转向 = 提前收口 + 新起一轮」（用户 2026-09-19 拍板，取代
+  早先"消息并进本轮"的排水口形状）**：
+  - (a) **interrupt/resume 顺带捎**（resume 载荷扩 user_messages）：只覆盖有闸门的轮，
+    且把转向混进 `Decision` 值对象不干净——不选；
+  - (b) **`update_state` 写运行中线程**：**已实测否决**——调用本身成功（返回新
+    checkpoint_id），但注入**静默丢失**（终态不含它）：运行中的 superstep commit 按自己的
+    内存视图落盘，外部写被穿透丢弃、全程无报错。最坏的失败形态，不选；
+  - (c) **进程内信箱 + 提前收口（定案）**：langgraph 封闭的是 **API 层的 state 写入**，
+    不是进程内对象——图与基座同进程同事件循环（探针 4 已验：运行中向图外队列投递，节点
+    在 superstep 边界读得到）。**消息内容从头到尾不进图**：信箱由基座持有，图侧只读布尔
+    信号；转向 = 当前轮在下一个 llm 边界提前收口，基座把信箱里的行当**下一轮输入**新起
+    turn——模型经完全标准的输入路径（HumanMessage）看到转向，CONTEXT_ENGINEERING 的消息
+    流转一律不动。收口时 `compact_node` 照常参与（超预算才动手），新 turn 轻装开局。
+  - 备查：cancel + 从 checkpoint 续跑——None 输入的语义**已实测**：对停在 interrupt 的
+    线程，`ainvoke/astream(None)` **原样回报 `__interrupt__`**（不推进、不吞闸门）；对已
+    完成的线程是 no-op（0 拍 / 返回终态）。即 None 输入**不能当续跑通道**，续跑必须
+    `Command(resume=…)`；"cancel 后带新消息重入"这条路本身仍悬而未测，留作备选。
+- **图侧改动收敛到三点（比"三条条件边"的草图更小）**：
+  1. `state.is_inject: bool`；`build_turn_state` 每轮置 False；
+  2. **唯一 peek 点 = `llm_node` 入口**：信箱有货 → **跳过本次模型调用**、返回
+     `{"is_inject": True}`（不产生新 AIMessage）→ 既有 `route_after_llm` 看到
+     "末条非 AIMessage(tool_calls)" → 走既有 compact/END。**不需要新增任何条件边**——
+     "模型这拍没说话"与"给了最终答复"在路由眼里同形，自然收口；
+  3. 信箱接线：`runtime.py::build_session_runtime` 造信箱，图工厂与基座各持一份引用
+     （探针 4 同款）；`llm_node` 加可选 mailbox 参量。
+- **草图里的地雷（为什么不能在 llm 出口收口）**：若按"llm_node 条件边 → compact"，模型
+  恰在本拍吐了 tool_calls 时会带着**悬空调用**进 END——历史里 AIMessage(tool_calls) 没有
+  兑现的 ToolMessage，下一轮直接 API 400。入口**跳过**（而非出口拦截）天然没这个问题：
+  跳过时不产生新调用，旧调用都已兑现。
+- **转向时延上界 = 在途一批**：信号只在 llm 入口被读——正在跑的批次照常执行（已过人批）、
+  orchestrate 切片照常合并，然后才收口。**刻意不做"在途批次入口丢弃"**：同样的悬空问题，
+  要做就得 seal（给未兑现调用补 `[已收口未执行]` 回执，同 approval_denied 回灌的机制）——
+  留作后续优化；默认"执行完再收口"，用户本就可以在面板上拒绝，拒绝回灌路径是现成的。
+- **基座两端职责**：主循环第 2 步 `_race` 加第三路 `ui.read_line`——行在 `turn_done` 前
+  到 → 投信箱 + 前端回执（"已收到，本回合将在边界收口"；`_held` 那句"已留给下一个回合"
+  的提示语跟着分化）；turn 结束 → 信箱非空则取**第一行**当下一轮输入（其余留队，与既有
+  "预输入一行一 turn"语义一致）。内容只在基座侧流动、图侧 peek 不消费——同一行既触发
+  收口又成为下一轮输入，不丢不重。
+- **收口回合的呈现（别漏）**：被收口的 turn 没有模型答复，`messages[-1]` 是 ToolMessage
+  ——`loop.py` 现状会把它当 `TurnFinished` 正文打出来。基座须看 `is_inject` 翻成专门提示
+  （"回合已按你的新消息收口"），别把工具输出当答复。
+- **worker 是 no-op**：`llm_node` 被子图共用 → mailbox 是可选参量、worker 恒传 None；
+  不设标记就永不触发（worker 图无 compact 也无妨）。
+- **重放语义写明**：`llm_node` 入口读了图外可变状态（布尔），checkpoint 重放不再纯——
+  本仓库不用 time travel，接受，注释留痕。
+- **先验**：LangGraph Platform（server）对"run 运行中来新输入"的官方策略是
+  `multitaskStrategy: enqueue/interrupt/rollback/reject`——需求普适的佐证；但 server 只能在
+  **run 边界**处置（run 是它的黑盒），本设计在 **superstep 边界**（llm 入口）收口，
+  粒度更细一档。
+- **验证路径**：机制层假模型 + 真图（沿 `test_command_review_e2e` 的路子）：信箱有货时
+  llm 跳过（该拍零模型调用）、在途批次已执行、`is_inject` 落终态、路由落 END；基座层沿
+  `test_platform_loop`：运行中投行 → turn 提前结束 → 下一轮输入 = 该行。层 A 回放对转向
+  是瞎的（回放模型不读输入），若动提示词照旧 `--live`。
+- **范围**：只做主 agent——worker 短命、无用户交互，结构性不涉及。
+
+**入向已落地（2026-09-19，出向 astream 化仍未做，本条目保持开着）**：
+
+- **图侧三点**：`state.is_inject`；`LLMNode` 入口 peek（`__call__` 第一条语句——收口拍零模型
+  调用且**零读盘**，画像/记忆/技能都不碰）；mailbox 经 `get_main_agent_graph(mailbox=)` 参量
+  接线，`build_session_runtime` 造信箱、基座与图各持一份引用（`UserMailbox` 落在
+  `app/platform/runtime.py`：基座 put/take_first/clear，图侧只有 has_pending 的 peek 权）。
+- **基座三件**：`_race` 第三路收行（**EOF 即撤下输入臂**——None 秒回会把 race 变忙轮询）；
+  空闲分支**信箱优先消费**（`take_first` 当下一轮输入、其余留队，命令解析与退出词判定与
+  正常输入共用同一段）；收口回合翻成 `Notice("回合已按你的新消息收口")`，不把 ToolMessage
+  当 `TurnFinished` 正文。运行中回执措辞"**已收到，将在最近边界生效**"——刻意不承诺收口
+  （最后一次 peek 之后到的行只会成为下一条消息）。
+- **`build_turn_state` 每轮显式置 `is_inject: False`**：那是**上一轮**留在 checkpoint 里的
+  收口痕迹，不归零下一轮一进来就又跳过。
+- **实测钉住的刻意行为**：连敲 N 行 = 前 N-1 轮空转收口、只有最后一行真进模型（所有行都在
+  历史里，模型一并看到）；在途 `ask_user` 照常弹出、回答照常兑现，然后才收口。
+- **切会话**：旧信箱随运行体作废；正常流程下到不了"有残留"（空闲分支优先消费），防御分支
+  丢弃残留行并 `Notice` 明说数量。
+- **验证**：`tests/test_steering.py`（3 例真图：零模型调用+零读盘 / 消息尾部形状=ToolMessage /
+  在途 ask_user 序列 / mailbox=None 行为不变）+ `tests/test_platform_loop.py` 新 3 例
+  （race 投递与续轮 / 两行连锁空转 / 切会话丢弃）。全量 **562 passed / 7 skipped**；
+  层 A 回放 **8/8、退出码 0**。
+
+**相关背景**：`app/tui/ui.py` 的 `_held`/`_hold_pretyped`（预输入那半已经在了）、
+`app/platform/turn.py::drive_turn`（astream 化 + park/resume 都在这里改）、
+docs/CONTEXT_ENGINEERING.md（消息流转改动前必读）、docs/ARCHITECTURE.md §4（图内 vs 基座）、
+文末「相关但未立项」的**长回合止损**（取消 = 扔掉整轮，队列 = 带着上下文转向，互补不互替）。
+
+## [ ] 技能：project-handoff（跨会话交接）——已勘察，未落地（2026-09-19）
+
+**动机**：Theta 换会话 = 任务态全丢——`/new session` 之后 notes、`current_plan` 全部留在旧
+checkpoint 里，长期记忆又只收"约束/偏好/项目事实"、不收**任务态**（做到哪、下一步是什么、
+哪些决定有效）。工作做一半想换新会话，只能靠用户人工重述。外部仓库
+[duoduoler-ops/Table-skills](https://github.com/duoduoler-ops/Table-skills) 的
+`project-handoff` 技能正好补这个缺：在压缩检查点/阶段切换/已核实的混淆时评估"该不该交接"，
+提醒 → 保存材料 → 新建会话并接续。
+
+**技能内容概要**（原文 SKILL.md + 两个附页 `references/compaction-reminder.md`、
+`references/handoff.md`）：核心纪律是**「提醒、保存、新建接续是不同动作，不互相授权」**；
+评估只看任务事实——**安全位置**（成果/验证/归属可定位，未验收不能写成已验收）、**明确后续**
+（新对话能确定第一步）、**切换收益**（不能只说"对话太长"）；首次提醒在第 3 次自动压缩后，
+之后同阶段去重、冷却 ≥ 3 次压缩；建议放最终答复正文最前（"交接建议："开头）；用户说
+"先不交接"再冷却；"本任务不提醒"关掉主动提醒直到用户主动恢复；无 Hook 时退化为"最终答复前
+自检，不宣称有程序兜底"。
+
+**落点判定**：`skills/project-handoff/`，**知识型**（原文无 server.py、无工具面，是行为
+纪律不是能力包）；SKILL.md 正文走既有的 `get_skill` 注入通道（docs/SKILL_DESIGN.md §11）。
+
+**适配 Theta 须拍板的**：
+
+1. **references 不可达**：知识型只注入 SKILL.md 正文，而 `skills/` 在 Theta 仓库里、通常
+   **不在用户工作区沙箱内**——agent 的 file_io 读不到两个附页。三选一：内联进正文（体积换
+   可达）；技能通道扩展"host 侧按需读 references 注入"；或砍掉附页、正文自足。
+2. **触发锚点**：原文锚在"第 N 次自动压缩后"，Theta 的 `compact_node` 是轮末确定性折叠、
+   没有"压缩次数"概念，hooks 也没有。候选：给 state 加 compact 触发计数；或按技能自带的
+   退化模式起步——靠模型在阶段切换/已核实混淆时自评。**倾向后者起步**，锚点等运行中 compact
+   （上面那条）落地再搭车。
+3. **保存落点**：交接材料是任务态，**别写进 memory.md**（污染"只存重取不到的结论"的既有
+   语义）。候选：`resource/<ws_key>/handoff/`（`app/resource.py` 加单点函数）或工作区内
+   约定路径。落点定了才谈"新会话怎么知道有交接材料"（新会话播种时提示模型去读？）。
+4. **动作映射**：保存 ≈ 资源区写入（免审与否沿用现有策略表）；新建接续 ≈ `/new session`
+   （已有）；恢复/查看 ≈ `/session <id>`（已有）。"在指定目录新建并打开"在 Theta 没有对应物
+   （工作区 = 启动目录），砍掉或映射成"提示用户到目标目录重启"。
+5. **合规**：外部仓库搬进来要按 Theta 口径改写（中文文档、工具面、会话命令、闸门语义），
+   不是原文照抄；来源 URL 与概要留档在本条。
+
+**相关背景**：docs/SKILL_DESIGN.md §11（知识型通道）、上文「运行中 compact」（压缩锚点若
+落地，本技能触发点可搭同一班车）、「长期记忆分层化」（交接材料落点的分层语义别打架）。
+
 ## [ ] 运行中 compact：工具循环中间的上下文收口
 
 **问题**（2026-09-07 长回合实测）：主 agent 一轮里大量工具调用（如一次 jupyter 审计

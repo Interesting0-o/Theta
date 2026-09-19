@@ -43,3 +43,12 @@ class AgentState(TypedDict):
     # （口径同记忆的"文件即真值"）。只存名字让 SKILL_DESIGN §3.5 的铁律**结构性成立**——
     # 正文只有一个家（系统提示），卸载就是删一个名字，不存在"两份拷贝"。无 reducer。
     loaded_skills: List[str]
+
+    #--------------运行中转向（消息队列）-----------------
+    # 当前轮是否被"用户在 turn 运行中发来新输入"提前收口：LLMNode 入口 peek 转向信箱
+    # （app/platform/runtime.py::UserMailbox，基座持有内容）有货 → 置 True 并**整体跳过本拍**
+    # （不拼系统提示、不读画像/记忆/技能、不调模型、不加消息），既有 route_after_llm 看到
+    # "末条非 AIMessage(tool_calls)"沿 compact/END 收口。基座据它把本回合翻成"已收口"提示
+    # 而不是把 ToolMessage 当答复。每轮由 build_turn_state 置 False；收口时若正超预算，
+    # compact_node 照常参与（新 turn 轻装开局）。
+    is_inject: bool
