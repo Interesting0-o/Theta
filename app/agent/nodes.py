@@ -26,7 +26,7 @@ from app.schema.approval_schema import GATE_ASK_USER, GATE_TOOL_APPROVAL
 
 # 顶部读一次 settings 是**行为契约**，不是随手一行：它让"缺 .env"在 import 期就响亮报错，而不是
 # 拖到第一次真去建模型时才炸（`app/agent/model.py` 于 2026-09-21 并入本模块，那行随之下移到这里；
-# 并入时**刻意保留**该时机，见 docs/TODO.md 该条）。懒加载（+ 入口把 ValidationError 翻成
+# 并入时**刻意保留**该时机，见 docs/DONE.md「节点过度实现」条）。懒加载（+ 入口把 ValidationError 翻成
 # ConfigError）是 docs/EXCEPTION_DESIGN.md 里另一条**尚未落地**的待办，落地时连同这一行一起改。
 settings = get_settings()
 
@@ -110,7 +110,7 @@ class LLMNode:
         self._bound_key: tuple | None = None
 
     #-------------------模型构造（原 app/agent/model.py，2026-09-21 并入）-------------------
-    # 并入理由（docs/TODO.md「节点过度实现」一）：模型是"这一拍要发给谁"，属本节点；独立成模块
+    # 并入理由（docs/DONE.md「节点过度实现」条）：模型是"这一拍要发给谁"，属本节点；独立成模块
     # 只多一层间接。**留作静态方法而非内联**——沿用 profile.py 并入时的先例：测试仍可直接调用它，
     # 不必构造 LLMNode 实例（构造要 workspace、toolset、mailbox）。
     # ⚠️ **`model` 参量必须保持可注入**：evaluation 的层 A 回放与一批单测靠

@@ -189,7 +189,7 @@
 | **审批闸门** | "合并 PR 必须人批""推送要人点头" | **技能自带工具：`skill.json` `tools` 段声明 `need_review: true` → interrupt；内置工具：`tool.json`** | 硬：结构性挂起 |
 | **结构性拒绝** | "master / protected 分支不许直接提交" | **工具内部直接拒绝**（`InvalidArgumentError`） | 最硬：压根不问人 |
 
-- 第二、三类**绝不能只写进 `SKILL.md` 正文**——那等于把闸门降级成提示词纪律，与本项目"写操作要点头是**结构性前提**、不是提示词纪律"的立身之本相悖（同 [[docs/TODO]]「验证门」那条的结论）。
+- 第二、三类**绝不能只写进 `SKILL.md` 正文**——那等于把闸门降级成提示词纪律，与本项目"写操作要点头是**结构性前提**、不是提示词纪律"的立身之本相悖（同 [[docs/MULTI_AGENT]] §7「交付物验证门」的结论）。
 - 第三类有**现成先例可抄**：`mcp_service/terminal.py::_deny_sudo` `[已落地]` 在 spawn 前直接 raise——"不做提权"是结构性的，不是问人。`github_push` 判定目标是 protected branch 就该照此直接拒。
 - **所以：skill 的硬约束 = 它的 `skill.json` 声明行（§13.11）+ 工具内的拒绝逻辑；`SKILL.md` 正文只装软的那半。**
 - **skill 不得自己造审批**：skill 只是"把工具与指导一起送到"，**不得**声明"用了本 skill 就免审"——决定权仍在审批声明与闸门（同 [[docs/TODO]]「反思节点」那条纪律）。**自报政策的信任前提是技能源 first-party（同仓库）**：若将来开放外部技能源，外部技能的政策声明 host 不认、一律按 `need_review: true` 兜底。

@@ -125,7 +125,7 @@ worker = **常驻异步事件循环**（resident runtime），一个进程持有
 > - **"没人回答"与"没人批准"语义不同**：前者是"未作答"（模型带假设继续），后者是 fail-closed
 >   不放行。两者都不设超时。详见 `app/platform/ui.py::UI.decide` 的 EOF 契约。
 >
-> 决策与实现细节见 `docs/TODO.md` 的「agent 提问模式」条。
+> 决策与实现细节见 `docs/DONE.md` 的「agent 提问模式」条（已完成归档；`docs/TODO.md` 只留未完成项）。
 
 > **现状修正（2026-09-15 · 终端下放给 worker）**：本节及 §5/§9 里"worker 只授只读、不授写/命令，
 > 故无需回传"的那套论证**已部分作废**——终端的 `run_command` 与四个进程管理工具**已下放给 worker**

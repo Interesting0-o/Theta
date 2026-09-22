@@ -1,7 +1,7 @@
 """派发子任务 MCP server（stdio）：`dispatch_subtasks` —— 主 agent 的"并发资料收集"入口。
 
 **为什么在这里、而不在 `app/agent/tools.py`**（2026-09-21 拍板，理由见 docs/ARCHITECTURE.md §4
-的四问与 docs/TODO.md 该条）：它派生 worker —— **独立进程 + 独立 Agent runtime**，命中四问的
+的四问与 docs/DONE.md 该条归档）：它派生 worker —— **独立进程 + 独立 Agent runtime**，命中四问的
 **第四问**（multi-agent 正落在这里）。它与 `mcp_service/sub_agent.py` 是**一对**：一个拉起、
 一个被拉起；worker 既然住在 MCP 侧，拉起它的入口就该在同一侧。留在 `app/agent/` 的写法有个
 说不通的理由——"因为需要注入工作区"：那是**处境**（住主进程必然靠注入），不是结构

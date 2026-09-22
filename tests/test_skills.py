@@ -438,3 +438,63 @@ def test_read_preflight_ignores_broken_config(skills_dir, caplog):
     with caplog.at_level("WARNING"):
         assert skills.read_preflight(meta) is None
         assert skills.read_skill_env(meta) == []
+
+
+# ---------------------- 契约：requirements ↔ server.py 的 import（first-party 技能）----------------------
+
+# 本仓库自己的包：不参与"第三方依赖"的比对
+_FIRST_PARTY = {"app", "mcp_service", "skills"}
+
+
+def _module_level_third_party_roots(server_py: Path) -> set[str]:
+    """`server.py` **模块级** import 里的第三方顶层包名（stdlib 与本仓库自己的包除外）。
+
+    只取模块级（`ast.Module.body` 里的 Import / ImportFrom）：函数内、`try:` 里的 import 天然是
+    "可有可无"的可选依赖，不属于"起进程就必需"的那个集合。
+    """
+    import ast
+    import sys
+
+    roots: set[str] = set()
+    for node in ast.parse(server_py.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = [node.module or ""]
+        else:
+            continue
+        for name in names:
+            root = name.split(".")[0]
+            if root and root not in sys.stdlib_module_names and root not in _FIRST_PARTY:
+                roots.add(root)
+    return roots
+
+
+def test_skill_requirements_match_server_imports():
+    """**契约用例**：`skill.json` 声明的 `requirements` 与 `server.py` 实际 import 的第三方包必须一致。
+
+    两侧是同一条依赖关系的两种写法，却是**两个不同的失败点**：
+
+    - 声明侧驱动**起进程前的 fail-closed 预检**（`_missing_requirements` 用 `find_spec` 查，缺了就
+      拒载、回一条可行动回执）；
+    - import 侧才是真正会炸的地方。
+
+    漂移的症状因此很难看：**声明了却没 import**（白查一个包，或键拼错）、**import 了却没声明**
+    （预检放过 → 起进程才崩，模型拿到的是子进程 traceback，得靠 `_probe_skill_startup` 事后补救）。
+    这条把两侧钉在一起（与 `_EXTRA_SLICE_KEYS` 那条契约用例同一路子）。
+
+    **只对 first-party 技能开口**（仓库里的 `skills/`）：将来开放外部技能源时，动态 import 会误报。
+    静态扫 + 只认模块级 import——它守的是"**声明与事实一致**"，不是"能不能装上"。
+    """
+    capability_skills = [m for m in skills.scan_skills().values() if m.capability]
+    assert capability_skills, "仓库里应当有能力型技能（skills/<name>/server.py）"
+
+    for meta in capability_skills:
+        declared = set(skills.read_requirements(meta))
+        imported = _module_level_third_party_roots(Path(meta.path).with_name("server.py"))
+        assert declared == imported, (
+            f"技能 {meta.name}：requirements 与 server.py 的 import 对不上——"
+            f"声明了没 import {sorted(declared - imported)}；"
+            f"import 了没声明 {sorted(imported - declared)}"
+            f"（前者是冗余或拼错，后者会让预检放过、起进程才崩）"
+        )
