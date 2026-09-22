@@ -67,3 +67,36 @@ LangGraph 擅长的：把"一条 agent run"描述成带状态机、可中断、�
 - 图对外只通过 driver 暴露：`ainvoke/stream` 包在 driver 里，图不直接面向事件循环。
 - 新增"agent 能力"先问：它是**图内的一条边/一个节点**，还是**基座上的一类事件/一条 run**？前者是小步执行、后者是整体编排——两者用错会拧巴（见 MULTI_AGENT 三种编排模式的对偶）。
 - **基座与前端**（§2.7）：基座（`app/platform`）**不许** `print` / 读 stdin / `import app.tui`；前端（`app/tui`）**不许**碰调度与 run 生命周期——它只实现 `UI` 协议。新增前端能力时先问"这是渲染/取输入，还是调度？"，后者属于基座。用户命令（`/init`、`/session`）属**基座的控制面事件**，落 `app/platform`；前端只渲染它们的输出。
+- **工具面：新增工具先问四句**（2026-09-21 定；**取代**此前一切"按返回值形状 / 按是否需要注入"的分类说法。依次问，前一句答"否"才问下一句）：
+  1. **它是对外部世界能力的调用吗**（读文件 / 跑命令 / 搜网页）→ 是 = **MCP 工具**（`mcp_service/` 或技能目录：住**自己的子进程**、工作区来自启动 `env`、返回值 `ToolResult`、走 `ToolNode`）。
+  2. **不是的话——它改变当前 Agent 的运行语义吗**（plan / notes / loaded skills / pending work / subtask）→ 是 = **Agent orchestration**（编排工具，`app/agent/tools.py`）。**这就是编排工具的定义**：改的是 agent 自身，不是外部世界。而**改变的方式本就各样**（写 `current_plan` 切片的、只产一条回执的都有）——"返回 state 切片"不是定义。
+  3. **它还涉及持久化 / workspace / session 等资源吗**（如 memory 读写、dispatch 的工作区）→ 那不是退回 MCP，而是 **Resource abstraction** 方向：资源访问要有单点（`app/resource/paths.py` 那类）。
+  4. **它还需要独立进程 / 独立 Agent runtime / 独立能力边界吗** → **才**考虑 **MCP / worker boundary**——**multi-agent 正落在这里**（`dispatch_subtasks` 派生 worker = 独立 agent runtime）。
+  ⚠️ **两条不得用作判据的东西**：① **返回值的形状**（见上第 2 条）；② **"需要工作区"**——`file_io` 需要工作区却住在子进程（工作区就是它的启动配置），`InjectedWorkspace` 只是"留在主进程"的**后果**、不是理由。两类工具的返回值**为何不做统一**，见 [[docs/EXCEPTION_DESIGN]] §5。
+- **`app/agent/`：一个东西该不该进来，先问三句**（2026-09-21 定；**与上一条配对**——上一条判"是 MCP 还是编排"，本条判"进不进 `app/agent/`"，**三条都不中**才轮到上一条决定它去哪）：
+  - **A · 是否参与 Agent 的决策上下文**——"**Agent 现在知道什么**"：当前对话 / plan / notes / memory / loaded skills / 工具状态 / workspace 状态的语义表示；
+  - **B · 是否定义 Agent 的决策过程**——"**Agent 如何从当前状态走向下一步**"：`LLM → tool call → queue → review → orchestrate/tool → LLM`；Graph / Node / AgentState；
+  - **C · 是否定义 Agent 可以采取什么行动**——Agent action：plan / load_skill / write_memory / dispatch_subtask。
+  命中任一即属于 `app/agent/`。**C 有最容易做错的一处**：**Agent action ≠ action implementation**——`app/agent/tools.py` 描述"Agent 可以做什么决策性动作"（*"我要写这个文件"*），`mcp_service/file_io.py` 负责"这个动作实际怎么执行"（真正写盘）；两者**同名、同签名、同一业务**，从名字看不出谁是谁。**同一条区分在节点层还会再出现一次**：节点做"这一拍做什么"（拼 messages / 调 / 写回），被它调用的模块做"资源怎么读、怎么转"——别把它当成两条独立规则。
+  ⚠️ **反向限制**：**代码只因为 Agent 恰好调用了某个外部边界，并不因此属于 Agent。** 判法——问"**如果那条外部边界不存在，这段代码还需要吗？**"：`app/platform/tool_results.py::format_tool_result` 与 `app/platform/mcp.py` 答"不需要"（它们的存在理由是 MCP 边界的形状），`app/agent/tools.py` 答"需要"。
+  已判出的实例与落地清单见 [[docs/TODO]] 的「`app/agent/` 的判据（A/B/C）与资源层拆分」条。
+
+### 4.1 判据的落地结果（2026-09-21，三簇一起做）
+
+按上面两条判据过了一遍全仓，实际搬动如下（**看代码时以这一节为准**，别照旧文档翻老路径）：
+
+| 原位置 | 现位置 | 判据 |
+| --- | --- | --- |
+| `app/resource.py`（单文件） | **`app/resource/`（包）**：`paths.py` / `memory.py` / `skills.py` / `images.py` / `profile.py` | 资源层 = 读 agent 之外的东西 → 内部表示 |
+| `app/agent/memory.py` / `skills.py` | `app/resource/memory.py` / `skills.py` | 同上（消费者跨 agent + platform，一个被基座 import 的模块不该住 `app/agent/`） |
+| `LLMNode` 里的图片通道（139 行）/ 画像读盘（31 行） | `app/resource/images.py` / `profile.py` | 节点做"这一拍做什么"，资源访问不归它（节点只留"读一次还是每轮读"这个决定） |
+| `app/agent/model.py` | `LLMNode.thinking_extra_body()` / `LLMNode.main_chat_model()` | "这一拍发给谁"属节点；**并入时保留了 import 期读 `.env` 的时机** |
+| `app/agent/mcp.py` / `utils.py` | **`app/platform/mcp.py` / `tool_results.py`** | 反向限制：答"不需要"（存在理由是 MCP 边界）；两者是同一件事的两半，放一起 |
+| `ReviewNode` 的免审判定 / `tools.py` 的重复读表 / `ReviewNode` 的提问校验 | **`app/agent/gates.py`** | 都是"闸门挂起前必须成立的判定材料"；策略表仍与解析器同住（纪律见 §4 上一节） |
+| `app/agent/tools.py::dispatch_subtasks` | **`mcp_service/dispatch.py`** | 四问第四问（派生独立进程 / 独立 Agent runtime）；memory 则按第三问留在编排工具 |
+
+**顺带定下的两条"单一落点"**（此前形状靠两侧注释互相指认）：`ToolMessage` 的结构化戳由生产端
+（`app/agent/nodes.py` 的 ToolNode / ReviewNode，经 `_tool_stamp`）定义、CompactNode 只读常量；
+编排工具返回切片的协议由执行器（`OrchestrateNode` + `_EXTRA_SLICE_KEYS`）定义、`tools.py` 按它写。
+**为什么切片的权威在消费端**：生产者与执行器分居 `nodes.py` / `tools.py`，而 `nodes.py` 刻意不
+import `tools.py`，"权威放生产端"就得造一条反向 import——写成"执行器定义协议、生产端照写"即可。

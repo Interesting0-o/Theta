@@ -76,7 +76,7 @@ class MCPToolSpec:
     """一条 MCP 工具的静态 schema（**不含会话**，故可跨会话复用、按工作区缓存）。
 
     与 `ToolResult` 的分工：那是工具**执行后**的返回形状，这是工具**调用前**的描述形状。
-    生产者 = `app/agent/mcp.py`（从适配器列到的工具里取 schema），消费者 = 同模块造 shim 工具、
+    生产者 = `app/platform/mcp.py`（从适配器列到的工具里取 schema），消费者 = 同模块造 shim 工具、
     以及二期能力型 skill 的工具注册表。
 
     `server` 必须显式记着：`web_search` 这个**工具名与 server 名同名**，任何"按名字反推 server"
@@ -110,7 +110,7 @@ class MemoryEntry:
     - date：**首次记入日** YYYY-MM-DD——覆写保留原日期，不重排、不重新编号；
     - content：条目正文（不含标题行）。
 
-    设计见 docs/LONG_TERM_MEMORY.md §3；读写与解析在 app/agent/memory.py。
+    设计见 docs/LONG_TERM_MEMORY.md §3；读写与解析在 app/resource/memory.py。
     """
 
     key: str
@@ -123,7 +123,7 @@ class MemoryEntry:
 class SkillMeta:
     """一个**已安装技能**的元信息——即技能目录里的一条（skills/<name>/SKILL.md）。
 
-    与 `MemoryEntry` 同族：都是"**解析出来的值对象**"（这里由 `app/agent/skills.py::scan_skills`
+    与 `MemoryEntry` 同族：都是"**解析出来的值对象**"（这里由 `app/resource/skills.py::scan_skills`
     从 SKILL.md 的 frontmatter 解析），且**消费者跨模块**（`app/agent/tools.py` 的
     `get_skill`/`drop_skill`、`app/agent/nodes.py::LLMNode` 的注入块、构图期把目录烤进 docstring），
     所以落在这里，而不是定义在扫描器旁边。

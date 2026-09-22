@@ -200,7 +200,7 @@ class TerminalUI:
           任意文本当补充、EOF 落回"未回答"，所以不会把人困住；
         - 补充可留空。**两段皆空 = 未回答**（与 EOF 同语义），由模型自己带假设继续。
 
-        这里的 `value["options"]` 是**闸门归一后**那份清单（`nodes.py::_ask_request` 已去掉空白项），
+        这里的 `value["options"]` 是**闸门归一后**那份清单（`app/agent/gates.py::ask_request` 已去掉空白项），
         所以面板上显示的序号与闸门回写 `ask_answers` 时校验的序号是同一套——别在这边再过滤一遍，
         否则两边会错位。
         """

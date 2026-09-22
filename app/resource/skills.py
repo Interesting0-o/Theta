@@ -8,14 +8,15 @@
 单源少掉"重名谁覆盖谁"与"工作区外的目录要不要进沙箱故事"两处复杂度。以后真需要再加回来，
 那时重新论证比留一段没人跑的代码便宜。）
 
-**位置**：与 `app/agent/memory.py` 并列，同属"工作区内容 → 注入"的通道。**独立成模块**
-（而非并进 `LLMNode`）是因为消费者跨三个文件：`tools.py` 的 `get_skill`/`drop_skill`、
-`nodes.py::LLMNode` 的注入块、`graph.py` 构图期把目录烤进 docstring。
+**位置**：`app/resource/skills.py`——资源层里"能力资源"那一支（与同包的 memory.py 并列：一个读
+记忆文件、一个读技能目录，都是"读 agent 之外的东西 → 转成内部表示"）。**独立成模块**（而非并进
+`LLMNode`）是因为消费者跨三个文件：`tools.py` 的 `get_skill`/`drop_skill`、`nodes.py::LLMNode`
+的注入块、`graph.py` 构图期把目录烤进 docstring。
 
 **一个技能 = 一个目录**：`<name>/SKILL.md`（+ 可选 `server.py`、可选 `skill.json`）。
 有 `server.py` 是**能力型**（get_skill 会把它的工具拉进会话）、没有是**知识型**（只有正文）。
 本模块只管**读**：扫描 / 解析 / 渲染；拉起 server、登记工具、关运行体都在 `tools.py`
-（`get_skill`/`drop_skill`/`SessionToolset`）+ `app/agent/mcp.py`。属二期（§13）。
+（`get_skill`/`drop_skill`/`SessionToolset`）+ `app/platform/mcp.py`（宿主侧运行体）。属二期（§13）。
 
 三条纪律：
 

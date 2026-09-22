@@ -6,7 +6,7 @@ app.resource 只依赖 stdlib/pathlib（import 不触发 app.agent → 无需 .e
 import re
 from pathlib import Path
 
-import app.resource as resource
+import app.resource.paths as resource
 
 
 def test_workspace_key_is_sanitized_abs_path(tmp_path):

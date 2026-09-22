@@ -19,10 +19,11 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import SecretStr
 
-import app.agent.mcp as mcp_module
+import app.platform.mcp as mcp_module
 import app.agent.tools as tools_module
 import app.config as config
-from app.agent import mcp, skills
+import app.platform.mcp as mcp  # noqa: E402
+from app.resource import skills
 from app.agent.nodes import LLMNode
 from app.agent.tools import SessionToolset, drop_skill, get_skill
 from app.schema.agent_schema import MCPToolSpec, SkillMeta, SkillPreflight
@@ -867,7 +868,10 @@ def test_main_graph_wires_dynamic_toolset_into_three_nodes(tmp_path, monkeypatch
 
     monkeypatch.setattr(graph_mod, "load_mcp_tool", fake_load_mcp_tool)
     spy = _SpyModel()
-    monkeypatch.setattr(graph_mod, "get_main_chat_model", lambda: spy)
+    # 默认模型的构造已从 app/agent/model.py 并入 LLMNode（2026-09-21）：打类上的静态方法
+    from app.agent.nodes import LLMNode
+
+    monkeypatch.setattr(LLMNode, "main_chat_model", staticmethod(lambda: spy))
 
     async def main():
         graph = await graph_mod.get_main_agent_graph(str(tmp_path), "graph-session")

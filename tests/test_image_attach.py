@@ -1,4 +1,4 @@
-"""@图片路径 附图通道（LLMNode.attach_images_to_payload）的机制测试——无网络。
+"""@图片路径 附图通道（app/resource/images.py::attach_images_to_payload）的机制测试——无网络。
 
 真调用的最小链路见 test_vision_input.py（模型层）；本文件钉的是**通道本身**：
 @token 怎么解析、base64 怎么只进请求体副本、state 怎么保持纯文本、记账怎么防止重发、
@@ -14,6 +14,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 import app.agent.nodes as nodes_module
 from app.agent.nodes import LLMNode
+from app.resource import images
 from app.schema.agent_schema import ImageRef
 
 
@@ -48,7 +49,7 @@ def test_relative_and_absolute_path_both_attach(tmp_path):
     abs_ref = Path(ws) / "b.jpg"
     msgs = [HumanMessage(content=f"@a.png 相对的 @{abs_ref} 绝对的")]
 
-    out, newly = asyncio.run(LLMNode.attach_images_to_payload(msgs, [], ws))
+    out, newly = asyncio.run(images.attach_images_to_payload(msgs, [], ws))
 
     assert [ref["mime"] for ref in newly] == ["image/png", "image/jpeg"]
     assert all(Path(ref["path"]).is_absolute() for ref in newly)
@@ -68,7 +69,7 @@ def test_only_last_human_message_is_parsed(tmp_path):
         HumanMessage(content="这轮没图"),
     ]
 
-    out, newly = asyncio.run(LLMNode.attach_images_to_payload(msgs, [], ws))
+    out, newly = asyncio.run(images.attach_images_to_payload(msgs, [], ws))
 
     assert newly == []
     assert out[0].content == "@a.png 上一轮"  # 旧消息原样
@@ -79,7 +80,7 @@ def test_cjk_tail_is_cut_and_remainder_kept(tmp_path):
     ws = _make_ws(tmp_path)
     msgs = [HumanMessage(content="帮我看@a.png和@b.jpg这两张")]
 
-    out, newly = asyncio.run(LLMNode.attach_images_to_payload(msgs, [], ws))
+    out, newly = asyncio.run(images.attach_images_to_payload(msgs, [], ws))
 
     assert len(newly) == 2
     text = out[0].content[0]["text"]
@@ -91,7 +92,7 @@ def test_quoted_path_with_spaces(tmp_path):
     ws = _make_ws(tmp_path)
     msgs = [HumanMessage(content='@"with space.png" 看看这张')]
 
-    out, newly = asyncio.run(LLMNode.attach_images_to_payload(msgs, [], ws))
+    out, newly = asyncio.run(images.attach_images_to_payload(msgs, [], ws))
 
     assert len(newly) == 1 and newly[0]["mime"] == "image/png"
     assert "[图片已附加: with space.png]" in out[0].content[0]["text"]
@@ -111,7 +112,7 @@ def test_image_token_mime_follows_the_admission_rule():
         ("@b.JPG", "image/jpeg"),              # 大小写不敏感（_IMAGE_EXT_RE 是 IGNORECASE）
         ("@c.jpeg", "image/jpeg"),
     ]:
-        tokens = LLMNode._image_tokens(text)
+        tokens = images.image_tokens(text)
         assert len(tokens) == 1, text
         assert tokens[0][3] == want, text
 
@@ -122,7 +123,7 @@ def test_quoted_token_that_is_not_a_real_file_gets_note_not_crash(tmp_path):
     content = '@"with space.png（新版）" 看看'
 
     out, newly = asyncio.run(
-        LLMNode.attach_images_to_payload([HumanMessage(content=content)], [], ws)
+        images.attach_images_to_payload([HumanMessage(content=content)], [], ws)
     )
 
     assert newly == []
@@ -135,7 +136,7 @@ def test_non_image_at_tokens_left_alone(tmp_path):
     raw = "@note.txt 和 @someone 还有裸@ 与 @\"没闭合 不算"
 
     msgs = [HumanMessage(content=raw)]
-    out, newly = asyncio.run(LLMNode.attach_images_to_payload(msgs, [], ws))
+    out, newly = asyncio.run(images.attach_images_to_payload(msgs, [], ws))
 
     assert newly == []
     assert out[0].content == raw  # 没有任何图块，消息原样
@@ -148,7 +149,7 @@ def test_missing_file_becomes_note(tmp_path):
     ws = _make_ws(tmp_path)
     msgs = [HumanMessage(content="@nope.png 看看")]
 
-    out, newly = asyncio.run(LLMNode.attach_images_to_payload(msgs, [], ws))
+    out, newly = asyncio.run(images.attach_images_to_payload(msgs, [], ws))
 
     assert newly == []
     assert out[0].content[0]["text"] == "[图片未找到: nope.png] 看看"
@@ -157,10 +158,10 @@ def test_missing_file_becomes_note(tmp_path):
 
 def test_oversize_becomes_note(tmp_path, monkeypatch):
     ws = _make_ws(tmp_path)
-    monkeypatch.setattr(nodes_module, "_MAX_IMAGE_BYTES", 16)
+    monkeypatch.setattr(images, "_MAX_IMAGE_BYTES", 16)
     msgs = [HumanMessage(content="@a.png 看看")]
 
-    out, newly = asyncio.run(LLMNode.attach_images_to_payload(msgs, [], ws))
+    out, newly = asyncio.run(images.attach_images_to_payload(msgs, [], ws))
 
     assert newly == []
     assert "[图片过大" in out[0].content[0]["text"]
@@ -168,10 +169,10 @@ def test_oversize_becomes_note(tmp_path, monkeypatch):
 
 def test_over_count_becomes_note(tmp_path, monkeypatch):
     ws = _make_ws(tmp_path)
-    monkeypatch.setattr(nodes_module, "_MAX_IMAGES_PER_MESSAGE", 1)
+    monkeypatch.setattr(images, "_MAX_IMAGES_PER_MESSAGE", 1)
     msgs = [HumanMessage(content="@a.png 和 @b.jpg")]
 
-    out, newly = asyncio.run(LLMNode.attach_images_to_payload(msgs, [], ws))
+    out, newly = asyncio.run(images.attach_images_to_payload(msgs, [], ws))
 
     assert len(newly) == 1  # 第一张照常附
     text = out[0].content[0]["text"]
@@ -187,7 +188,7 @@ def test_already_attached_not_resent(tmp_path):
     ref = ImageRef(path=str((Path(ws) / "a.png").resolve()), mime="image/png")
     msgs = [HumanMessage(content="@a.png 再看一眼"), AIMessage(content="图我看到了")]
 
-    out, newly = asyncio.run(LLMNode.attach_images_to_payload(msgs, [ref], ws))
+    out, newly = asyncio.run(images.attach_images_to_payload(msgs, [ref], ws))
 
     assert newly == []
     assert out[0].content[0]["text"].startswith("[图片已在上文发送过")
@@ -200,7 +201,7 @@ def test_at_in_aimessage_is_never_parsed(tmp_path):
     aim = AIMessage(content="请发 @a.png 给我")
     msgs = [HumanMessage(content="你好"), aim]
 
-    out, newly = asyncio.run(LLMNode.attach_images_to_payload(msgs, [], ws))
+    out, newly = asyncio.run(images.attach_images_to_payload(msgs, [], ws))
 
     assert newly == []
     assert out[1] is aim  # 模型消息原样
@@ -279,7 +280,7 @@ def test_live_apple_image_through_attach_channel(monkeypatch):
     if not os.getenv("THETA_LIVE_VISION"):
         pytest.skip("需要 THETA_LIVE_VISION=1 才跑（真打 API，会花钱）")
 
-    import app.agent.model as model_module
+    import app.agent.nodes as nodes_module
 
     tmp = Path(__file__).resolve().parents[1] / "tmp"
     images = (
@@ -297,11 +298,11 @@ def test_live_apple_image_through_attach_channel(monkeypatch):
     monkeypatch.setattr(
         model_module,
         "settings",
-        model_module.settings.model_copy(update={"CHAT_MODEL_NAME": "glm-4.6v-flash"}),
+        nodes_module.settings.model_copy(update={"CHAT_MODEL_NAME": "glm-4.6v-flash"}),
     )
 
     payload, newly = asyncio.run(
-        LLMNode.attach_images_to_payload(
+        images.attach_images_to_payload(
             [HumanMessage(content=f"@{images[0].name} 这张图里是什么？只回答一个词")], [], str(tmp)
         )
     )
@@ -313,7 +314,7 @@ def test_live_apple_image_through_attach_channel(monkeypatch):
     reply = None
     for attempt in range(4):
         try:
-            reply = asyncio.run(model_module.get_main_chat_model().ainvoke(payload))
+            reply = asyncio.run(LLMNode.main_chat_model().ainvoke(payload))
             break
         except (openai.RateLimitError, openai.APIConnectionError, openai.APITimeoutError) as exc:
             if attempt == 3:

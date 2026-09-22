@@ -1,12 +1,13 @@
-"""项目画像（工作区根 AGENT.md）的读取与截断——`LLMNode.agent_md_block`。
+"""项目画像（工作区根 AGENT.md）的读取与截断——`app/resource/profile.py::agent_md_block`。
 
-原测 `app/agent/profile.py`；该模块 2026-09-12 并入 `LLMNode`（静态方法），用例随之改为直接
-调静态方法（不必构造 LLMNode 实例，也仍不碰 resource 目录）。
+位置史：`app/agent/profile.py` → 2026-09-12 并入 `LLMNode`（静态方法）→ 2026-09-21 剥到资源层
+（判据见 docs/ARCHITECTURE.md §4 的 A/B/C），用例随之改为直接调模块函数（不必构造 LLMNode
+实例，也仍不碰 resource 目录）。
 
 `import app.agent.nodes` 会经包 `__init__`（→ graph → model）触发 `get_settings()`，需 .env
 存在（CLAUDE.md 前提）。
 """
-from app.agent.nodes import AGENT_MD_FILENAME, LLMNode
+from app.resource.profile import AGENT_MD_FILENAME, agent_md_block
 
 
 def test_agent_md_filename_is_workspace_root_agent_md():
@@ -15,13 +16,13 @@ def test_agent_md_filename_is_workspace_root_agent_md():
 
 
 def test_agent_md_block_missing_file_returns_empty(tmp_path):
-    assert LLMNode.agent_md_block(str(tmp_path)) == ""
+    assert agent_md_block(str(tmp_path)) == ""
 
 
 def test_agent_md_block_reads_and_tags_header(tmp_path):
     (tmp_path / "AGENT.md").write_text("  # Theta\n\nLangGraph 编码助手。  ", encoding="utf-8")
 
-    block = LLMNode.agent_md_block(str(tmp_path))
+    block = agent_md_block(str(tmp_path))
 
     assert block.startswith("# 项目画像（工作区 AGENT.md）")  # 加标签，模型知道这段是什么
     assert "LangGraph 编码助手。" in block
@@ -32,13 +33,13 @@ def test_agent_md_block_blank_file_returns_empty(tmp_path):
     """只有空白的画像不注入（免得多塞一条空系统消息）。"""
     (tmp_path / "AGENT.md").write_text("   \n\n\t", encoding="utf-8")
 
-    assert LLMNode.agent_md_block(str(tmp_path)) == ""
+    assert agent_md_block(str(tmp_path)) == ""
 
 
 def test_agent_md_block_truncates_over_cap(tmp_path):
     (tmp_path / "AGENT.md").write_text("长" * 500, encoding="utf-8")
 
-    block = LLMNode.agent_md_block(str(tmp_path), cap=100)
+    block = agent_md_block(str(tmp_path), cap=100)
 
     body = block.split("\n\n", 1)[1]  # 去掉块标题（标题里也有字，别混进字符计数）
     assert body.startswith("长" * 100)  # 截到 cap

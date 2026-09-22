@@ -205,7 +205,7 @@ def _is_in_workspace(path: Path) -> None:
 分类已在 guard 完成，`ToolNode` 收到的全是已分类的 ToolResult，只需提取正文。`except Exception` 在 ToolNode 仅剩一个职责：**MCP 传输层本身挂了**（机制故障，非工具逻辑）。
 
 ```python
-# app/agent/utils.py —— format_tool_result（[已落地]；ToolNode 与编排节点共用）
+# app/platform/tool_results.py —— format_tool_result（[已落地]；只服务 ToolNode 这条 MCP 路径）
 from app.schema.agent_schema import ToolResult
 
 def format_tool_result(result) -> str:
@@ -217,8 +217,23 @@ def format_tool_result(result) -> str:
     return str(result)
 ```
 
-> 位置注意：它在 **`app/agent/utils.py`**（早期本节写作"写在 nodes.py"，已按现值更正）；还额外支持
+> 位置注意：它在 **`app/platform/tool_results.py`**（早期本节写作"写在 nodes.py"，已按现值更正）；还额外支持
 > MCP adapter 的 content-block 列表形态（逐块取 `text`、`json.loads` 还原 `ToolResult` 后走前缀分支）。
+
+> **编排节点不参与这个契约**（2026-09-21 确认）：编排工具**改变的是 agent 自身的编排语义**（见
+> [[docs/ARCHITECTURE]] §4「工具面」），它们**改变的方式各不相同、返回形状也不统一**——写
+> `current_plan` / `loaded_skills` 切片的有，只产一条回执的也有；且都**不过 MCP 边界**，没有
+> content-block 封装可解，也没有 `error_type` 前缀可打。**故不给两类工具定统一的返回类型**：
+> 它们本就是两个位置上的东西，`format_tool_result` 只服务 MCP 这一侧。
+> 早先本节写作"ToolNode 与编排节点共用"，是把意愿写成了事实（代码里编排节点一次都没调用过它）。
+
+> **`ToolMessage` 上那枚结构化戳的单一落点 = 生产端**（2026-09-21）：形状是
+> `additional_kwargs` 里的 `{error_type: <语义标记>}` 或 `{decision: "denied"}`，**构造器只有
+> `app/agent/nodes.py::_tool_stamp()` 一个**（生产端 = ToolNode / ReviewNode，全仓仅有的两个写出点），
+> 键名（`STAMP_ERROR_TYPE` / `STAMP_DECISION` / `STAMP_DENIED`）也定义在那里；消费端只有
+> `CompactNode._tm_status`，它**只读常量**、不再解析 content 前缀（前缀回退只服务戳落地前的旧
+> checkpoint，取值必须与生产端一致——本轮就核对出 `[config_error]` 从来没匹配上过：`ConfigError`
+> 经 `_type_token` 去掉 "Error" 后缀得到的是 `config`）。
 
 async def __call__(self, state: AgentState) -> dict | AgentState:
     tool_calls = list(state.get("approved_tool_calls", []))
@@ -279,7 +294,7 @@ except ConfigError as exc:
     sys.exit(1)
 ```
 
-> ⚠️ 仍未做的那一半：`get_settings()` **懒加载**。当前 `app/agent/model.py` 在模块顶层调用它
+> ⚠️ 仍未做的那一半：`get_settings()` **懒加载**。当前 `app/agent/nodes.py::LLMNode` 在模块顶层调用它
 > （`tools.py` 已无该调用），于是"`.env` 缺键"会在 **import 阶段**抛 `ValidationError` 崩掉，
 > 根本走不进入口的 try——所以 `ValidationError → ConfigError` 的翻译也就无从谈起。要补的是
 > 把模块顶层的调用挪进函数内。
@@ -316,9 +331,9 @@ except ConfigError as exc:
 - [x] `app/schema/agent_schema.py`：`ToolResult` 增加 `error_type` 字段
 - [x] `mcp_service/utils.py`：`guard` 装饰器（含 `internal_error` 桶，同步/异步都支持）+ 分类用 `_type_token`；`mcp_service/file_io.py`：`_resolve_path` + `_is_in_workspace`（原拟名 `_resolve_within_workspace`/`_workspace_root`）
 - [x] 各文件工具：`resolve` 移出 try，操作失败保留 `except OSError → ToolResult(io_error)`
-- [x] `app/agent/utils.py`：`format_tool_result` 提取正文（`ToolNode` 调它）；`ToolNode` 的 `except Exception` 仅作传输层兜底（正文 `工具执行失败: …`、`error_type="tool_error"`）
-- [x] MCP 子进程 env 注入工作区：**`WORKSPACE_PATH`**（不是 `WORKSPACE_ROOT`），由 `app/agent/mcp.py::_build_servers` 注入；`app/config.py` 不参与（工作区已是图的构造期参量）
-- [~] 入口翻译：**已落地一半**——`app/main.py` 捕获 `ConfigError` 打一句人话 + 退出码 1（不再让它裹在 traceback 里）；**未做**：`get_settings()` 懒加载（现在 `app/agent/model.py` 顶层调用）与 `ValidationError → ConfigError` 的翻译
+- [x] `app/platform/tool_results.py`：`format_tool_result` 提取正文（`ToolNode` 调它）；`ToolNode` 的 `except Exception` 仅作传输层兜底（正文 `工具执行失败: …`、`error_type="tool_error"`）
+- [x] MCP 子进程 env 注入工作区：**`WORKSPACE_PATH`**（不是 `WORKSPACE_ROOT`），由 `app/platform/mcp.py::_build_servers` 注入；`app/config.py` 不参与（工作区已是图的构造期参量）
+- [~] 入口翻译：**已落地一半**——`app/main.py` 捕获 `ConfigError` 打一句人话 + 退出码 1（不再让它裹在 traceback 里）；**未做**：`get_settings()` 懒加载（现在 `app/agent/nodes.py::LLMNode` 顶层调用）与 `ValidationError → ConfigError` 的翻译
 - [x] 测试：越界拒绝（绝对路径/`../`/符号链接）、工作区内放行、`internal_error` 不冒充工具失败（`tests/test_guard.py`、`tests/test_file_io_sandbox.py`）
 
 ---

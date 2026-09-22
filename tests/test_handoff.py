@@ -16,7 +16,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 
 from app.agent.nodes import LLMNode
 from app.agent.prompt import HANDOFF_MD_FILENAME, handoff_pointer_block
-from app.agent.skills import scan_skills
+from app.resource.skills import scan_skills
 
 SKILL_NAME = "project-handoff"
 

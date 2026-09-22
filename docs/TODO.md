@@ -3,6 +3,506 @@
 > 当前工作树仍在演进：文档与代码不一致时以代码为准（约定同 CLAUDE.md 与 docs/README.md）。
 > 每条记录动机/现状，避免"当初为什么没做"再次翻车；勾掉前应能指到验证它的提交。
 
+## [x] 节点过度实现：剥离"资源访问的实现"，保留"这一拍做什么"（2026-09-21）
+
+**判据**（承下方「`app/agent/` 的判据（A/B/C）」与「工具面四问」两条——**这是同一条区分在节点层的
+翻版**）：
+
+> **节点 = 图里的一拍**。它的职责是"从 state 取输入 → 做这一拍该做的事 → 写回 state"。
+> 它**调用**别的模块是正当的；它**实现**"某个具体资源怎么访问 / 怎么转换"就是**过度实现**。
+
+| 层 | 定义侧（留下） | 实现侧（出去） |
+| --- | --- | --- |
+| 工具面（四问） | `app/agent/tools.py`：Agent **可以做什么** | `mcp_service/`：**怎么执行** |
+| **节点面（本条）** | 节点：**这一拍做什么**（拼 messages / 调 / 写回） | 被它调用的模块：**资源怎么读、怎么转** |
+
+**实例（用户原话）**：`LLMNode` 最基本的职责是**拼接 messages、发送给厂商、拿回模型回复**——
+不需要实现图片 base64 转码，也不需要实现"确保图片路径在不在"。**而"格式化"可以保留**：把 state 里
+的东西渲染成消息是"这一拍做什么"，不是资源访问。
+
+### 审计（2026-09-21 实测）
+
+| 节点 | 行 | 过度实现 | 处置 |
+| --- | --- | --- | --- |
+| **LLMNode** | 336 | 图片通道 **139** · **画像读取 31** | 都出去（见一） |
+| **ReviewNode** | 325 | 免审策略与判定 **~95** · 提问参数校验 **~60** | 都归 `policy.py`（见二） |
+| **CompactNode** | 230 | **9 个私有辅助共 ~110 行** | 分两步（见三） |
+| OrchestrateNode | 159 | `_invoke` 的签名代填 ~30（注入机制） | 先记，等 dispatch 搬完再估（见四） |
+| ToolNode | 188 | — | **干净** |
+| QueueNode | 36 | — | **干净** |
+
+### 一、`LLMNode`：同一个病有两处，只有一处被提过
+
+`__call__` 里四条注入通道，**三条是"调用"，只有画像是"自己实现"**：
+
+```python
+profile    = await self._read_profile()                                # ← 自己实现：读盘 + 截断 + 实例 memo
+block      = await asyncio.to_thread(memory_block, self.workspace_path)    # ← 只调用
+pointer    = await asyncio.to_thread(handoff_pointer_block, ...)           # ← 只调用
+skill_text = await asyncio.to_thread(skills_block, loaded_skills)          # ← 只调用
+```
+
+画像那 31 行（`agent_md_block` / `_read_profile` / `AGENT_MD_INJECT_CAP` / `_PROFILE_BLOCK_HEADER`）
+是 2026-09-12 从 `profile.py` **并进来**的，理由是"生产侧只有本节点一个消费者"。**那个理由现在站不
+住了**——`memory_block` 同样只被 `LLMNode` 调用，却住在自己的模块里。同一类东西，两种待遇。
+
+而且那个**实例 memo 是个真 bug 面**：`_read_profile` 的 docstring 自己记着"零参入口（langgraph dev）
+一图多 thread、同一实例跨会话复用，那条路径下不重开进程就不会刷新"。
+
+**该保留的**：`format_plan_status`（22 行，把 `state.current_plan` 渲染成文本）与 `_model_for`
+（17 行，按工具集版本决定要不要重新 `bind_tools`）——两者都是"这一拍做什么"。
+
+### 二、`ReviewNode`：两处都归 `policy.py`
+
+- **免审策略与判定**（`_COMMAND_POLICY_PATH` / `_command_policy` / `_SHELL_METACHARS` /
+  `_free_shell_verdict`，~95 行）——已在「`app/agent/` 的判据」条归 `app/agent/policy.py`。
+- **提问参数校验**（`_ask_request` / `_normalize_ask_answer` / `_MAX_ASK_OPTIONS` /
+  `_ASK_SELECT_MODES`，~60 行）——按 C 它是 **`ask_user` 这个 action 的参数校验**，属于 action 的
+  定义侧（`tools.py`）。**但**它必须在**弹面板之前**跑（"空问题 / 超限选项摆到人面前是最糟的形态"），
+  搬去 `tools.py` 会造一条 `nodes → tools` 的边——而**现在 `nodes.py` 刻意不 import `tools.py`**
+  （它拿的是构图期传进来的工具对象）。
+
+  **2026-09-21 拍板：也放 `policy.py`**，不搬去 `tools.py`、不造那条边。理由：它是"闸门挂起前必须
+  成立的判定材料"，与"这条命令要不要免审"同性质。
+
+### 三、`CompactNode`：230 行里 ~110 行是 9 个私有辅助，分两步
+
+**① 纯重复（先收，低风险、立竿见影）**——与职责无关：
+
+- `CompactNode._short(text, 60)` 与**模块级** `_short(text, 120)` 同名不同值；
+- 且与 `CompactNode._first_line(text, 80)` **逐字相同**；
+- 加上 `app/platform/commands/session.py::_short_line`，这是**四处逐字重复**（第一轮扫描已列出，
+  同族还有 `panels.py::truncate` / `skills/github/server.py::_clip`——后两者的**后缀语义刻意不同**，
+  是人看的 vs 教模型补救的，**别顺手合**）。
+
+**② 跨节点协议解析 / 归档策略（归到"约定落点"那条线一起做，别单独动）**：
+
+- `_tm_status`——docstring 自己写着「优先读 `additional_kwargs` 的结构化戳（**ToolNode/ReviewNode
+  生产端已挂**）」：**它知道另外两个节点的内部约定**；
+- `_notes_kind`——决定"哪些工具的结果进 notes"，那是**归档策略**，不是折叠。
+
+### 四、`OrchestrateNode`：先记账
+
+`_invoke` 的签名代填（~30 行：按 `InjectedState` / `InjectedToolCallId` / `InjectedWorkspace`
+注入）是**注入机制**的实现。但它现在服务 5 个工具（memory×2 / `get`·`drop_skill` / dispatch）；
+**等 dispatch 搬去 MCP**（见下方那条）之后只剩 4 个，那时再估这 30 行值不值，别现在动。
+
+### 五、反复出现的病：跨模块的"数据形状约定"**没有单一落点**
+
+审计过程中三次撞见同一个形状——约定在两侧各写一份，靠注释互相指认，**没有一方是权威**：
+
+| 约定 | 生产侧 | 消费侧 | 单点在哪 |
+| --- | --- | --- | --- |
+| MCP 跨进程序列化 | `mcp_service/utils.py::guard` | `app/platform/tool_results.py::format_tool_result` | **没有**（两侧注释互引 + 一条 `tests/test_mcp_pool.py` 用例代管） |
+| `ToolMessage` 的 `error_type` 戳 | `ToolNode` / `ReviewNode` | `CompactNode._tm_status` | **没有**（docstring 里点名"生产端已挂"） |
+| 编排工具的返回切片 | `app/agent/tools.py` 各工具 | `OrchestrateNode.__call__` | **没有**（两侧 docstring 各写一遍形状） |
+
+**这和「`app/agent/` 没有入目录判据」是同一个病的两个面**——都是"**没有单一落点**"。工具面的
+`ToolResult` 被否掉不做统一（见 `docs/EXCEPTION_DESIGN.md` §5），但那不等于这三处约定可以继续
+无主；**该做的是给每处约定一个显式落点**（形如"生产端提供构造器 / 消费端只读它"），而不是让两侧
+注释继续互相指认。
+
+**未决**：第五条的落点形态（一个 `app/agent/contracts.py`？还是各自归入生产端模块？）；
+`app/agent/nodes.py` 剥完 LLMNode 图片与画像后是否还需再分（当前 1357 行 → 预计 ~1160）。
+
+**相关背景**：`docs/ARCHITECTURE.md` §4（工具面四问）、本文件「`app/agent/` 的判据（A/B/C）」
+（目录层同一条区分）、`docs/CONTEXT_ENGINEERING.md`（`compact_node` 的折叠语义，改 CompactNode 前
+先读）。代码落点：`app/agent/nodes.py`（六个节点 + 模块级 helper）、`app/resource/`（图片与画像的
+新家，见另一条）。
+
+### 落地（2026-09-21 当日做完）
+
+- **`LLMNode` 336 → 约 160 行**：图片通道 139 行 → `app/resource/images.py`（`image_tokens` /
+  `resolve_image_path` / `attach_images_to_payload`，全是无状态函数）；画像 31 行 →
+  `app/resource/profile.py::agent_md_block`。**留在节点的**：`format_plan_status`（渲染 state）、
+  `_model_for`（工具集版本决定 bind），以及 `_read_profile` 的**实例内 memo**——"读一次还是每轮读"
+  是"这一拍做什么"，读盘/截断才是资源访问（这条线写进了 `_read_profile` 的 docstring）。
+- **`model.py` 并入**（原计划见下文"二"）：`LLMNode.thinking_extra_body()` / `LLMNode.main_chat_model()`
+  两个静态方法；`graph.py` 调它当默认值，**`model` 参量照旧可注入**（层 A 回放与
+  `test_skill_runtime` 的 monkeypatch 都还在）。**`.env` 时机刻意不变**：`nodes.py` 顶部保留
+  `settings = get_settings()` 一行（懒加载是 `docs/EXCEPTION_DESIGN.md` 里另一条未落地待办）。
+- **`ReviewNode` 剥出 → `app/agent/gates.py`**（**命名按"更广的语义"重估**：装的是"闸门挂起前必须
+  成立的判定材料"，`policy` 只覆盖前三样，故取 `gates`）：`tool_config()` / `command_policy()` /
+  `SHELL_METACHARS` / `free_shell_verdict()` / `ask_request()` / `normalize_ask_answer()`。
+  **顺带清掉两处真冗余**：① `tools.py::_tool_config()` 是**死代码**（生产零消费者，只有它自己的
+  docstring 说"给测试留缝"）——直接删；② `worker_tools()` 里那份**不缓存的**读表改走
+  `gates.tool_config()`。于是"同一份 tool.json、两个缓存、一个不缓存"变成一份缓存一个入口。
+  `tool.json` / `command_policy.json` **仍在原地**（表与解析器必须同住，理由写在 `gates.py` 顶部）。
+- **`CompactNode` 去重（第①步）**：`_short(text, 60)` 与 `_first_line(text, 80)` 逐字相同 → 合成
+  一个 `_first_line(text, limit)`（`limit` 由调用点显式给）；模块级 `_short(text, 120)` 是**另一种
+  语义**（把所有空白折叠成一行，给控制台日志用），**改名 `_one_line`** 并在两边 docstring 写明
+  "刻意不合并"。`app/platform/commands/session.py::_short_line` 按拍板**保留**（理由见下"未决 1"）。
+- **第②步（跨节点协议解析 / 归档策略）只做了一半**：`_tm_status` 改读**生产端常量**（见下"第五条
+  的落地"）；`_notes_kind` / `ARCHIVE_TOOLS`（归档策略）**未动**——它不是"约定无主"，而是"折叠与
+  归档同住一个节点"这件更大的事，动它得连 `compact_node` 一起设计，不在本轮。
+- **`OrchestrateNode._invoke` 的注入代填：按原计划只记账不动**——dispatch 搬走后它仍服务
+  memory×2 / `get_skill` / `drop_skill` 四个工具，30 行值不值留到那时再估。
+
+### 第五条的落地：三处约定各给一个落点（拍板"归生产端，消费端只读"）
+
+| 约定 | 落点与方向 |
+| --- | --- |
+| `ToolMessage` 的结构化戳 | **生产端单点** = `nodes.py` 的 `_tool_stamp()` + `STAMP_ERROR_TYPE` / `STAMP_DECISION` / `STAMP_DENIED`（ToolNode / ReviewNode 是全仓仅有的两个写出点）；CompactNode 只读常量 |
+| 编排工具返回切片 | **执行器为权威** = `OrchestrateNode` + `_EXTRA_SLICE_KEYS` 上方那段说明（messages 必给 / current_plan 可选且链式 / 其余切片要登记）；`tools.py` 只描述"本组给哪些键"并指向它。**权威落在消费端是无奈的**：`nodes.py` 刻意不 import `tools.py`，放生产端就得造一条反向 import |
+| guard ↔ format_tool_result 的跨进程序列化 | 随 `mcp.py` / `utils.py` 一起搬进 `app/platform/` 后**成了邻居**；生产端 = `mcp_service/utils.py::guard`，消费端 `tool_results.py` 只读它 |
+
+**顺带修掉一个从来匹配不上的回退项**：`_FAIL_PREFIXES` 里的 `"[config_error]"` 从未命中——
+`_type_token(ConfigError)` 去掉 "Error" 后缀得到的是 `config`。已按生产端的真实取值改正。
+
+**未决（仍开放）**：`app/agent/nodes.py` 剥完图片与画像后是否还需再分（现 1101 行）。
+
+**2026-09-22 量过一轮，结论是"先不动"，但下次要动请按下面这两刀切**（用户提的是"拆成
+`nodes/` 包 + `tools/` 包"，评估后否掉）：
+
+- **拆包的代价是具体的，不是理论**：测试里有 **5 处 `monkeypatch.setattr(nodes_module, …)`**
+  （`interrupt` / `memory_block` / `skills_block` / `settings`）。变成包、靠 `__init__` re-export 的话，
+  补丁**打在包对象上、读全局的是子模块** → **静默失效**（测试照绿、行为没被钉住）——与
+  `app/resource/paths.py` 的 `RESOURCE_ROOT` 同一个坑（那条已在 docstring 里留痕）。另有 22 处
+  `app.agent.nodes.X` 引用点要跟着改。收益只有导航性：**包边界不是判据**，判据问的是"它是不是一类
+  独立的东西"（机制 vs 定义、引擎 vs 一拍）。
+- **该切的两刀**（按同一把尺）：
+  1. **`app/agent/compact.py`**——折叠**引擎**（扫块 / 判状态 / 渲染摘要行 / 归档策略，纯函数）从
+     `CompactNode` 剥出，节点只剩"读 state → 调引擎 → 写 state"。**顺带就是上文 CompactNode 第②步**
+     （`_tm_status` 的跨节点协议 + `_notes_kind` 归档策略）。`nodes.py` 1101 → 约 860。
+  2. **`app/agent/skill_runtime.py`**——`tools.py` 里那 **466 行技能加载机制**（起 server / 三向校验 /
+     体检 / 依赖预检 / import 探针 / `_register_skill_runtime`）加 `SessionToolset`(124)。它与
+     `get_skill`/`drop_skill` 的**工具定义**是两种东西，性质同 `app/platform/mcp.py`（"起进程"的
+     基础设施）——正是本条"记账 2"点名的那一族。`tools.py` 1165 → 约 700。
+  两刀切完都落回本项目其它模块的量级（`mcp.py` 669 / `skills.py` 429）；在那之后再谈要不要拆包，
+  且那时必须"各模块 own 自己的全局、测试打具体子模块"。
+
+
+## [x] `app/agent/` 的判据（A/B/C）与资源层拆分（2026-09-21）
+
+**动机**：承下方「`dispatch_subtasks` 该跟 worker 同侧走 MCP」一条——那条的起点是"`app/agent/` 是
+唯一没有入目录判据的目录"。**现在判据有了**，本条是它的落地清单：按判据一过，`app/agent/` 里有
+两个模块要出去、三处片段要记账、一个模块要合并进来。
+
+### 判据（三条问，命中任一即属于 `app/agent/`；三条都不中则不属于）
+
+| | 问什么 | 它回答 | 例 |
+| --- | --- | --- | --- |
+| **A** | 是否参与 Agent 的**决策上下文**？ | "**Agent 现在知道什么**" | 当前对话 / plan / notes / memory / loaded skills / 工具状态 / workspace 状态的语义表示 |
+| **B** | 是否定义 Agent 的**决策过程**？ | "**Agent 如何从当前状态走向下一步**" | `LLM → tool call → queue → review → orchestrate/tool → LLM`；Graph / Node / AgentState |
+| **C** | 是否定义 Agent **可以采取什么行动**？ | Agent action —— **不是** action implementation | plan / load_skill / write_memory / dispatch_subtask |
+
+**C 的关键区分**（这条最容易被做错）：
+
+- `app/agent/tools.py` 描述"Agent 可以做什么**决策性动作**"（*"我要写这个文件"*）→ **属于 agent**；
+- `mcp_service/file_io.py` 负责"这个动作**实际怎么执行**"（真正写盘）→ **不属于 agent**。
+
+**一条反向限制**：**代码只因为 Agent 恰好调用了某个外部边界，并不因此属于 Agent。**
+
+### 审计结果（2026-09-21 实测）
+
+| 模块 | 行 | A | B | C | 判定 |
+| --- | --- | --- | --- | --- | --- |
+| `graph.py` / `nodes.py` / `state.py` / `__init__.py` | 245 / 1357 / 54 / 7 | | ✓ | | 留 |
+| `tools.py` | 1313 | | | ✓ | 留（Agent action 的定义） |
+| `prompt.py` | 348 | ✓ | | | 留（含一处越界，见"记账"3） |
+| `memory.py` | 294 | ✓ | | | **搬**（见一） |
+| `skills.py` | 428 | ✓ | | | **搬**（见一） |
+| `model.py` | 72 | | △ | | **并入**（见二） |
+| **`mcp.py`** | **638** | **✗** | **✗** | **✗** | **出**（见四） |
+| **`utils.py`** | **111** | | | △ | **出**（见四） |
+
+### 一、`app/resource/` 资源包（认知 / 能力 / 输入）
+
+`app/resource/paths.py`（94 行，落盘路径单点）**升格成包**——不另起 `app/memory/` + `app/skills/`
+（**`app/skills/` 会与顶层 `skills/`（技能库本体）重名**，而 `skills.py` 里还有
+`SKILLS_PACKAGE = "skills"` 指向那个包，读起来极绕）：
+
+```
+app/resource/
+  paths.py    ← 现在的 app/resource/paths.py（workspace_key / workspace_dir / session_db_path /
+                memory_root / sessions_dir / iter_session_dbs / remove_legacy_single_db）
+  memory.py   ← 认知资源（294 行）
+  skills.py   ← 能力资源（428 行）
+  images.py   ← 输入资源：@路径 → data URI 的调用期转码（139 行，从 LLMNode 剥出）
+```
+
+判据一致——**读 agent 之外的东西、转成内部表示**：落盘路径 / 记忆文件 / 技能目录 / 图片文件。
+
+- **`images.py`**（2026-09-21 认定）：139 行全是 `@staticmethod`，测试从头到尾不构造 `LLMNode`
+  （`tests/test_image_attach.py` 直接调静态方法）；输入是"HumanMessage 文本 + workspace"、输出是
+  "请求体副本 + 记账"，**完全不碰 state**。它还有一条明确的资源访问政策：**不做沙箱拒绝**（`@` 是
+  用户手输的通道，沙箱约束的是模型的工具调用、不约束用户自己）。它占 `LLMNode` 41%。
+- **memory / skills 暂时各自保持单文件**（2026-09-21 拍板）：我另发现"技能内部有缝"（解析渲染
+  vs 加载机制），**先不切**。
+- **红利**：`app/platform/runtime.py:68` 现在是函数内**懒加载**（`# noqa: PLC0415`），为的是避开
+  `app.agent.*` import 即需 `.env`；`memory.py` 只依赖 `app.resource` + `app.schema`，**搬进资源层后
+  没有 `.env` 依赖，懒加载可以去掉**（`app/resource/paths.py` 的 docstring 正是这么描述自己的定位的）。
+- **搬家成本低**：两者都是"叶子"（`memory.py` → `app.resource` + `app.schema`；`skills.py` → **只有
+  stdlib + `app.schema`**），无循环依赖要解。真正的成本在测试：**9 个文件**改 import
+  （`test_memory` / `test_memory_injection` / `test_memory_tools` / `test_skills` / `test_skill_runtime`
+  / `test_skill_tools` / `test_handoff` / `test_github_skill_e2e` / `test_steering`）。
+- **`memory.py` 还有一个后续项**：长期记忆分层（见下方那条）实施时它多半还要**再出去一次**——
+  ① ② 层的路径不在 `resource/<ws_key>/` 下，`memory_block(workspace)` 的签名会失效，`mN` 编号与
+  `MEMORY_INJECT_CAP` 的"单份"假设也都不成立。那时它从"单文件读写单点"变成"多层记忆的路径 +
+  解析 + 预算分配 + 播种"——**按四问第三问，那是 Resource abstraction 方向**。
+
+### 二、`model.py` 合并进 `LLMNode`
+
+`model.py`（72 行）= `get_main_chat_model()` + `thinking_extra_body()`。合并形态：
+**成为 `LLMNode` 的 `@staticmethod`**（`graph.py` 调它当默认值）。
+
+- ⚠️ **硬约束：`model` 参量必须保留可注入**。`get_main_agent_graph(model=None)` /
+  `get_sub_agent_graph(model=None)` 的参量不能收掉——`evaluation` 的层 A 回放靠
+  `build_eval_graph(..., model=replay_model)` 注入 `ReplayChatModel`，`tests/test_skill_runtime.py:870`
+  也 monkeypatch 它。所以是"**默认构造跟着 LLMNode 走**"，**不是**让 `__init__` 自己造模型。
+- **先例**：`profile.py` 2026-09-12 并入时就是这么做的——"**留作静态方法而非内联**——测试仍可直接
+  调用它，不必构造 LLMNode 实例"。`model.py` 的测试（`test_thinking_config.py` /
+  `test_vision_input.py` / `test_image_attach.py`，都写 `import app.agent.model as model_module`）
+  正好吃这一套。
+- **连带改**：`app/config.py:23` 的注释引用了 `app/agent/nodes.py::LLMNode::thinking_extra_body`。
+
+### 三、`app/agent/policy.py`：权限读取**单点**（表不动）
+
+**`tool.json` 与 `command_policy.json` 保留在原地**（2026-09-21 拍板，理由是纪律不是偏好）：
+CLAUDE.md 明写"**元字符刻意留在代码里**（`_SHELL_METACHARS`）：那是解析器的**词法定义**不是策略，
+进数据文件等于让人能在不改代码的情况下削弱解析器"。把表搬进资源包、解析器留在 `ReviewNode`，会
+制造"只改表就能改行为"的误读——而第①步（元字符串）恰恰改不动。`tool.json` 同理：四个键
+（`need_review` / `source` / `worker_allow` / `free_when`）的语义全在代码分支里。
+按 A/B/C，`free_shell_verdict` 是 **B**（闸门的决策过程），表是它的输入，**不可分**。
+
+**但实测有真重复要收**——`tool.json` 被**三处各读一遍**：
+
+| 读者 | 缓存 |
+| --- | --- |
+| `app/agent/nodes.py:644` `ReviewNode._tool_config()` | lru_cache |
+| `app/agent/tools.py:714` `_tool_config()` | lru_cache |
+| `app/agent/tools.py:89` `worker_tools()` 里的 `_WORKER_TOOL_CONFIG` | **每次读盘，无缓存** |
+
+**同一份文件、两个缓存、一个不缓存。** 落点 `app/agent/policy.py`，装：`tool_config()` /
+`command_policy()` / `free_shell_verdict()`（从 `ReviewNode` 搬出）+ `_SHELL_METACHARS`。
+这样"策略表 + 解析器仍住在一起"（纪律不破），`nodes.py` 掉约 90 行、`tools.py` 去掉重复读取。
+**"权限有单一入口"的目的能达到，代价是它留在 `app/agent/` 内（它是 B 的配置层）。**
+
+**还要装一块**（2026-09-21 与「节点过度实现」条一并拍板）：`_ask_request` /
+`_normalize_ask_answer` / `_MAX_ASK_OPTIONS` / `_ASK_SELECT_MODES`（提问闸门的**输入校验**，~60 行，
+从 `ReviewNode` 搬出）。它按 C 是 `ask_user` 这个 action 的参数校验、本该归 `tools.py`，但**必须在
+弹面板之前跑**，搬去 `tools.py` 会造一条 `nodes → tools` 的边（现在 `nodes.py` 刻意不 import
+`tools.py`）——所以归这里。
+
+⚠️ **命名要重估**：该模块最终装的是"**闸门挂起前必须成立的判定材料**"（策略表 + 免审判定 +
+提问校验），`policy` 只覆盖了前三样。动手时按这个更广的语义取名（`gates.py` 之类），别让名字窄于
+内容——这条正是本项目反复吃亏的地方。
+
+### 四、判出 `app/agent/` 的两个（独立于上面三件）
+
+- **`mcp.py`（638 行）**：A/B/C **三个都不答**——它是运行体机制（拉起子进程 / 常驻会话 / owner task
+  / schema 缓存 / 关闭），不是"Agent 知道什么"、不在图里、也不是"Agent 能做什么"。独立证据早就
+  摆在眼前：消费者是 `app/platform/loop.py`（`close_all_pools` / `close_session_pool`）、
+  `evaluation/runner.py`、`mcp_service/sub_agent.py`——**基座管着它的关闭**；`graph.py` 只用它的
+  `load_mcp_tool` 两次。
+- **`utils.py`（111 行）**：按上面那条**反向限制**，`format_tool_result` / `coerce_tool_result` 的
+  全部存在理由就是"MCP 跨进程返回的形状需要解开"（content-block → `json.loads` → 还原
+  `ToolResult`）——它服务的是**边界**，不是 Agent 语义。住在 `app/agent/` 只因为两个调用方
+  （`ToolNode`、dispatch 的 worker spawn）碰巧都在 agent 侧。
+- **两者是同一件事的两半**（主进程侧的 MCP 边界：一个管运行体、一个管返回形状），**建议放一起**。
+  落点三选一，**未定**：跟 `mcp_service/` 做邻居 / 跟 `app/resource/paths.py` 一样做 `app/` 顶层单文件 /
+  `app/platform/`（因为基座管关闭）。另外 `utils.py` 若要独立，它和服务端 `guard` 之间那条
+  **跨进程序列化契约**目前**没有单一落点**（只靠两侧注释 + 一条 `test_mcp_pool.py` 的用例代管，
+  见 `docs/EXCEPTION_DESIGN.md` §5）。
+
+### 记账（先不切，各自独立成立）
+
+1. **`memory.py::ensure_memory_template`** —— 建会话播种，消费者是 `app/platform/runtime.py:68`。
+   性质是**资源生命周期**，不是 A/B/C。它只是恰好和读写语义住在同一个文件里。
+2. **`skills.py` 的加载机制那半**（`read_skill_env` / `read_requirements` / `read_preflight` /
+   `server_module`）—— 实测消费者**只有 `tools.py` 的加载组**（`_register_skill_runtime` /
+   `_missing_requirements` / `_skill_preflight_line` / `_probe_skill_startup`）。按四问的口径，这一族
+   和 `mcp.py` 同性质（"起进程"的基础设施）。**2026-09-21 拍板暂不切。**
+3. **`prompt.py::handoff_pointer_block` + `HANDOFF_MD_FILENAME`** —— project-handoff **技能**的指针
+   注入，住进了提示词模块。
+
+### 判据已落纸（2026-09-21）
+
+A/B/C 已写进 `docs/ARCHITECTURE.md` §4，**紧挨工具面四问**（配对关系：一个判"是 MCP 还是编排"、
+一个判"进不进 `app/agent/`"，三条都不中才轮到四问决定去处）。文档里带上了三个要点：**配对关系**、
+**C 的同构性**（工具面 / 节点面是同一条区分）、**可操作的排除判法**（"外部边界不存在还需要吗"）。
+本条的审计表留在这里作为**实例证据**——它是"为什么 `mcp.py` / `utils.py` 该出去"的原始记录，
+文档里只放判据、不放大表。
+
+**相关背景**：`docs/ARCHITECTURE.md` §4（工具面四问——先过那一关，再过本条的 A/B/C）、本文件
+「`dispatch_subtasks` 该跟 worker 同侧走 MCP」条（四问的第一次应用）、`docs/LONG_TERM_MEMORY.md`
+§8（分层分期，决定 `memory.py` 的第二次搬迁）。**未决**：`mcp.py` + `utils.py` 的落点（见四）、
+A/B/C 要不要给"闸门判定的配置"开例外（本条的结论是不开，表因此不动）。
+
+### 落地（2026-09-21 当日做完）
+
+- **一 · `app/resource/` 包**：`paths.py`（原 `app/resource.py` 原样搬入，只多一级 `parent`）/
+  `memory.py` / `skills.py`，新增 `images.py`（从 `LLMNode` 剥出）与 `profile.py`（同）。
+  `__init__.py` **只转出 paths 那几个函数**——`RESOURCE_ROOT` 刻意不转出：它是可 monkeypatch 的
+  模块全局，转出去会让 `app.resource.RESOURCE_ROOT = …` 这种补丁**静默失效**（理由写在 `paths.py`
+  的 docstring 里；9 个测试文件改成 `import app.resource.paths as resource`）。
+  **红利兑现**：`app/platform/runtime.py` 的 `ensure_memory_template` 懒加载去掉、改顶层 import
+  （资源层不 import app.agent，`import app.platform` 仍不触发 .env）。
+- **二 · `model.py` 并入 `LLMNode`**：见上一条的落地记录（同一件事）。
+- **三 · `app/agent/gates.py`**：见上一条的落地记录。三处读表收拢成一份缓存；
+  **`tool.json` / `command_policy.json` 保留在原地**（纪律：表与解析器同住）。
+- **四 · `mcp.py` + `utils.py` 出 `app/agent/`**：**用户拍板归基座** → `app/platform/mcp.py`（运行体
+  机制）与 `app/platform/tool_results.py`（工具结果归一化）。两条代价已认下：① 这是全仓**唯一一处
+  反向 import**（`app.agent.*` → `app.platform.*`，单向；这两个模块不 import app.agent，故
+  `import app.platform` 仍不触发 .env）；② `import app.platform` 会连带拉进
+  `langchain_mcp_adapters`（重，但不读 .env）。`loop.py` 的两处懒加载随之改回顶层——原先懒加载的
+  理由是"import 即需 .env"，那个理由随搬家消失了。
+- **记账三条的现状**：`ensure_memory_template` 仍住 `memory.py`（未切，性质是资源生命周期）；
+  `skills.py` 的**加载机制半**（`read_skill_env` / `read_requirements` / `read_preflight` /
+  `server_module`）**仍未切**（拍板暂不切）；`handoff_pointer_block` 仍在 `prompt.py`。
+- **未决（本轮已消化）**：`mcp.py` + `utils.py` 的落点 → `app/platform/`（用户拍板）；
+  A/B/C 给不给"闸门判定的配置"开例外 → **不开**，表与解析器同住，故 `gates.py` 留在 `app/agent/`。
+
+
+## [x] `dispatch_subtasks` 该跟 worker 同侧走 MCP；memory 按拍板留在编排工具（2026-09-21）
+
+**动机**：起点是 `LLMNode` 越来越肿（`app/agent/nodes.py`，336 行 = 装配 35 + 图片通道 139 +
+画像 31 + 调模型若干）。但 LLMNode 只是症候——真正的病是 **`app/agent/` 是这套架构里唯一没有
+入目录判据的目录**：`app/schema/`（只有属性、可序列化的纯数据）、`app/platform/`（基座纪律）、
+`app/tui/`（UI 协议）、`mcp_service/`（是不是一个 MCP server）、`skills/`（是不是可插拔领域包）
+都有可判定的标准，只有 `app/agent/` 的标准是"agent 要用的东西"——等于没有标准。于是任何新功能
+问一句"算基座吗？算 MCP 吗？"，答案都是"不算"，只能落进来。**顺着这条线查工具面，发现同一个病
+在编排队列重演：判据也是混的。**
+
+**现状（2026-09-21 实测）**：编排工具 10 个，按注入需求分三组——
+
+| 注入 | 工具 |
+| --- | --- |
+| 只 `InjectedState` | 计划三件套、`read_note`、`ask_user` |
+| `InjectedState` + `InjectedWorkspace` | `get_skill`、`drop_skill` |
+| **只 `InjectedWorkspace`** | **`write_memory`、`read_memory`、`dispatch_subtasks`** |
+
+第三组的**返回形状**与普通 MCP 工具相同（纯回执）——但**返回形状不是判据**（见
+`docs/ARCHITECTURE.md` §4 的四问）：按"改变 agent 自身运行语义"这条定义，memory 改的是跨会话
+先验、dispatch 改的是执行结构，**两件都算编排**，它们待在该队列里是对的。真正出错的是它们在编排
+队列里的**理由**——`app/agent/tools.py:534-536` 的注释写着："与 dispatch 同走 OrchestrateNode，
+**因为都需要注入工作区**（对模型隐藏的 `InjectedWorkspace`）。"
+
+**这条因果链是错的**，反例在同一份表里：`mcp_service/file_io.py:32` 同样需要工作区
+（`_workspace_path = os.environ.get("WORKSPACE_PATH")`），却是普通工具、走 `ToolNode`。真正的
+链条是：
+
+1. 它们是**主进程内的普通函数**（不是独立进程）；
+2. 主进程**同时服务多个工作区**——`evaluation/runner.py:230` 每任务 `build_eval_graph(workspace, …)`
+   建一张图、一个进程串跑 N 个任务；`langgraph dev` 更是一图多 thread。**env 是进程级的，一个
+   进程只有一个值，表达不了"我是哪个工作区"**；
+3. 所以只能把 workspace 当参数递进去 → `InjectedWorkspace`（`app/agent/tools.py:384`）；
+4. 而**唯一能代填这个注入的执行器是 `OrchestrateNode._invoke`**（`ToolNode` 走的是
+   `await tool_obj.ainvoke(args)`，没有注入源）；
+5. → 只能待编排队列。
+
+**所以"需要 workspace"不是理由，「住在主进程 + 一进程多工作区 ⇒ 必须靠注入」才是。** 前者是
+处境，不是结构。`file_io` 从不需要 MCP 化，因为它一开始就是进程——工作区就是它的启动配置。
+
+**决定（2026-09-21 拍板；与上一轮"两者都独立成 MCP"的提议不同）**：
+
+按 `docs/ARCHITECTURE.md` §4 的**四问**逐条走——两者**第一问、第二问相同**（都不是对外部世界的
+调用；都改变 agent 的运行语义），分岔在第三、四问：
+
+- **memory 留在编排工具**：命中**第三问**（还涉及"持久化 / workspace"等资源）→ 方向是
+  **Resource abstraction**（资源访问单点），**不是 MCP**。附带好处：读写都在主进程，避开"注入在
+  主进程读、写入在子进程写"这对跨进程碰同一批文件的组合。
+- **dispatch 走 MCP**：命中**第四问**（需要独立进程 / 独立 Agent runtime——它派生 worker）→
+  **multi-agent 正落在这里**。它与 `mcp_service/sub_agent.py` 是**一对**（一个拉起、一个被拉起），
+  worker 既然住在 MCP 侧，拉起它的入口就该在同一侧。
+
+**代价与副产物（要摆明）**：
+
+1. **编排队列仍要求两种注入**（`InjectedState`：计划三件套 / `read_note` / `ask_user` /
+   `get`·`drop_skill`；`InjectedWorkspace`：`write_memory` / `read_memory`）——但**注入不是判据，
+   是后果**：凡"改变 agent 运行语义"的工具都住在主进程，住主进程才需要注入（四问见
+   `docs/ARCHITECTURE.md` §4）。`ORCHESTRATE_SOURCES` 只删 `"dispatch"`，`"memory"` 保留。
+2. **`InjectedWorkspace` 的定位随之清楚**：它是"住主进程"的后果，服务的是按第二问/第三问留在
+   主进程的工具（memory×2 / `get`·`drop_skill`）——不是历史遗留，但也不是判据（见未决 3）。
+3. **`app/resource/memory.py` 的归属问题不变**（未决 1）：消费者仍跨 agent + platform 两处，
+   与 dispatch 搬不搬无关。
+
+**dispatch 迁移的工作项（落到 `mcp_service/dispatch.py`）**：
+
+- **落点**：新建 `mcp_service/dispatch.py`，**不并进 `sub_agent.py`**——后者是 **worker 侧**的
+  server（跑在被拉起的子进程里），dispatch 是**主侧**入口；同放一个 server 会变成"这个 server
+  的进程里再 spawn 一个同款 server 进程"的嵌套。
+- **`_PROJECT_ROOT` 要重算，且不能靠 cwd**：`tools.py:46` 是
+  `Path(__file__).resolve().parent.parent.parent`，搬到 `mcp_service/` 下要改成 `parents[1]`。
+  **尤其别靠 cwd**——`stdio_connection` 给 server 设的 `cwd=workspace`（工作区）而非项目根；
+  项目根只能靠 `PYTHONPATH`（它已被设成 `PROJECT_ROOT`）或 `__file__`。
+- **`AGENT_INBOX_URL` 的转发链多一跳，必须显式接上**：现在是
+  `主进程 env →（_worker_child_env）→ worker`；搬后变成
+  `主进程 env →（stdio_connection 的 extra_env）→ dispatch server env →（server 内组装）→ worker`。
+  **漏掉中间那跳不会报错，只会静默发往默认端口**——正是 `tools.py:417-418` 注释警告过的失效。
+  主侧 `_build_servers` 要为这个 server 读 `os.environ["AGENT_INBOX_URL"]` 塞进 `extra_env`。
+- **`worker_tools()` 的排除要复核**：现在靠 `source: "dispatch"` 不命中 `_WORKSPACE_SOURCES` /
+  `_WEB_SOURCES` / `worker_allow` 而被剔除（`tools.py:94-99`）。搬成 `mcp_service/dispatch` 后
+  **仍然不命中**，防线自动保持——但**别顺手把它加进 `_WORKSPACE_SOURCES`**（那是"新 mcp_service
+  server 都算工作区只读"的错误推广），那会打开**递归派发**。
+- **`tool.json`**：`source` 改 `mcp_service/dispatch`、`need_review` 维持 `false`；
+  `ReviewNode.ORCHESTRATE_SOURCES` 删 `"dispatch"`。
+- **顺带简化**：现有 `async + asyncio.to_thread` 包装（`tools.py:538-540`，为避开 langgraph dev
+  的 blockbuster 拦事件循环里的阻塞调用）在子进程里**不需要**——主进程的 blockbuster 管不着
+  MCP server 进程（`file_io` 的工具就是同步的）。
+
+**与「长期记忆分层化」的关系**（该条见下方 `[ ] 长期记忆分层化`）：memory 既然留在编排工具，
+分层要改的就是**编排工具自己的签名**（加 `scope`）——不再有"MCP 化顺带重签"这回事，一次改完
+即可。该条 §待拍 5（"工具面怎么指定层"）问的仍是那个签名。分层后 ① ② 层跨工作区、路径不在
+`resource/<ws_key>/` 下，这条与 memory 是否 MCP 化无关，仍要在 `app/resource/paths.py` 长出路径单点
+（注入在主进程 `LLMNode`，直接 import 即可）。
+
+**未决**：
+
+1. **`app/resource/memory.py` 的归属**（独立于 dispatch，仍然成立）：它被三方消费——`LLMNode`
+   （注入用的 `memory_block`）、`app/platform/runtime.py`（`ensure_memory_template` 播种）、
+   `app/agent/tools.py`（读写工具）。**一个被 agent / 基座两处 import 的模块不该住在 `app/agent/`
+   里**——它和 `app/resource/paths.py` 是天然的一对（一个管路径 `workspace_key`/`memory_root`，一个管
+   内容解析/追加/覆写），该做邻居。是否本轮一起搬？
+2. **dispatch 的审批策略**：`need_review` 维持 `false`（"派发本身免审"是既有语义），还是借搬家
+   重审？（worker 侧真正有副作用的调用仍各自过闸门，见 `docs/MULTI_AGENT.md`。）
+3. **`InjectedWorkspace` 的存废与落点**：dispatch 搬走后它剩 memory×2 / `get_skill` / `drop_skill`。
+   按上面"代价 2"它是**长期设施**而非将就——那么 `tools.py:384` 的 docstring 得改（现在写着
+   "dispatch 往该工作区 spawn worker，memory 系列工具用它定位记忆文件"，dispatch 那半将过时），
+   以及要不要把它挪到更显眼的位置、把"只为留在主进程的工具服务"这条定位立住？
+
+**已顺带修（2026-09-21）**：`OrchestrateNode` 的 docstring 曾把"**不产生真实副作用**"写成编排
+工具与普通工具的关键区别——**10 个里 4 个有**（`dispatch_subtasks` / `write_memory` /
+`get_skill` / `drop_skill`）。那句话正是 ReviewNode 承重约束「interrupt 只能待在'挂起之前无副
+作用'的节点里」的依据，留着会误导后来者把闸门搬进本节点。已改为：关键区别只留**返回值的形状**
+（state 切片 vs `ToolResult`），副作用逐条点名（无的四个 / 有的四个），并补一条 ⚠️ 明写"本节点不
+承载 interrupt、闸门唯一落点在 ReviewNode"。
+
+**相关背景**：`docs/LONG_TERM_MEMORY.md`（§5 的路径安全不变量——"模型碰不到记忆文件路径"；
+memory 留在编排工具，这条靠 `InjectedWorkspace` 继续对模型隐藏参数；§8 的分期）、
+`docs/MULTI_AGENT.md`（dispatch 的形态与跨进程审批回流）、`app/platform/mcp.py`（运行体常驻机制，
+`mcp_service/dispatch.py` 直接复用同一套 `_ServerWorker`）。代码落点：`app/agent/tools.py`
+（`InjectedWorkspace` / `write_memory` / `read_memory` / `dispatch_subtasks`）、
+`app/agent/nodes.py::OrchestrateNode._invoke`（代填逻辑——memory 留下则它仍是必需）、
+`app/agent/tool.json`（`source` 与 `need_review`）、`app/resource/paths.py`（路径单点）。
+
+### 落地（2026-09-21 当日做完）
+
+- **落点**：新建 `mcp_service/dispatch.py`（**不并进 `sub_agent.py`**——后者是 worker 侧的 server，
+  dispatch 是主侧入口，合起来会变成"这个 server 的进程里再 spawn 一个同款 server 进程"）。
+  `_PROJECT_ROOT` 用 `Path(__file__).resolve().parents[1]`（**不靠 cwd**：stdio_connection 给的 cwd
+  是工作区）；`source` 改 `mcp_service/dispatch`；`ReviewNode.ORCHESTRATE_SOURCES` 删 `"dispatch"`。
+- **`AGENT_INBOX_URL` 的转发链显式接上**（本条最容易静默失效的一跳）：
+  `主进程 env →（新增 _build_servers::_inbox_env）→ dispatch server env →（它内部的
+  _worker_child_env）→ worker`。新用例钉住"有地址就带、没有就不带"
+  （`tests/test_mcp.py::test_dispatch_server_env_forwards_inbox_url_only_when_present`）。
+- **递归派发的防线自动保持**：`worker_tools()` 的两条 source 规则都不命中它、也没有 `worker_allow`
+  → 天然被剔除；新用例把它写成断言
+  （`test_dispatch.py::test_source_registered_and_stays_out_of_orchestrate_and_worker`），并在
+  注释里点名"**别把它加进 `_WORKSPACE_SOURCES`**"。
+- **顺带简化**：`async + asyncio.to_thread` 的包装去掉（主进程的 blockbuster 管不着 MCP server
+  进程）；新增参数校验——空 `sub_tasks`（或全空白）→ `InvalidArgumentError`，不再回一条
+  "已并发派出 0 个 worker"让模型以为查过了。
+- **未决逐条处置**：① `app/agent/memory.py` 的归属 → **本轮一起搬**（→ `app/resource/memory.py`）；
+  ② dispatch 的审批策略 → **维持 `need_review: false`**（用户拍板：派发只是起只读资料收集 worker，
+  worker 侧真正有副作用的调用各自过闸门）；③ `InjectedWorkspace` 的存废 → **留存**（仍服务
+  memory×2 / `get_skill` / `drop_skill`），docstring 重写为"**它是'住在主进程'的后果，不是判据**"，
+  并点名 dispatch 已离开这条路径。
+- **验证**：`tests/test_dispatch.py` 重写（9 例：接线 / env 转发 / 并发汇总 / 失败隔离 / 空列表 /
+  工作区缺失）、`tests/test_dispatch_worker_approval.py` 改为**直接调 MCP 工具**跑真链路
+  （批准 → 工具真执行、拒绝 → 回灌 `[approval_denied]`，断言不变）、`tests/test_mcp.py` 补一跳转发用例。
+
+
 ## [ ] 运行中转向：用户消息队列（输入不等整轮结束才递进）（2026-09-19）
 
 **场景**：用户给 agent 派了任务、指了 A 方向，agent 已开跑；跑到一半用户发现 A 不合意图、
@@ -144,7 +644,7 @@ checkpoint 里，长期记忆又只收"约束/偏好/项目事实"、不收**任
    退化模式起步——靠模型在阶段切换/已核实混淆时自评。**倾向后者起步**，锚点等运行中 compact
    （上面那条）落地再搭车。
 3. **保存落点**：交接材料是任务态，**别写进 memory.md**（污染"只存重取不到的结论"的既有
-   语义）。候选：`resource/<ws_key>/handoff/`（`app/resource.py` 加单点函数）或工作区内
+   语义）。候选：`resource/<ws_key>/handoff/`（`app/resource/paths.py` 加单点函数）或工作区内
    约定路径。落点定了才谈"新会话怎么知道有交接材料"（新会话播种时提示模型去读？）。
 4. **动作映射**：保存 ≈ 资源区写入（免审与否沿用现有策略表）；新建接续 ≈ `/new session`
    （已有）；恢复/查看 ≈ `/session <id>`（已有）。"在指定目录新建并打开"在 Theta 没有对应物
@@ -511,9 +1011,10 @@ ToolMessage 进 history（token，由 compact 折叠兜底）。实测里还有*
 **相关背景**：`docs/LONG_TERM_MEMORY.md`（§1 三条通道的边界表、§3 单文件格式与编号规则、§4 注入
 与 cap、§5 工具与路径安全不变量、§8 分期）——**注意 §8 的 Phase C 把"跨工作区共享记忆"与
 "分层摘要"列为"明确不做、后续再议"，本条正是把那条提前**；动手前先读该文，别与它的单文件格式 /
-`m1,m2,…` 编号 / "只存工作区里重取不到的结论"这三条既有纪律打架。代码落点：`app/agent/memory.py`
-（读写单点）、`app/resource.py`（落点单点）、`app/agent/nodes.py::LLMNode`（注入点，
-`memory_block` / `agent_md_block`）、`app/agent/tools.py`（`write_memory`/`read_memory` 与
+`m1,m2,…` 编号 / "只存工作区里重取不到的结论"这三条既有纪律打架。代码落点：`app/resource/memory.py`
+（读写单点）、`app/resource/paths.py`（落点单点）、`app/agent/nodes.py::LLMNode`（注入点，
+`memory_block` 在 `app/resource/memory.py`、`agent_md_block` 在 `app/resource/profile.py`）、
+`app/agent/tools.py`（`write_memory`/`read_memory` 与
 `InjectedWorkspace`）。证据见本文「工具面缺口」与「工作区语义」两条。
 
 ## [x] 终端命令继承了 MCP 的 stdin（挂死；2026-09-13 修）
@@ -567,7 +1068,7 @@ GitPython 起 git 时显式设了 `stdin=(istream or DEVNULL)`，所以**只有 
 **落地**：
 
 - **配置三态**：`app/config.py::CHAT_THINKING`（`enabled` / `disabled` / 留空 = **不下发该参数**、
-  交给服务端默认）→ `app/agent/model.py::thinking_extra_body()`（**provider 映射的单点**）→
+  交给服务端默认）→ `app/agent/nodes.py::LLMNode::thinking_extra_body()`（**provider 映射的单点**）→
   当 `extra_body=` 传给 `ChatOpenAI`（它是一等字段，不走"未知 kwargs → model_kwargs"那条带警告的路）。
   **默认留空 ⇒ 行为与现状完全一致**。`.env.example` 有分区说明。
 - **"思考不进 messages" 天然成立，故不写剥离代码**：`langchain-openai` 的响应转换是白名单式的，
@@ -606,7 +1107,7 @@ PR / issue / 搜索 / 不克隆就读远端代码，外加"先开分支""master 
 **约束三分法**——软约束走 `SKILL.md` 正文（host 读取、注入系统提示）、硬闸门走 `tool.json`、
 结构性拒绝写死在工具里。
 
-**当前状态（2026-09-12）**：**两型共用的那条通道已落地**——`app/agent/skills.py` +
+**当前状态（2026-09-12）**：**两型共用的那条通道已落地**——`app/resource/skills.py` +
 `get_skill`/`drop_skill` + state 的 `loaded_skills` + `LLMNode` 注入（落地清单见
 SKILL_DESIGN §11）。`skills/github/` 没有 `server.py`，故**当前自动是知识型**、可加载。
 **未做**：能力型（`server.py` 生命周期、会话级注册表 + 动态 `bind_tools`、idle 回收、
@@ -639,7 +1140,8 @@ Python 关键字时被误标 `[带工具]`）。
 **用户通路已落地（本期）**：消息里写 `@路径`（相对工作区或绝对路径；带空格用 `@"…"`），
 `LLMNode` 构造请求体副本时把图**临时**附上——**base64 从不进 messages/checkpoint**：state 里的
 消息始终是带 @路径 的纯文本（本身就是"看过哪张图"的日志），轮末没有"剔除"这回事。机制收在
-`LLMNode.attach_images_to_payload` 一个静态方法里（解析/读盘/拼接/记账，单一生产消费者）；
+`app/resource/images.py::attach_images_to_payload`（解析/读盘/拼接/记账；2026-09-21 从 `LLMNode`
+的静态方法剥到资源层，节点只剩"这一拍要不要附图"）；
 记账 = state 的 `attached_images`（`ImageRef` 元数据，单调追加）→ 同轮不重发（**首次-only**，
 重启后重读盘即得）。宽进策略（议定）：扩展名不像图片的 @token 是普通文本、原样放行；失败不炸
 turn，处置（未找到 / 过大>5MB / 超 4 张 / 读取失败）写进正文让模型转告用户。worker
@@ -673,7 +1175,7 @@ turn，处置（未找到 / 过大>5MB / 超 4 张 / 读取失败）写进正文
 2. ~~块列表撞"按 str 消费"的老代码~~：state 消息保持 str，`TurnFinished` / `/list session` /
    `CompactNode._tm_status` 全部照旧。
 3. **工具返回图的通路仍是断的（未动）**：`format_tool_result`/`_join_block_texts` 丢非文本块
-   （`app/agent/utils.py:22-33`，**已被 `tests/test_format_tool_result.py:65-70` 钉住**），且
+   （`app/platform/tool_results.py:22-33`，**已被 `tests/test_format_tool_result.py:65-70` 钉住**），且
    `ToolResult.content: str`（`app/schema/agent_schema.py:9`）是硬墙——模型还不能把工具读到的图
    送进对话。要做时另开一期。
 4. ~~一批测试会红~~：str 断言测试全部照旧（全量回归 401 passed）。
@@ -752,14 +1254,14 @@ turn，处置（未找到 / 过大>5MB / 超 4 张 / 读取失败）写进正文
 
 **遗留（均为低危）**：
 
-- **只被测试用的生产函数**：`app/agent/skills.py::read_body`——生产路径走 `get_meta`/`body_of`，
+- **只被测试用的生产函数**：`app/resource/skills.py::read_body`——生产路径走 `get_meta`/`body_of`，
   只有 `tests/test_skills.py` 在用；而同文件 docstring:24 把"host 侧只读 SKILL.md、不拿模型
   给的名字拼路径"这条安全不变量的落点指成了它（真正落点是 `get_meta`）。删需同步改
   `tests/test_skills.py` 里 4 条用例的调用。
 - **自我标注的 YAGNI 字段**：`app/schema/agent_schema.py::MCPToolSpec.metadata`（注释自述
-  "当前无消费者，保留以备将来"）。留就换成具体计划，删就顺带清 `app/agent/mcp.py` 两处透传。
+  "当前无消费者，保留以备将来"）。留就换成具体计划，删就顺带清 `app/platform/mcp.py` 两处透传。
 - **跨文件重复**：`WORKSPACE_PATH` 的"取 env + resolve + 存在性校验 + **同文案** `ConfigError`"
-  在 `mcp_service/file_io.py`（import 期校验）与 `app/agent/mcp.py::_validate_workspace`（构图期）
+  在 `mcp_service/file_io.py`（import 期校验）与 `app/platform/mcp.py::_validate_workspace`（构图期）
   各一份。抽到 `mcp_service/utils.py` 前先想清楚：file_io 那份是 **import 期**触发的，搬过去会
   把"import 即校验"也一起搬走——要么只抽纯函数（校验时机留在各调用点），要么显式拍板改时机。
 - **小冗余**：`mcp_service/file_io.py:699-700` 的 `ext_set` 两次赋值可合一
@@ -771,7 +1273,7 @@ turn，处置（未找到 / 过大>5MB / 超 4 张 / 读取失败）写进正文
 **待拍（一条）**：`app/agent/tools.py:872` 的 `meta.name != meta.dir_name` 分支**生产不可达**
 （扫盘期已保证能力型两者相等），但 `tests/test_skill_runtime.py:467` 自述是"安全网…即便拿到
 构造出来的 meta，加载期也必须拒绝"。二选一：① 删掉该分支 + 同步删那条用例；② 按安全网保留
-——保留的话请在注释里点明它不可达，并修掉 `app/agent/skills.py:174` 那处把校验位置指向
+——保留的话请在注释里点明它不可达，并修掉 `app/resource/skills.py:174` 那处把校验位置指向
 "get_skill 的校验"的指针（实际执行处是**扫描期**）。
 
 ## [ ] 评估框架的已知缺口（2026-09-16 记，09-17 更新）

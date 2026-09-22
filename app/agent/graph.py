@@ -15,15 +15,13 @@ from app.agent.nodes import (
     ToolNode,
     needs_compact,
 )
-from app.agent.model import get_main_chat_model
 from app.agent.prompt import WORKER_SYSTEM_PROMPT
-from app.agent.mcp import load_mcp_tool
+from app.platform.mcp import load_mcp_tool
 from app.agent.tools import (
     SessionToolset,
     orchestrate_tool,
     note_tools,
     ask_tool,
-    dispatch_tool,
     memory_tool,
     skill_tools_for,
 )
@@ -78,11 +76,11 @@ async def get_main_agent_graph(
     get_main_agent_graph_langgraph 零参调用 → 默认 <项目根>/tmp。
 
     session_id 同样是构造期参量：它决定 MCP **运行体的作用域**（(工作区, 会话) 一个池，
-    见 app/agent/mcp.py）。TUI 传真实会话 id、evaluation 传任务名；零参入口（langgraph dev）
+    见 app/platform/mcp.py）。TUI 传真实会话 id、evaluation 传任务名；零参入口（langgraph dev）
     为 None → 所有会话共享一组运行体（已知偏差）。worker 子图**不走本入口**——它走
     get_sub_agent_graph（签名里没有 session_id）。
 
-    model：不传 = `get_main_chat_model()`（生产路径）。给了就用它当**未绑定**的原始模型
+    model：不传 = `LLMNode.main_chat_model()`（生产路径）。给了就用它当**未绑定**的原始模型
     （bind_tools 仍由 LLMNode 按工具集版本做，见下）——评估的录制/回放从这里注入模型替身；
     与 `get_sub_agent_graph` 的同名参量一个路子。
 
@@ -103,9 +101,7 @@ async def get_main_agent_graph(
     # 技能目录在**构图期**烤进 get_skill 的 docstring（§3.2）——装技能是低频事件，
     # "扫一次、重开会话生效"够用（同 AGENT.md 的实例内 memo）。
     skill_tools = skill_tools_for()
-    static_tools = (
-        orchestrate_tool + note_tools + ask_tool + dispatch_tool + memory_tool + skill_tools
-    )
+    static_tools = orchestrate_tool + note_tools + ask_tool + memory_tool + skill_tools
 
     # 动态工具集（§13.4）：技能加载/卸载会改工具表，三个节点共用这一份接线——技能对账
     # （state 说加载了、运行体没有 → 重建）也在它里面。
@@ -113,16 +109,18 @@ async def get_main_agent_graph(
 
     # 模型**不在这里 bind_tools**：交给 LLMNode 按工具集版本做（只在版本变化时重绑）。
     # 仍传未绑定的原始 model —— binding 上没有再 bind_tools 的能力。
-    model = model if model is not None else get_main_chat_model()
+    model = model if model is not None else LLMNode.main_chat_model()
 
     graph.add_node(
         "llm_node",
         LLMNode(model=model, workspace_path=workspace_path, toolset=toolset, mailbox=mailbox),
     )
     graph.add_node("queue_node", QueueNode())
-    # dispatch_subtasks（spawn worker）与 memory 读写（定位 memory.md）都需要工作区，
-    # 由 node 按签名注入（InjectedWorkspace 对模型隐藏）；技能工具也要工作区——能力型的 server
-    # 在它里面运行（cwd / WORKSPACE_PATH），虽然技能**源**在项目根、不随工作区变。
+    # memory 读写（定位 memory.md）与技能加载/卸载都要工作区，由 node 按签名注入
+    # （InjectedWorkspace 对模型隐藏）；技能工具也要工作区——能力型的 server 在它里面运行
+    # （cwd / WORKSPACE_PATH），虽然技能**源**在项目根、不随工作区变。
+    # （dispatch_subtasks 2026-09-21 起是 mcp_service/dispatch 的工具，工作区来自它的启动
+    #   env，不经这条注入路径。）
     graph.add_node(
         "orchestrate_node",
         OrchestrateNode(static_tools, workspace_path=workspace_path),  # type: ignore[arg-type]
@@ -194,9 +192,9 @@ def get_sub_agent_graph(read_tools=None, workspace_path: str | None = None, mode
       不能 print（需日志的调用方传 True）。
     - compile 挂 InMemorySaver：worker 每次被拉起只跑一条 run_subtask，interrupt 挂起 →
       Command(resume) 续跑都在同进程同 thread 内完成，内存检查点足够，不落盘。
-    - model：默认 get_main_chat_model()；有 read_tools 才 bind_tools（便于测试注入假模型/假工具）。
+    - model：默认 LLMNode.main_chat_model()；有 read_tools 才 bind_tools（便于测试注入假模型/假工具）。
     """
-    chat = model if model is not None else get_main_chat_model()
+    chat = model if model is not None else LLMNode.main_chat_model()
     if read_tools:
         chat = chat.bind_tools(list(read_tools))
 

@@ -2,13 +2,14 @@
 
 **不拉真实 MCP server**：全部经 `_ServerWorker` 的注入口（`session_factory` / `tools_loader`）
 在进程内跑。假会话的 `__aexit__` 会断言"关闭发生在创建它的那个 Task 里"——那正是
-`app/agent/mcp.py` 文件头记的承重约束（anyio cancel scope 与 Task 绑定），谁把关闭挪出 owner,
+`app/platform/mcp.py` 文件头记的承重约束（anyio cancel scope 与 Task 绑定），谁把关闭挪出 owner,
 这里立刻变红。
 
 最后三条用例走真链路（真 adapter / 真 tool.json），锁住"改造后模型可见的东西不变"这一契约。
 
-注意：import app.agent.mcp 会触发 app.agent/__init__ → graph → model，model 顶层调用
-get_settings()，因此运行本文件要求 .env 存在（CLAUDE.md 前提）。
+注意：本文件 import 的是 `app.platform.mcp`（宿主侧 MCP 边界，2026-09-21 从 app/agent 搬来），
+它不 import app.agent、本身不需要 .env；但最后三条用例要 import `app.agent.tools` 取工具子集
+（那条链会到 `get_settings()`），所以运行本文件仍要求 .env 存在（CLAUDE.md 前提）。
 """
 import asyncio
 import functools
@@ -22,8 +23,8 @@ from mcp.types import CallToolResult, TextContent
 from mcp.types import Tool as MCPTool
 from pydantic import SecretStr
 
-import app.agent.mcp as mcp_module
-from app.agent.mcp import (
+import app.platform.mcp as mcp_module
+from app.platform.mcp import (
     _ServerWorker,
     _make_shim,
     _normalize_workspace,
@@ -33,7 +34,7 @@ from app.agent.mcp import (
     load_mcp_tool,
 )
 from app.agent.tools import worker_tools
-from app.agent.utils import format_tool_result
+from app.platform.tool_results import format_tool_result
 from app.schema.agent_schema import MCPToolSpec
 
 # 假连接：注入假会话工厂后它从不被使用，只为构造 _ServerWorker 占位
@@ -278,7 +279,7 @@ def _adapter_tool(result: CallToolResult):
 def _strip_ids(value):
     """adapter 给每个 content block 附一个随机 `id`，两边各自随机——比对时按结构比对，忽略它。
 
-    真正有意义的是 `format_tool_result` 的产出（它本来就丢弃 id，见 app/agent/utils.py）。
+    真正有意义的是 `format_tool_result` 的产出（它本来就丢弃 id，见 app/platform/tool_results.py）。
     """
     if isinstance(value, list):
         return [{k: v for k, v in block.items() if k != "id"} for block in value]
@@ -303,7 +304,7 @@ _SHAPE_CASES = {
 def test_shim_returns_same_shape_as_adapter_tool(case, monkeypatch):
     """shim 的返回值与真 adapter 工具逐字节同形——模型可见文本因此不变。
 
-    这是本次改造最要紧的契约：`app/agent/utils.py::format_tool_result` 只认 content-block 列表，
+    这是本次改造最要紧的契约：`app/platform/tool_results.py::format_tool_result` 只认 content-block 列表，
     所以 shim **不能**给内层传 tool_call_id/config（那会让 _format_output 提前返回 ToolMessage）。
     """
 

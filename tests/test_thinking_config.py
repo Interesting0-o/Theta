@@ -9,7 +9,7 @@
 3. **可选的真调用用例**：默认 skip，只有显式设 `THETA_LIVE_THINKING=1` 才跑。它真打一次 API，
    验证"配置确实生效、厂端确实返回思考、正文没被思考挤空"。花钱且依赖网络，故不进默认回路。
 
-需要 `.env` 存在（`app.agent.model` 在 import 期就调 `get_settings()`，CLAUDE.md 前提）。
+需要 `.env` 存在（`app.agent.nodes` 在 import 期就调 `get_settings()`，CLAUDE.md 前提）。
 """
 import asyncio
 import os
@@ -22,7 +22,8 @@ from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
-import app.agent.model as model_module
+import app.agent.nodes as nodes_module
+from app.agent.nodes import LLMNode
 from app.exception import ConfigError
 
 # 带思考字段的假响应：形状照 OpenAI Chat Completions，只多一个厂商扩展字段
@@ -57,18 +58,18 @@ def _bare_model() -> ChatOpenAI:
 
 
 def test_thinking_extra_body_maps_the_three_states():
-    assert model_module.thinking_extra_body("enabled") == {"thinking": {"type": "enabled"}}
-    assert model_module.thinking_extra_body("DISABLED ") == {"thinking": {"type": "disabled"}}
+    assert LLMNode.thinking_extra_body("enabled") == {"thinking": {"type": "enabled"}}
+    assert LLMNode.thinking_extra_body("DISABLED ") == {"thinking": {"type": "disabled"}}
     # 留空 → None（**不是**空 dict）：库的 `exclude_if_none` 会把 None 的键整个丢掉，
     # 于是"不下发该参数"才成立；空 dict 反而会以 `{}` 发出去。
-    assert model_module.thinking_extra_body("") is None
-    assert model_module.thinking_extra_body(None) is None
+    assert LLMNode.thinking_extra_body("") is None
+    assert LLMNode.thinking_extra_body(None) is None
 
 
 def test_thinking_extra_body_rejects_typos_loudly():
     """写错就当场抛：静默按"没配"处理会让用户以为开了思考、实际没开，而这种事行为上几乎不可观测。"""
     with pytest.raises(ConfigError) as excinfo:
-        model_module.thinking_extra_body("ture")  # 故意的错拼
+        LLMNode.thinking_extra_body("ture")  # 故意的错拼
 
     assert "CHAT_THINKING" in str(excinfo.value)
 
@@ -104,7 +105,7 @@ def test_reasoning_content_survives_in_the_raw_sdk_object():
 def _model_with_thinking(monkeypatch, mode: str) -> ChatOpenAI:
     """用假 settings 构造模型：只换 `CHAT_THINKING`，其余照真配置的字段形状。"""
     monkeypatch.setattr(
-        model_module,
+        nodes_module,
         "settings",
         SimpleNamespace(
             CHAT_MODEL_NAME="fake-model",
@@ -113,7 +114,7 @@ def _model_with_thinking(monkeypatch, mode: str) -> ChatOpenAI:
             CHAT_THINKING=mode,
         ),
     )
-    return model_module.get_main_chat_model()
+    return LLMNode.main_chat_model()
 
 
 def test_configured_thinking_reaches_the_request_payload(monkeypatch):
@@ -160,7 +161,7 @@ def test_live_endpoint_returns_reasoning_and_the_model_sheds_it(monkeypatch):
     if not os.getenv(_LIVE_FLAG):
         pytest.skip(f"需要 {_LIVE_FLAG}=1 才跑（真打 API，会花钱）")
 
-    real = model_module.settings
+    real = nodes_module.settings
     prompt = "一句话说明为什么 2+2=4"
 
     # ① 旁路直打 SDK：证明**厂端确实在返回思考**，且正文没被思考挤空。
@@ -185,7 +186,7 @@ def test_live_endpoint_returns_reasoning_and_the_model_sheds_it(monkeypatch):
         model_module, "settings", real.model_copy(update={"CHAT_THINKING": "enabled"})
     )
     try:
-        result = asyncio.run(model_module.get_main_chat_model().ainvoke(prompt))
+        result = asyncio.run(LLMNode.main_chat_model().ainvoke(prompt))
     except openai.RateLimitError as exc:  # 同①：环境问题不当失败
         pytest.skip(f"端点限流，第二段没验成：{exc}")
 

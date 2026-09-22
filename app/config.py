@@ -20,7 +20,8 @@ class Settings(BaseSettings):
     # 思考模式（可选，三态）：`enabled` = 强制思考 / `disabled` = 不思考 / **留空 = 不下发该参数**、
     # 完全交给服务端默认（当前智谱 GLM-4.7 系列默认就开思考）。
     # 与 GITHUB_TOKEN 同理带空默认：它是**可选的厂商参数**，不是"必须配的东西"——不填时行为与
-    # 没有这个键完全一样。取值 → `extra_body` 的映射单点在 app/agent/model.py::thinking_extra_body。
+    # 没有这个键完全一样。取值 → `extra_body` 的映射单点在
+    # app/agent/nodes.py::LLMNode.thinking_extra_body。
     CHAT_THINKING: str = ""
 
     #词嵌入模型配置
@@ -31,7 +32,7 @@ class Settings(BaseSettings):
     #Tavily搜索api
     TAVILY_API_KEY: SecretStr
 
-    # GitHub 技能凭证（能力型技能用，见 app/agent/skills.py 与 docs/SKILL_DESIGN.md §13.5）。
+    # GitHub 技能凭证（能力型技能用，见 app/resource/skills.py 与 docs/SKILL_DESIGN.md §13.5）。
     # **有意偏离"所有字段无默认值"那条约定**：技能是可插拔的，它的凭证缺失不该让核心启动就
     # ValidationError；空值 = 该技能拒绝加载（用户能看懂的回执），而不是整个程序起不来。
     # 核心字段（CHAT_* / EMBEDDING_* / TAVILY_API_KEY）仍保持"键必须都出现"。

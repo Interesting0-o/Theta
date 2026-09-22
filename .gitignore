@@ -24,11 +24,11 @@ CLAUDE.md
 .idea/
 .nvim
 
-#资源
-resource
+#资源（**锚定项目根**：裸 `resource` 会连 `app/resource/` 这个源码包一起吞掉——2026-09-21 踩到）
+/resource
 
 # LangGraph dev 服务器运行产物
 .langgraph_api/
 
-# 默认沙箱工作区（未指定 WORKSPACE_PATH 时模型操作目录）
-tmp/
+# 默认沙箱工作区（未指定 WORKSPACE_PATH 时模型操作目录；同样锚定根，避免吞掉别处的 tmp/）
+/tmp/

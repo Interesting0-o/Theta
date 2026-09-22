@@ -8,7 +8,7 @@
 
 **为什么 tool_calls 的 `id` 一个都不能丢**：ReviewNode 拿它兑现 `ToolMessage`、提问闸门按它索引
 `ask_answers`，丢了 id 回放会走成另一条路（于是测的就不是生产行为）。`AIMessage` 的序列化在这里
-是**只取 content + tool_calls**：思考内容本来就不进 messages（见 app/agent/model.py），
+是**只取 content + tool_calls**：思考内容本来就不进 messages（见 app/agent/nodes.py::LLMNode），
 additional_kwargs 也不参与图的行为。
 """
 from __future__ import annotations

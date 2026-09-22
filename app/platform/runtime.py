@@ -3,7 +3,7 @@
 位置：`app/platform/runtime.py`（从 app/tui/driver.py::_build_session_runtime 平移；
 2026-09-10 基座/前端分家后归基座——它只与资源落点和图有关，与终端显示无关）。
 
-`app.agent.*`（graph/model，import 即需 .env）在本模块内**懒加载**：`import app.platform`
+`app.agent.*`（graph，import 即需 .env）在本模块内**懒加载**：`import app.platform`
 不触发 .env，保持 TUI/基座可被无 .env 的测试与工具顶层 import。
 `ensure_memory_template`（要 stat/mkdir）走 asyncio.to_thread——langgraph dev 的 blockbuster
 会在事件循环里拦截这类阻塞调用。注意 `session_db_path()` 的路径解析与 `mkdir` 是**直接**在
@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 
 from app.resource import session_db_path
+from app.resource.memory import ensure_memory_template
 
 
 class UserMailbox:
@@ -59,13 +60,13 @@ async def build_session_runtime(workspace: str, session_id: str):
     返回 (connection, step, mailbox)：connection 供退出时关闭；step 是 compiled.ainvoke 的
     闭包（带本会话 thread_id）；mailbox 是运行中转向信箱（基座与图各持一份引用，随本会话
     运行体存亡——切会话即丢弃）。首次为某工作区建会话时，顺带播种该工作区的长期记忆模板
-    （app/agent/memory.py::ensure_memory_template，缺失才写）。app.agent.* 在此懒加载
+    （app/resource/memory.py::ensure_memory_template，缺失才写）——它属资源层，**不必懒加载**
+    （记忆与技能两条读取通道搬进 app.resource 后已无 .env 依赖）。app.agent.* 仍在此懒加载
     ——首次交互时才有 .env 与真实需要。
     """
     import aiosqlite  # noqa: PLC0415
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver  # noqa: PLC0415
     from app.agent.graph import get_main_agent_graph  # noqa: PLC0415
-    from app.agent.memory import ensure_memory_template  # noqa: PLC0415
 
     db_path = session_db_path(workspace, session_id)
     db_path.parent.mkdir(parents=True, exist_ok=True)

@@ -131,7 +131,7 @@ def test_worker_tools_filter():
         "git_add": {"need_review": True, "source": "mcp_service/git"},
         "create_plan": {"need_review": False, "source": "plan"},
         "read_note": {"need_review": False, "source": "notes"},
-        "dispatch_subtasks": {"need_review": False, "source": "dispatch"},
+        "dispatch_subtasks": {"need_review": False, "source": "mcp_service/dispatch"},
         "write_memory": {"need_review": False, "source": "memory"},
         "read_memory": {"need_review": False, "source": "memory"},
     }

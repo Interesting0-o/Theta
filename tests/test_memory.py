@@ -1,13 +1,13 @@
-"""app/agent/memory.py 测试：模板播种 + 记忆条目的解析 / 追加 / 按 key 覆写。
+"""app/resource/memory.py 测试：模板播种 + 记忆条目的解析 / 追加 / 按 key 覆写。
 
-import app.agent.memory 会触发 app.agent 包 __init__（需 .env，测试全局前提）；路径断言
-monkeypatch app.resource.RESOURCE_ROOT 到 tmp，不碰真实 resource 目录。
+import app.resource.memory 会触发 app.agent 包 __init__（需 .env，测试全局前提）；路径断言
+monkeypatch app.resource.paths.RESOURCE_ROOT 到 tmp，不碰真实 resource 目录。
 
 重点覆盖"注释里的格式示例不算条目"：模板刻意把示例放进 HTML 注释，而示例正文自己就含一行
 `## [m1] …`——朴素按标题正则扫描会把它当真（编号凭空 +1、覆写可能改到示例那行）。
 """
-import app.agent.memory as memory
-import app.resource as resource
+import app.resource.memory as memory
+import app.resource.paths as resource
 
 
 def _workspace(tmp_path, monkeypatch, name="proj"):

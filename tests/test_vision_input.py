@@ -18,7 +18,7 @@
 **URL 路径不写进用例**：它要求一个稳定的外部图片地址，会随外部世界腐坏。通路是同一条——
 把 `image_url.url` 换成 http 地址即可（已实测：`glm-4v-flash` 认出了百度 logo）。
 
-需要 `.env` 存在（`app.agent.model` 在 import 期就调 `get_settings()`，CLAUDE.md 前提）。
+需要 `.env` 存在（`app.agent.nodes` 在 import 期就调 `get_settings()`，CLAUDE.md 前提）。
 """
 import asyncio
 import base64
@@ -32,7 +32,8 @@ import pytest
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
-import app.agent.model as model_module
+import app.agent.nodes as nodes_module
+from app.agent.nodes import LLMNode
 
 _LIVE_FLAG = "THETA_LIVE_VISION"
 _LIVE_MODEL_ENV = "THETA_LIVE_VISION_MODEL"
@@ -115,7 +116,7 @@ def _invoke_with_retry(model, message):
 
 
 def test_live_vision_sees_the_image_through_our_model_layer(monkeypatch):
-    """真打一次 API：通过 `get_main_chat_model()` 发一张图，回复里要看得出图的内容。
+    """真打一次 API：通过 `LLMNode.main_chat_model()` 发一张图，回复里要看得出图的内容。
 
     默认 skip（花钱 + 依赖网络 + 要求模型是视觉模型）。显式打开：
 
@@ -131,10 +132,10 @@ def test_live_vision_sees_the_image_through_our_model_layer(monkeypatch):
     monkeypatch.setattr(
         model_module,
         "settings",
-        model_module.settings.model_copy(update={"CHAT_MODEL_NAME": model_name}),
+        nodes_module.settings.model_copy(update={"CHAT_MODEL_NAME": model_name}),
     )
     reply = _invoke_with_retry(
-        model_module.get_main_chat_model(),
+        LLMNode.main_chat_model(),
         HumanMessage(
             content=[
                 {

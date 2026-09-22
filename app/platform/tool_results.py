@@ -1,10 +1,17 @@
-"""agent 侧工具返回的统一归一化：结构化 ToolResult / 模型可见文本。
+"""工具返回的统一归一化：结构化 ToolResult / 模型可见文本——**MCP 宿主侧**的解封装。
 
-原为 ToolNode 的两个静态方法（app/agent/nodes.py），因出现第二个消费者（tools.py 里
-dispatch 对 worker run_subtask 返回的归一化）而从节点类解耦出来，收成模块级函数，
-ToolNode 与 dispatch 共用；与节点执行、审批、压缩无耦合。
+**位置**（2026-09-21 从 `app/agent/utils.py` 搬来）：与同目录的 `mcp.py` 是同一件事的两半
+（主进程侧的 MCP 边界：一个管运行体、一个管返回形状）。按 docs/ARCHITECTURE.md §4 的
+**反向限制**——"如果 MCP 这条外部边界不存在，这段代码还需要吗？"——答案是"不需要"：
+本模块的全部存在理由就是解开**跨进程返回的形状**（content-block → json.loads → 还原
+ToolResult），它服务的是边界，不是 agent 语义。
 
-注意：早期 app/agent/utils.py 曾因"各 helper 单一消费者"被删（helpers 收进各自消费者
+**跨进程序列化的单一落点 = 生产端**（2026-09-21 拍板）：写出去的那一侧是
+`mcp_service/utils.py::guard`（把 ToolResult 交给 FastMCP → JSON 化进 content[].text），
+本模块只**读**那个形状。改形状先改 guard，这里是消费者；`tests/test_format_tool_result.py`
+与 `tests/test_mcp_pool.py` 各钉一端。
+
+注意：早期 `app/agent/utils.py` 曾因"各 helper 单一消费者"被删（helpers 收进各自消费者
 模块）。本模块只放**一个职责**（工具结果归一化），不是旧的无序工具袋——若日后要加
 其它通用 helper，先判断是否够得上"多消费者 + 单一职责"再决定是否入此。
 

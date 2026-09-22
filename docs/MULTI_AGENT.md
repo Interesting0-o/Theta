@@ -71,7 +71,7 @@ worker 放哪个进程，直接决定"审批这道坎"长什么样。**已定：
 **候选 A · 同进程子图（起点，P0/P1 采用）**
 - worker = 用同一套 nodes 再 compile 的"子任务图"：同 model + **收束的子任务 prompt** + **裁剪的工具子集**（只读检索/规划/notes），每子任务独立消息栈/上下文；主图调度节点按 DAG 就绪 **asyncio 并发 ainvoke 多个 worker 图**。
 - **审批零成本**：worker 不授写/命令工具 → 主图 review→interrupt 单点原样成立，写动作执行权永远在主侧 ToolNode，**无需跨进程审批回传**。
-- 底层工具复用现成：`app/agent/mcp.py` 已有按工作区键的进程级工具缓存 + 单飞锁（`_MCP_TOOLS_CACHE` / `_MCP_LOADING_LOCKS`，当初为 langgraph dev 反复 `get_main_agent_graph` 提速而加），**主 + worker 直接 bind 同一批工具对象**即可，不再各自拉起子进程。
+- 底层工具复用现成：`app/platform/mcp.py` 已有按工作区键的进程级工具缓存 + 单飞锁（`_MCP_TOOLS_CACHE` / `_MCP_LOADING_LOCKS`，当初为 langgraph dev 反复 `get_main_agent_graph` 提速而加），**主 + worker 直接 bind 同一批工具对象**即可，不再各自拉起子进程。
 - 代价：与主同进程，无故障隔离；worker 上下文隔离要自管（独立消息栈）。二者短期都非目标。
 
 **候选 B · worker = MCP server（升级路径：A 出现瓶颈再做）**
@@ -213,11 +213,11 @@ interrupt 的契约 = **阻塞图、不阻塞进程**（LangGraph 原生）：ru
        决定后 resume——**批准即执行、拒绝回灌 [approval_denied]**。主侧 run_tui 事件驱动，在
        dispatch 进行中也能并发服务 worker 审批（new_pending 唤醒 drain）。**仍不下放工作区写/命令**。
        闭环测试 tests/test_sub_agent_approval.py（批准/拒绝/只读休眠三向）；主侧整链另由
-       tests/test_dispatch_worker_approval.py 覆盖（OrchestrateNode → dispatch → worker 审批 →
+       tests/test_dispatch_worker_approval.py 覆盖（dispatch MCP 工具 → worker 审批 →
        resume → 汇总回主）。同日重构：worker 子图迁 app/agent/graph.py::get_sub_agent_graph、
        mcp_service/sub_agent 瘦身为 run 壳，见文末"模块落点"。
      - **HTTP 传输层已通（同日）**：`mcp_service/http_agent.py`——streamable-http transport 的最小 MCP server，`chat(task)` 一次性 LLM 回复（无工具/状态）；验收 = 起服务 → HTTP 客户端 ListTools + CallTool 拿到回复（已手动验证）。`SUBAGENT_HTTP_HOST`/`SUBAGENT_HTTP_PORT` 可覆盖监听地址。
-     - **spawn-per-task 派发已落地（同日）**：主 graph **不静态绑 worker**（避免"先启动服务/最多一个子 agent"），而是加编排工具 `dispatch_subtasks(sub_tasks)`（收在 `app/agent/tools.py`，与 create_plan 等编排工具同住；source=dispatch 走 orchestrate 层）：每次调用按任务 `asyncio.gather` **现场 spawn N 个独立 sub_agent 子进程**跑 `run_subtask`，各独立上下文、干完即回收，返回汇总结论；`workspace` 以 `InjectedToolArg` 对模型隐藏、由 OrchestrateNode 注入。worker 子进程 cwd=项目根以读 .env 的 CHAT_*。测试 tests/test_dispatch.py。
+     - **spawn-per-task 派发已落地（同日）**：主 graph **不静态绑 worker**（避免"先启动服务/最多一个子 agent"），而是加编排工具 `dispatch_subtasks(sub_tasks)`（原收在 `app/agent/tools.py`；**2026-09-21 搬到 `mcp_service/dispatch.py`**——它派生独立进程 = 独立 Agent runtime，命中 docs/ARCHITECTURE.md §4 四问的第四问，于是成了普通 MCP 工具、走 tool_node；工作区随之改从启动 env 取，不再 `InjectedToolArg` / 不走 orchestrate 层。下述落地记录的其余部分仍然成立）：每次调用按任务 `asyncio.gather` **现场 spawn N 个独立 sub_agent 子进程**跑 `run_subtask`，各独立上下文、干完即回收，返回汇总结论；`workspace` 以 `InjectedToolArg` 对模型隐藏、由 OrchestrateNode 注入。worker 子进程 cwd=项目根以读 .env 的 CHAT_*。测试 tests/test_dispatch.py。
      - **主侧审批控制面落地（同日，idle-only；后收窄为纯请求队列）**：主 agent 保留 TUI、不做常驻后端。`app/main.py` 输入解耦（阻塞 `input()` → 单 stdin reader 线程 + asyncio.Queue，循环不再被键盘占死）；`app/approval_inbox.py` 合一**待审请求队列 ApprovalInbox + 薄 HTTP 收件箱 ApprovalInboxServer**（starlette/uvicorn 同事件循环任务，POST /requests 入队、GET /requests/{id}?block=1 长轮询、POST /requests/{id}/decision 回填；不 import app.agent）。**语义定界**：本模块只做队列 + 送达（enqueue/complete/wait），不做审批判定——判定单点在图的审核节点（§6）；complete 只记录审核方给的决定并唤醒等待者。TUI **idle 时**能收/审/回 worker 待审请求（复用 `format_tool_approval` 面板 + y/n）；**dispatch 中途弹审批与 worker 写工具未做**（留后续里程碑，届时复用 queue 的 enqueue/wait 原语）。测试 tests/test_approval_inbox.py。（本段的输入解耦 / 收件箱 / 审批判定已随 2026-09-07 main 事件化重构迁入 `app/tui`，并升格为"主 agent 自身 interrupt 也入同一 broker park"的统一审批，见 §6 统一审批视图与 §10 已定(2026-09-07)。**2026-09-10 再分家后的当前位置**：收件箱/队列 → `app/platform/approvals.py`，判定面 → `app/tui/panels.py` + `TerminalUI.decide`，输入 → `app/tui/input.py`，事件循环 → `app/platform/loop.py`；`app/tui/{driver,approval,approval_inbox}.py` 已删除。）
      - **HTTP interrupt 回传演示已通（2026-09-07）**：`mcp_service/http_agent.py` 在 `chat` 之外
        新增 `request_approval(description, tool_name, tool_args)`——模拟子 agent 在敏感动作前
@@ -284,7 +284,7 @@ interrupt 的契约 = **阻塞图、不阻塞进程**（LangGraph 原生）：ru
 
 ## 与现有模块的关系（改动面提示）
 
-- `app/agent/mcp.py::load_mcp_tool` / `_build_servers`：按工作区缓存 + 单飞锁**已落地**；P0 是验证主 + worker **bind 同一批工具对象**，不再各自拉起子进程（§5 候选 A / §10）。
+- `app/platform/mcp.py::load_mcp_tool` / `_build_servers`：按工作区缓存 + 单飞锁**已落地**；P0 是验证主 + worker **bind 同一批工具对象**，不再各自拉起子进程（§5 候选 A / §10）。
 - `app/agent/graph.py`：主 agent 侧新增"DAG/并行任务编排 + 归并"节点；节点执行复用现有 LLM/Review/Tool 回路。
 - `app/agent/tools.py` + `tool.json`：`create_dag` 类工具登记（source 进 state/plan 通道）。
 - `app/main.py` TUI：审批面板需展示"计划/子任务表"这一层（不只单工具）。

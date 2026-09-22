@@ -1,7 +1,7 @@
 """子任务 worker MCP server（stdio；worker 图在 app/agent.graph::get_sub_agent_graph）。
 
-暴露单个工具 `run_subtask(task)`：调用方（主 agent 的 dispatch_subtasks 编排工具，见
-app/agent/tools.py）把一条**子任务**（并发资料收集）派过来，本 server 在自己进程里、以独立
+暴露单个工具 `run_subtask(task)`：调用方（`mcp_service/dispatch.py::dispatch_subtasks`——
+主 agent 的派发工具，2026-09-21 从 app/agent/tools.py 搬到 MCP 侧）把一条**子任务**派过来，本 server 在自己进程里、以独立
 消息栈跑一个 worker 子 agent，返回结论正文。
 
 本模块是 **worker 进程的 server / run 壳**——业务（子图、人设、工具子集）归 app.agent：
@@ -18,7 +18,7 @@ app/agent/tools.py）把一条**子任务**（并发资料收集）派过来，�
 - ⚠️ 终端的执行发生在 **worker 自己的终端 server 实例**里（每子任务一个 session_id，见
   run_subtask_impl）：所以 worker 起的进程不在主 agent 的 process_list 里、主 agent 也杀不掉，
   随子任务结束回收。这是"独立进程表"的代价，不是缺陷。
-- 工作区取自 env WORKSPACE_PATH（缺失/非目录 → ConfigError，由 @guard 归成 config_error）。
+- 工作区取自 env WORKSPACE_PATH（缺失/非目录 → ConfigError，由 @guard 按类名归成 `config`）。
 """
 import os
 import time
@@ -217,14 +217,14 @@ async def run_subtask_impl(
     - workspace：工作区绝对路径（须存在）。
     - tools：默认经 load_mcp_tool(workspace, session_id) 拉取后按 app.agent.tools::worker_tools 筛成可用
       子集（只读检索 + 联网，后者 need_review 会触发审批）；注入时直接用。
-    - model：默认 app.agent.graph::get_sub_agent_graph 内建 get_main_chat_model()；注入假模型则无需
+    - model：默认 app.agent.graph::get_sub_agent_graph 内建 LLMNode.main_chat_model()；注入假模型则无需
       真实 LLM。
     - inbox_url：主侧审批收件箱基地址；默认读 env AGENT_INBOX_URL。仅 need_review 调用被
       interrupt 时才发起 HTTP（只读路径全程不需主侧）。
 
     子图/人设/工具子集均为懒加载（app.agent），模块 import 阶段不触发 get_settings。
     """
-    from app.agent.mcp import load_mcp_tool  # noqa: PLC0415 —— 懒加载：见模块 docstring
+    from app.platform.mcp import load_mcp_tool  # noqa: PLC0415 —— 懒加载：见模块 docstring
     from app.agent.tools import worker_tools  # noqa: PLC0415
     from app.agent.graph import get_sub_agent_graph  # noqa: PLC0415
 
@@ -233,7 +233,7 @@ async def run_subtask_impl(
 
     workspace = str(Path(workspace).expanduser().resolve())
 
-    # 会话 id 先生成：它既是图 state 的 session_id，也是 MCP 运行体的作用域键（app/agent/mcp.py）。
+    # 会话 id 先生成：它既是图 state 的 session_id，也是 MCP 运行体的作用域键（app/platform/mcp.py）。
     session_id = uuid.uuid4().hex
 
     if tools is None:

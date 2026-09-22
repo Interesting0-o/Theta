@@ -1,5 +1,8 @@
 r"""resource 落盘路径单点：所有"按 (工作区, 会话) 定位"的数据都在这算。
 
+本模块是 `app/resource/` 包里唯一管**路径**的一支（同包另有 memory / skills / images /
+profile——都是"读 agent 之外的东西、转成内部表示"，判据见 docs/ARCHITECTURE.md §4 的 A/B/C）。
+
 布局：`<项目根>/resource/<ws_key>/…`
 - `<ws_key>`：工作区**绝对路径**的可读 slug（把 `\` `/` 及盘符 `:` 替换成 `-`）末尾追加
   `_<sha1(该绝对路径)[:8]>`（如 `E:\code\python\Myllm` → `E-code-python-Myllm_3f9a1c2b`），
@@ -7,19 +10,24 @@ r"""resource 落盘路径单点：所有"按 (工作区, 会话) 定位"的数�
   塌成同一个 `C-work-a-b`，两个工作区就会共用一份 resource 目录；
 - `<ws_key>/sessions/<session_id>/agent.db`：该 (工作区, 会话) 的 LangGraph checkpoint（每会话一库）；
 - `<ws_key>/memory/memory.md`：**长期记忆**正文（跨会话长存，文件即真值；读写单点在
-  app/agent/memory.py，注入与上限见 docs/LONG_TERM_MEMORY.md）。
+  `app/resource/memory.py`，注入与上限见 docs/LONG_TERM_MEMORY.md）。
 
-注意：本模块只依赖 stdlib/pathlib——**不 import app.agent**（其 `__init__` re-export graph→model→
-模块顶层 `get_settings()`，import 即要 .env）。放 `app/` 根（命名空间包、无 `__init__`）使
-`app.platform`（基座）与测试能顶层 import 本模块而不触发 .env。
+注意：本模块（以及同包其余各支）只依赖 stdlib/pathlib——**不 import app.agent**（其 `__init__`
+re-export graph → nodes，而 nodes 顶部读 `get_settings()`，import 即要 .env）。`app.resource`
+因此可被 `app.platform`（基座）与测试顶层 import 而不触发 .env。
+
+⚠️ `RESOURCE_ROOT` **只在本题定义、刻意不由 `app/resource/__init__.py` 转出**：它是可
+monkeypatch 的模块全局（测试把它指到 tmp），转出去会让 `app.resource.RESOURCE_ROOT = …`
+这种打补丁**静默失效**（函数读的仍是本模块的全局）。要在测试里改它，请打
+`app.resource.paths.RESOURCE_ROOT`。
 """
 from __future__ import annotations
 
 import hashlib
 from pathlib import Path
 
-# 项目根/resource（gitignore 整目录忽略）
-RESOURCE_ROOT = Path(__file__).resolve().parent.parent / "resource"
+# 项目根/resource（gitignore 整目录忽略）。本文件在 app/resource/ 下，故上溯三级到项目根。
+RESOURCE_ROOT = Path(__file__).resolve().parent.parent.parent / "resource"
 
 
 def _sanitize_segments(text: str) -> str:

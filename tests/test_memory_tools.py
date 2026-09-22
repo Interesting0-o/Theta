@@ -4,7 +4,7 @@
 （跳过 schema / 注入管线），同样按它的方式驱动 OrchestrateNode，验证 workspace 由节点注入、
 模型给的路径不算数。
 
-记忆落盘一律 monkeypatch app.resource.RESOURCE_ROOT 到 tmp，绝不碰真实 resource 目录。
+记忆落盘一律 monkeypatch app.resource.paths.RESOURCE_ROOT 到 tmp，绝不碰真实 resource 目录。
 import app.agent.* 经 __init__ 触发 get_settings()，需 .env 存在（CLAUDE.md 前提）。
 """
 import asyncio
@@ -14,8 +14,8 @@ from pathlib import Path
 from langchain_core.messages import ToolMessage
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
-import app.agent.memory as memory
-import app.resource as resource
+import app.resource.memory as memory
+import app.resource.paths as resource
 from app.agent.nodes import OrchestrateNode, ReviewNode
 from app.agent.tools import memory_tool, read_memory, write_memory
 

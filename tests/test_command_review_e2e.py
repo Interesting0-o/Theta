@@ -20,7 +20,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.graph import get_main_agent_graph
-from app.agent.mcp import _reset_pools_for_tests, close_session_pool
+from app.platform.mcp import _reset_pools_for_tests, close_session_pool
 from app.platform.turn import build_turn_state
 from evaluation.models import ReplayChatModel
 
@@ -42,7 +42,7 @@ async def _drive(workspace, session: str, model) -> dict:
     """建真图（真 MCP 运行体）→ 脚本模型驱动一轮 → 返回终态。
 
     全程在**同一个事件循环**里：运行体的建与关都只能发生在 owner task 里，跨 loop 关闭会炸
-    （见 app/agent/mcp.py::_reset_pools_for_tests 注释）。
+    （见 app/platform/mcp.py::_reset_pools_for_tests 注释）。
     """
     _reset_pools_for_tests()
     try:

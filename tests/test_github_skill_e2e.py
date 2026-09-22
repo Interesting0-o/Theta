@@ -27,9 +27,10 @@ from pydantic import SecretStr
 
 import app.agent.tools as tools_module
 import app.config as config
-from app.agent import mcp, skills
+import app.platform.mcp as mcp  # noqa: E402
+from app.resource import skills
 from app.agent.tools import drop_skill, get_skill
-from app.agent.utils import format_tool_result
+from app.platform.tool_results import format_tool_result
 from app.schema.agent_schema import SkillPreflight
 
 _SESSION = "github-e2e"

@@ -1,13 +1,13 @@
-"""app/agent/utils.py::format_tool_result 的测试（对应 docs/EXCEPTION_DESIGN.md §10 L4）。
+"""app/platform/tool_results.py::format_tool_result 的测试（对应 docs/EXCEPTION_DESIGN.md §10 L4）。
 
-原挂在 ToolNode 上，解耦后归 app/agent/utils.py 模块级函数（ToolNode 与 dispatch 共用）。
+位置史：原挂在 ToolNode 上 → 解耦为 app/agent/utils.py 模块级函数 → 2026-09-21 随 mcp.py 一起
+搬进 `app/platform/`（宿主侧 MCP 边界的两半：一个管运行体、一个管返回形状）。
 
-注意：import app.agent.utils 会触发 app.agent/__init__ → graph → model，
-而 model 顶层调用 get_settings()，因此运行本文件要求 .env 存在（CLAUDE.md 前提）。
+注意：import app.platform.tool_results 不 import app.agent，故本文件不需要 .env。
 """
 import json
 
-from app.agent.utils import format_tool_result
+from app.platform.tool_results import format_tool_result
 from app.schema.agent_schema import ToolResult
 
 def test_format_tool_result_prefixes_error_type():

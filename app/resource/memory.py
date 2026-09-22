@@ -1,8 +1,8 @@
-"""agent 长期记忆：记忆 md 的读写单点（已落地；"Phase B" 是当时的设计阶段名）。
+"""长期记忆：记忆 md 的读写单点（已落地；"Phase B" 是当时的设计阶段名）。
 
-落点：`resource/<ws_key>/memory/memory.md`（路径经 app/resource.py::memory_root 算，文件名
-白名单硬编码在本模块——模型只给 type/content/key，永远不碰路径，见 LONG_TERM_MEMORY.md §5）。
-文件形态见 §3：
+落点：`resource/<ws_key>/memory/memory.md`（路径经 `app/resource/paths.py::memory_root` 算，
+文件名白名单硬编码在本模块——模型只给 type/content/key，永远不碰路径，见
+LONG_TERM_MEMORY.md §5）。文件形态见 §3：
 
     # 长期记忆（工作区 <ws_key>）
     <说明行>
@@ -19,9 +19,9 @@
   注释里那行。本模块用 `_visible_segments` 先切出"注释外区间"，只在其中认标题。
 - **追加写原始文本**（注释原样保留），**覆盖写只替换注释外那一段 span**。
 
-本模块只依赖 stdlib + `app.resource` + `app.schema`（不碰 app.agent 内部），可被工具层
-（app.agent.tools）与测试直接 import。日期一律作参量传入（工具侧传 date.today()），
-保证纯函数好测。
+本模块只依赖 stdlib + `app.resource.paths` + `app.schema`（不碰 app.agent 内部），可被工具层
+（app.agent.tools）、基座（app.platform.runtime 的播种）与测试直接 import。日期一律作参量传入
+（工具侧传 date.today()），保证纯函数好测。
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.resource import memory_root, workspace_key
+from app.resource.paths import memory_root, workspace_key
 from app.schema.agent_schema import MemoryEntry
 
 # 记忆文件名（白名单单点：模型无法指定路径）

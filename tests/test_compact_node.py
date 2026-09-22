@@ -16,7 +16,7 @@ from langchain_core.messages import (
 from langgraph.graph.message import add_messages
 
 from app.agent.nodes import CompactNode, needs_compact
-from app.agent.utils import coerce_tool_result
+from app.platform.tool_results import coerce_tool_result
 
 # 触发折叠的小预算：任何有内容的历史都会超
 BUDGET = 40

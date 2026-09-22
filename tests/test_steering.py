@@ -28,7 +28,7 @@ from langgraph.types import Command
 
 import app.agent.nodes as nodes_module
 from app.agent.graph import get_main_agent_graph
-from app.agent.mcp import _reset_pools_for_tests, close_session_pool
+from app.platform.mcp import _reset_pools_for_tests, close_session_pool
 from app.platform.runtime import UserMailbox
 from app.platform.turn import build_turn_state
 

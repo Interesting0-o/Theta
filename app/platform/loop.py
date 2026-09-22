@@ -23,6 +23,7 @@ from app.platform.commands import (
     is_command,
     parse_command,
 )
+from app.platform.mcp import close_all_pools, close_session_pool
 from app.platform.runtime import build_session_runtime
 from app.platform.turn import _race, build_turn_state, drive_turn
 from app.platform.ui import UI
@@ -42,18 +43,15 @@ EXIT_WORDS = ("quit", "q", "exit")
 async def _close_mcp_session(workspace: str, session: str | None) -> None:
     """关掉某会话的 MCP 常驻运行体（切会话用）。
 
-    机制在 `app/agent/mcp.py`，**生命周期归宿主**（此处）——worker 子进程也要用同一套机制，
-    所以机制不能寄生在平台里，只有"何时关"归平台。`app.agent.*` 懒加载：import 即需 .env。
+    机制在 `app/platform/mcp.py`（2026-09-21 从 app/agent 搬来），**生命周期归宿主**（此处）
+    ——worker 子进程也要用同一套机制，所以机制不能寄生在"谁用得多"里，只有"何时关"归平台。
+    顶层 import 即可：该模块不 import app.agent，不触发 .env。
     """
-    from app.agent.mcp import close_session_pool  # noqa: PLC0415
-
     await close_session_pool(workspace, session)
 
 
 async def _close_all_mcp_sessions() -> None:
     """关掉本进程全部 MCP 常驻运行体（退出用）。"""
-    from app.agent.mcp import close_all_pools  # noqa: PLC0415
-
     await close_all_pools()
 
 
@@ -165,8 +163,8 @@ class AgentPlatform:
             await inbox.stop()
             if self._connection is not None:
                 await self._connection.close()
-            # 关常驻 MCP 运行体（子进程）。守卫用 _step：没建过运行时就没有运行体可关，
-            # 也避开"无 .env 时 import app.agent 抛 ValidationError"把干净退出变成 traceback。
+            # 关常驻 MCP 运行体（子进程）。守卫用 _step：没建过运行时就没有运行体可关
+            # （那也省掉一次没意义的关闭扫描）。
             if self._step is not None:
                 await _close_all_mcp_sessions()
 

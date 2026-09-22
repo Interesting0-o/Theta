@@ -115,7 +115,7 @@
     },
     "dispatch_subtasks":{
         "need_review":false,
-        "source":"dispatch"
+        "source":"mcp_service/dispatch"
     },
     "write_memory":{
         "need_review":false,

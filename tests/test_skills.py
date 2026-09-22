@@ -1,4 +1,4 @@
-"""app/agent/skills.py：技能源的扫描 / 解析 / 渲染（单源 = 项目根 skills/）。
+"""app/resource/skills.py：技能源的扫描 / 解析 / 渲染（单源 = 项目根 skills/）。
 
 源目录用 monkeypatch `skills.SKILLS_DIR` 指到 tmp——不碰仓库里真实的 `skills/`
 （否则加一个技能就会弄坏这些用例）。
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from app.agent import skills
+from app.resource import skills
 from app.schema.agent_schema import SkillMeta, SkillPreflight
 
 

@@ -2,7 +2,7 @@
 
 用**真的 sqlite checkpoint 库**（AsyncSqliteSaver + 最小 StateGraph + 局部 TypedDict state）——
 不 import app.agent，故本文件**无需 .env**、也无需 WORKSPACE_PATH。
-落盘一律 monkeypatch app.resource.RESOURCE_ROOT 到 tmp。
+落盘一律 monkeypatch app.resource.paths.RESOURCE_ROOT 到 tmp。
 """
 import asyncio
 import time
@@ -15,7 +15,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
-import app.resource as resource
+import app.resource.paths as resource
 from app.platform.commands.session import _format_time, list_sessions, resolve_session_id
 
 

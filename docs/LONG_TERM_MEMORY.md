@@ -67,7 +67,7 @@ resource/
 - 想续旧对话 → 用 **`/session`**（见 §7）列出 `resource/<ws>/sessions/` 下的历史会话并切换（切到该 id 重开 checkpointer、接着它的消息栈/thread 走）；
 - 每个 session 一个独立 sqlite 文件 → 多会话 checkpoint 天然隔离，不再挤一个 105MB 单库。
 
-**装配点（改动前 → 已落地）**：改动前 db 路径由 `app/tui/driver.py::get_agent_db_path()` 无参算出（固定 `resource/agent.db`），工作区在 `get_main_agent_graph` 内解析，两者的工作区来源不统一。**已落地**：路径统一到 `app/resource.py`（`session_db_path(workspace, session_id)` / `workspace_key`），基座 `app/platform/runtime.py::build_session_runtime` 在建 checkpointer 前就拿到工作区（由前端解析后**作参量传入**）；未另造"单一解析出口"函数——"前端定工作区 → 参量传 → resource 只算 key"已经够清楚（见 §7.1）。
+**装配点（改动前 → 已落地）**：改动前 db 路径由 `app/tui/driver.py::get_agent_db_path()` 无参算出（固定 `resource/agent.db`），工作区在 `get_main_agent_graph` 内解析，两者的工作区来源不统一。**已落地**：路径统一到 `app/resource/paths.py`（当时是 `app/resource.py`，2026-09-21 升格成包；`session_db_path(workspace, session_id)` / `workspace_key`），基座 `app/platform/runtime.py::build_session_runtime` 在建 checkpointer 前就拿到工作区（由前端解析后**作参量传入**）；未另造"单一解析出口"函数——"前端定工作区 → 参量传 → resource 只算 key"已经够清楚（见 §7.1）。
 
 ---
 
@@ -161,16 +161,16 @@ resource/
 ## 7. 装配与迁移（改动面）
 
 1. **路径解析收敛为一处**（Phase A）`[已落地]`：
-   - 新增轻量 helper（实为 **`app/resource.py`**——放 app 根而非 `app/agent/`：只依赖 stdlib/pathlib，import 不触发 .env）暴露：
+   - 新增轻量 helper（实为 **`app/resource/paths.py`**——放 app 根而非 `app/agent/`：只依赖 stdlib/pathlib，import 不触发 .env）暴露：
      `workspace_key(workspace_path) -> str`、`memory_root(workspace_path) -> Path`、
      `session_db_path(workspace_path, session_id) -> Path`；
    - `get_agent_db_path` 已删除，路径统一走 `session_db_path`；工作区一致性靠**参量传递**保证（前端解析 → 基座/图收同一个 `workspace` 字符串），未再抽"共用解析出口"函数——`_resolve_workspace`（`app/agent/graph.py`）仍只管"参量为空 → 默认 `<项目根>/tmp`"这一个分支。
 2. **memory 提供器 / 节点**（Phase B）：
-   - `app/agent/memory.py`：读 md、格式化 SystemMessage、追加/覆盖条目、cap 截断（纯函数为主，便于单测）；
+   - `app/resource/memory.py`：读 md、格式化 SystemMessage、追加/覆盖条目、cap 截断（纯函数为主，便于单测）；
    - LLMNode 收 memory 注入（读一次文件 → SystemMessage）；
    - `write_memory`/`read_memory` 工具 + `source="memory"` 分流 + tool.json 登记。
 3. **session/thread** `[已落地]`：前端每次启动 = 新会话（`uuid4().hex`），同时作 `thread_id` 与 db 目录名；硬编码 `conversation_456` 已删除（三级解析见 §2 的说明）。
-4. **旧数据** `[已落地]`：`resource/agent.db` 是 dev 运行产物（gitignore）。Phase A 切换路径后它不再被读，且**启动时自动删除**（`app/platform/loop.py` 调 `app/resource.py::remove_legacy_single_db`，用户已确认）。
+4. **旧数据** `[已落地]`：`resource/agent.db` 是 dev 运行产物（gitignore）。Phase A 切换路径后它不再被读，且**启动时自动删除**（`app/platform/loop.py` 调 `app/resource/paths.py::remove_legacy_single_db`，用户已确认）。
 5. **测试** `[已落地]`：`test_agent_db_path_resolves_under_resource_dir` 已随新布局删除，改由 `tests/test_resource.py`（路径布局）等覆盖；另已有 md 读写 / cap / 工具注入 / 会话命令（`tests/test_sessions.py`、`test_commands.py`）的单测。`reviewed.json` 因未实现，仍无对应测试。
 
 **TUI 命令层（/init · /session，2026-09-08 引入；2026-09-10 起落 `app/platform/commands/` 包）**：新开程序 = 新会话，续旧会话与沉淀项目约定走命令。命令是**基座的控制面事件（图之外）**——基座解析并处理，前端只渲染其输出（未识别命令走 `Notice` 事件，不喂给模型）；`q/quit/exit` 的退出词仍在 `loop.py`，未纳入命令表。

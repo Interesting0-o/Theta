@@ -123,7 +123,7 @@
 - **这是本项目第一个"运行中改变工具集"的机制**，值得单独立项、单独测。
 
 > **已落地（2026-09-12）→ §13.2/§13.4/§13.6**。三处与本节原稿不同：① "注册表 = 会话级对象"简化成
-> **技能 = 按需加入的 server**（运行时状态按 (工作区, 会话) 落在 `app/agent/mcp.py`，与 §12 同源，
+> **技能 = 按需加入的 server**（运行时状态按 (工作区, 会话) 落在 `app/platform/mcp.py`，与 §12 同源，
 > 不另造对象）；② 卸载**只剩一条路径** `drop_skill`（不做 idle 回收，与 §12 决定 4 一致）；
 > ③ `version` 计数与"只在版本变化时 bind"照原样落地（`LLMNode` 持未绑定 model + 按版本缓存 binding）。
 
@@ -200,7 +200,7 @@
 
 **一条编排工具只能返回文本、或改 state——它给不了模型新的可执行能力。** 所以"skill 只给文档/指导"的版本有个硬伤：GitHub 这类能力当前根本没有（§1），只有"间接实现"——让模型自己拼 shell 去调 `gh` / `git push`。这条路三点不可接受：
 
-1. **环境是即兴的。** 脚本跑在哪、依赖装没装、凭据从哪来，全靠模型现场判断（`pip install`？建 venv？token 塞进 URL？）。结果不可预计、不可复现，每次还是新花样。**MCP server 把这三样在*编写期*就钉死**——进程怎么起、env 注入哪些键、cwd 在哪（`app/agent/mcp.py::_build_servers` `[已落地]` 干的就是这个），不留给模型即兴。
+1. **环境是即兴的。** 脚本跑在哪、依赖装没装、凭据从哪来，全靠模型现场判断（`pip install`？建 venv？token 塞进 URL？）。结果不可预计、不可复现，每次还是新花样。**MCP server 把这三样在*编写期*就钉死**——进程怎么起、env 注入哪些键、cwd 在哪（`app/platform/mcp.py::_build_servers` `[已落地]` 干的就是这个），不留给模型即兴。
    > 这也正面回答"有脚本的 skill 怎么让 agent 执行"：**脚本不该由模型去跑，该被封进 server**。
 2. **审批失去意义。** `run_command` 把整个 shell 字符串当成一个审批单元——面板上是长长一条命令，人批的是"这条命令"，不是"把 PR #123 合进 main"。**知情审批要求审批对象是语义化的动作**：`github_pr_merge(pr=123)` 一眼可审，`bash -c "…"` 不可审计。
 3. **错误语义丢失。** shell 的失败是 stderr 文本，要模型自己读懂；MCP 工具走 `guard` `[已落地]` → 结构化 `ToolResult(error_type)`——正是 [[docs/EXCEPTION_DESIGN]] 的立论。
@@ -304,7 +304,7 @@ skills/<name>/
 - **`get_skill`**：`app/agent/tools.py`，作为新的编排工具组（或并入现有编排工具组），`source="skill"` 登记进 `tool.json` 并加进 `ReviewNode.ORCHESTRATE_SOURCES`。
   > **两种 source 是**有意的**、跟现有约定一致**：编排类用**单词类别名**（`plan` / `notes` / `dispatch` / `memory` / 新的 `skill`），普通工具用**路径式名**（`mcp_service/file_io`、新的 `skills/<name>`）。所以 `get_skill` 走 `skill`（→ 分流进 `OrchestrateNode`），而 GitHub 的各工具走 `skills/github`（**不命中** `ORCHESTRATE_SOURCES` → 进普通队列 → `ToolNode`）。这正是想要的：`get_skill` 是编排动作，它带来的工具不是。
 - **审批策略**：skill 的工具**预先登记进 `app/agent/tool.json`**（即使 server 没起）——保住"审批策略集中一处、可审计"。于是 **skill = 工具 + 它的 `tool.json` 登记行 + 指导文本**，三件套；加一个 skill 要动 `tool.json` 是**特性不是负担**。**登记表只在 `app/agent/tool.json` 一处**（2026-09-13 起）：技能正文不再抄一份——`SKILL.md` 只写**领域**内容（能力 + 纪律 + 凭证），项目侧的映射（哪个工具 `need_review`、`source` 是什么）不属它管，抄一份只会两处走散。
-- **知识型的注入**：与能力型**同一条通道**（§3.5）——目录（name + description）进 `get_skill` 的 docstring；正文由 `get_skill` 写 state、`LLMNode` 拼进系统提示。**不另走 `read_file`**：让模型自己去捞，正文会落在**对话历史**里（会被 compact 折掉、随轮次稀释）；进**系统提示**才每轮都在、模型无法忽略。扫描 / 解析落在新模块 `app/agent/skills.py`，与 `memory.py` 并列（同属"工作区内容 → 注入"的通道）。**独立成模块的判据**：消费者跨文件 >1 且自身逻辑成规模——`skills.py` 的消费者是 `tools.py`（`get_skill`/`drop_skill` 取目录与正文）、`nodes.py::LLMNode`（注入块）、构图期（目录烤进 docstring），跨三个文件，故独立；反例见下表 `profile.py` 那行。
+- **知识型的注入**：与能力型**同一条通道**（§3.5）——目录（name + description）进 `get_skill` 的 docstring；正文由 `get_skill` 写 state、`LLMNode` 拼进系统提示。**不另走 `read_file`**：让模型自己去捞，正文会落在**对话历史**里（会被 compact 折掉、随轮次稀释）；进**系统提示**才每轮都在、模型无法忽略。扫描 / 解析落在新模块 `app/resource/skills.py`，与 `memory.py` 并列（同属"工作区内容 → 注入"的通道）。**独立成模块的判据**：消费者跨文件 >1 且自身逻辑成规模——`skills.py` 的消费者是 `tools.py`（`get_skill`/`drop_skill` 取目录与正文）、`nodes.py::LLMNode`（注入块）、构图期（目录烤进 docstring），跨三个文件，故独立；反例见下表 `profile.py` 那行。
 
 ---
 
@@ -359,7 +359,7 @@ skills/<name>/
 
 | 落点 | 内容 |
 | --- | --- |
-| **`app/agent/skills.py`**（新增） | 扫描 / 解析 / 渲染的**只读单点**：`scan_skills`（无参，只扫项目根 `skills/`）/ `read_body` / `catalog_block` / `skills_block` / `bodies_size`。只依赖 stdlib |
+| **`app/resource/skills.py`**（新增） | 扫描 / 解析 / 渲染的**只读单点**：`scan_skills`（无参，只扫项目根 `skills/`）/ `read_body` / `catalog_block` / `skills_block` / `bodies_size`。只依赖 stdlib |
 | `app/agent/state.py` | 加 `loaded_skills: List[str]`（无 reducer）——**只存名字** |
 | `app/agent/tools.py` | `skill_tool` 组：`get_skill`（async，读盘走 `to_thread`）/ `drop_skill`（同步，纯 state）；**两者都不注入 `workspace`**（源在项目根）；`skill_tools_for()` 把目录 `model_copy` 进 docstring |
 | `app/agent/tool.json` | `get_skill` / `drop_skill` → `{"need_review": false, "source": "skill"}` |
@@ -387,7 +387,7 @@ skills/<name>/
 
 ### 12.1 改造前：没有池，而且已经坏了（**实测**，不是推理）
 
-`app/agent/mcp.py::load_mcp_tool` 用 `client.get_tools()` 拿工具。适配器这条路径的语义是 **每次调用新建会话**：
+`app/platform/mcp.py::load_mcp_tool` 用 `client.get_tools()` 拿工具。适配器这条路径的语义是 **每次调用新建会话**：
 
 - 源码：`langchain_mcp_adapters/tools.py` 里 `if session is None:` → `async with create_session(...)` + `await tool_session.initialize()`（**传了连接、没传会话**时走这条）；`client.get_tools()` 正是只传连接。
 - 观测：一次 `load_mcp_tool` 后连续调三个工具，服务端日志出现**三组** `ListToolsRequest` + `CallToolRequest`。
@@ -431,7 +431,7 @@ start_process(...)  → "进程 p1 仍在运行（常驻）：已在后台常驻
 
 | # | 决定 | 理由 / 含义 |
 | --- | --- | --- |
-| 1 | **机制在 agent 层，生命周期归宿主** | 机制的落点是 `app/agent/mcp.py`（**不新增模块**）；"何时关"由宿主调 `close_session_pool` / `close_all_pools`。理由：worker 子进程（`mcp_service/sub_agent.py`）也要用同一套机制而**它没有平台**，机制不能寄生在平台里；关闭时机只有宿主知道 |
+| 1 | **机制不在平台里，生命周期归宿主** | 机制的落点是 `app/platform/mcp.py`（2026-09-21 从 `app/agent/mcp.py` 整体搬来——判据见 docs/ARCHITECTURE.md §4 的 A/B/C；落点本身仍**不新增模块**）；"何时关"由宿主调 `close_session_pool` / `close_all_pools`。理由：worker 子进程（`mcp_service/sub_agent.py`）也要用同一套机制而**它没有平台**，机制不能寄生在平台里；关闭时机只有宿主知道 |
 | 2 | **作用域 = (工作区, 会话)** | 与 `session_db_path` 同口径。terminal 的受管进程表是**会话语义状态**，按工作区共享就会跨会话泄漏（A 会话起的进程 B 会话能看见、能杀） |
 | 3 | **懒起：首次真调用时** | 空会话零进程。schema 另走临时会话（按工作区缓存），所以构图期仍 spawn 一遍（与改造前相同），但**常驻体一个都不预养** |
 | 4 | **全部不回收（常驻到宿主关闭）** | 没有空闲计时器、没有 `busy` 计数、没有 sweep。terminal 的常驻进程因此不会被静默杀掉；代价是"进程只增不减"的担忧整体**交接给 §13**（卸载技能必须关运行体） |
@@ -524,7 +524,7 @@ async def _call(**kwargs):
 
 | 落点 | 内容 |
 | --- | --- |
-| **`app/agent/mcp.py`** | 三件事合一：`_build_servers`（连接配置）、`_tool_specs` + `_make_shim` + `load_mcp_tool`（工具加载，**不绑会话**）、`_ServerWorker` + `get_worker` + `close_session_pool` / `close_all_pools`（运行体常驻）。原 `_MCP_TOOLS_CACHE` 从"缓存工具对象"改成"缓存 shim"，另加按工作区的 schema 缓存 |
+| **`app/platform/mcp.py`** | 三件事合一：`_build_servers`（连接配置）、`_tool_specs` + `_make_shim` + `load_mcp_tool`（工具加载，**不绑会话**）、`_ServerWorker` + `get_worker` + `close_session_pool` / `close_all_pools`（运行体常驻）。原 `_MCP_TOOLS_CACHE` 从"缓存工具对象"改成"缓存 shim"，另加按工作区的 schema 缓存 |
 | `app/agent/graph.py` | `get_main_agent_graph(workspace_path=None, session_id=None)` → 传给 `load_mcp_tool` |
 | `app/platform/runtime.py` | `build_session_runtime` 把会话 id 传进构图 |
 | `app/platform/loop.py` | 两个宿主挂点：`switch_session` 关旧会话、`run()` finally 关全部（`app.agent.*` 懒加载，保持"无 .env 可顶层 import 基座"） |
@@ -707,9 +707,9 @@ evaluation = `task.name`，关池用的也是它）；langgraph dev 零参 → `
 | 落点 | 内容 |
 | --- | --- |
 | `app/schema/agent_schema.py` | `SkillMeta` 增 `dir_name` / `capability` |
-| `app/agent/skills.py` | `SKILLS_PACKAGE` / `SERVER_FILENAME` / `SKILL_CONFIG_FILENAME`；能力型判定（含 identifier 校验与降级）；`server_module` / `read_skill_env` / `read_requirements` / `read_preflight` / `get_meta` / `body_of`；`catalog_block` 标 `[带工具]`；`skills_block` 点名"已不可用的技能" |
+| `app/resource/skills.py` | `SKILLS_PACKAGE` / `SERVER_FILENAME` / `SKILL_CONFIG_FILENAME`；能力型判定（含 identifier 校验与降级）；`server_module` / `read_skill_env` / `read_requirements` / `read_preflight` / `get_meta` / `body_of`；`catalog_block` 标 `[带工具]`；`skills_block` 点名"已不可用的技能" |
 | `app/config.py` | `GITHUB_TOKEN`（可选带空默认）+ `SKILL_ENV_WHITELIST` + `skill_env` |
-| `app/agent/mcp.py` | `stdio_connection`（核心与技能共用）；**独立的 per-server schema 缓存**（见下）；`register_server` / `unregister_server` / `session_tools` / `session_tool_names` / `registered_servers` / `tools_version`；`close_session_pool` 一并清 extras 与版本 |
+| `app/platform/mcp.py` | `stdio_connection`（核心与技能共用）；**独立的 per-server schema 缓存**（见下）；`register_server` / `unregister_server` / `session_tools` / `session_tool_names` / `registered_servers` / `tools_version`；`close_session_pool` 一并清 extras 与版本 |
 | `app/agent/tools.py` | `get_skill` / `drop_skill`（加注入 workspace；drop 改 async）+ 四道校验 + `_skill_preflight_line`（加载时体检）+ `_probe_skill_startup`（起不来时捞真 traceback）+ `SessionToolset`（含双向对账）+ `_tool_config()` 校验缝 |
 | `app/agent/nodes.py` | `LLMNode` 动态 bind；`ToolNode` 动态查表 + 可行动 `unknown_tool` 文案；`ReviewNode` 限定版 fail-closed |
 | `app/agent/graph.py` | 主图装配 `SessionToolset(workspace, static_tools)`、model **不在此绑定**；worker 路径一行未改 |
@@ -879,12 +879,12 @@ issue / PR 通吃的**对话楼层**，带楼层号与翻页）与 `github_pr_re
 | `mcp_service/`（file_io / terminal / git / web_search） | **内置核心能力**，skill 与它并列而不混入（§8.1）；`terminal.py::_deny_sudo` 是"结构性拒绝"的样板；`git.py` 的 `git_push` / `git_clone` 都收远程仓库**地址**（§8.3），核心服务因此**不持有任何平台凭证** |
 | `skills/<name>/`（顶层库） | 一个技能一个目录：`SKILL.md` + 可选 `server.py`（能力型）+ 可选 `skill.json`（env 声明 + 加载时体检 `preflight`）。首个 = `skills/github/`（2026-09-12 起带 server.py；2026-09-14 起 **14 只读 + 3 写**工具 + 加载时体检，见 §13.10） |
 | `mcp_service/sub_agent.py` + `app/agent/graph.py::get_sub_agent_graph` + `app/agent/tools.py::worker_tools` | **fork 执行的现成骨架**（独立上下文 / 工具子集 / 跨进程审批回流）——§6 要复用它 |
-| `app/agent/mcp.py` | **§12 已落地**：现在同时承载连接配置、工具加载（**不绑会话的 shim**）与运行体常驻（`_ServerWorker` + `get_worker` + `close_session_pool`）。`load_mcp_tool(workspace, session_id)` 增加会话参量；`get_resources` 管道一期不做（§9 已决）——软约束由 host 读 `SKILL.md` |
+| `app/platform/mcp.py` | **§12 已落地**：现在同时承载连接配置、工具加载（**不绑会话的 shim**）与运行体常驻（`_ServerWorker` + `get_worker` + `close_session_pool`）。`load_mcp_tool(workspace, session_id)` 增加会话参量；`get_resources` 管道一期不做（§9 已决）——软约束由 host 读 `SKILL.md` |
 | `mcp_service/terminal.py` | **§12 顺带修好了它的跨调用进程管理**（改造前 `start_process` 起的进程下次调用就认不到，实测）——池化后自动恢复，**本文件一行没改** |
 | `app/platform/runtime.py::build_session_runtime` | **§13.2 的注册表宿主**：与 graph / checkpointer 一起造的会话级运行时对象，构图期注入 LLMNode / ToolNode / OrchestrateNode |
 | `app/agent/tool.json` | 审批策略的**唯一权威表**，也是硬约束的落点之一。`get_skill`/`drop_skill` 走 `source: skill`（§11）；技能带来的工具走 `source: skills/<目录名>`（§13）。**未登记的工具，`get_skill` 会拒绝加载整个技能**（§13.3） |
 | `app/agent/nodes.py` | `ORCHESTRATE_SOURCES` 含 `skill`（§11）；二期又动了三处：`LLMNode` 动态 bind、`ToolNode` 动态查表、`ReviewNode` 限定版 fail-closed（§13.4） |
-| `app/agent/memory.py` | 知识型的同族通道（"工作区内容 → 注入"），新模块 `skills.py` 与它并列 |
+| `app/resource/memory.py` | 知识型的同族通道（"工作区内容 → 注入"），新模块 `skills.py` 与它并列 |
 | ~~`app/agent/profile.py`~~ | **已于 2026-09-12 并入 `LLMNode.agent_md_block`**——生产侧只有 LLMNode 一个消费者，按上面那条判据不单独立模块。`skills.py` 不受此影响（它是 memory.py 的处境，不是 profile.py 的） |
 | `app/platform/commands/prompts.py` | `/init`、`/fast readme` 载荷——§10 待收敛 |
 | `docs/MULTI_AGENT.md` §6 | "子 agent 写权限下放"是 §6 的前置里程碑 |

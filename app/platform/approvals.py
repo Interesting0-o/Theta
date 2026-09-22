@@ -5,7 +5,7 @@
 
 职责边界（对齐 docs/MULTI_AGENT.md §6）：判定"要不要放行某动作"单点在**图的审核节点**
 （ReviewNode + interrupt）——人答 y/n 只发生在图的审核节点，经 interrupt→Command(resume)
-语义；"这段回答够不够格当作选项被选中"也判在那边（`_normalize_ask_answer`）。本模块只承接
+语义；"这段回答够不够格当作选项被选中"也判在那边（`gates.normalize_ask_answer`）。本模块只承接
 "待决请求的排队 + 决定的送达"，是纯队列/收件箱，不是判定权威。
 
 **统一 broker 语义（2026-09-07 起）**：本地主 agent 的 graph interrupt 与远端 worker 的
@@ -398,7 +398,7 @@ def _record_to_value(record: ApprovalRecord) -> dict:
         value["question"] = payload.get("question") or ""
         value["options"] = list(payload.get("options") or [])
         # 模态：面板据此提示"可多选"，并决定输入多个序号时收下还是重问。缺省 = 单选，
-        # 与 `nodes.py::_ask_request` 的默认值同源（那里是唯一权威，这里只做透传兜底）。
+        # 与 `app/agent/gates.py::ask_request` 的默认值同源（那里是唯一权威，这里只做透传兜底）。
         value["select"] = payload.get("select") or "one"
     else:
         value["tool_name"] = payload.get("tool_name", "?")

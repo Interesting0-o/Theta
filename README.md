@@ -160,7 +160,7 @@ START ─► llm_node ──(有 tool_calls)──► queue_node ─► review_n
 | `llm_node` | 聊天模型判断本轮要不要调工具（可调 = 编排/笔记/派发/记忆工具 + 四个 MCP server 的全部工具）；拼系统消息时注入 行为契约 + 工作区上下文 + 当前计划 + 项目画像 + 长期记忆 |
 | `queue_node` | 把模型输出的 `tool_calls` 移入待审队列，清空上一轮的放行队列与提问回答 |
 | `review_node` | **人机闸门的落点**，按 `tool.json` 逐个判定：`need_review: true` 则 `interrupt()` 挂起等 `y/n`；`source: "ask"`（`ask_user`）则 `interrupt()` **提问**并把回答写进 state；通过的调用按 `source` 分流（state 工具 → orchestrate_node，其余 → tool_node）；**被拒**的调用回灌一条带 `[approval_denied]` 的回执（不让模型以为它执行了） |
-| `orchestrate_node` | 执行 agent 侧 state 工具：计划编排（`create_plan` / `update_plan_step` / `clear_plan`）、`read_note`、`ask_user`（把闸门收来的两段回答渲染成回执）、`dispatch_subtasks`、`write_memory` / `read_memory`——只动会话内 state，不产生真实副作用 |
+| `orchestrate_node` | 执行 agent 侧 state 工具：计划编排（`create_plan` / `update_plan_step` / `clear_plan`）、`read_note`、`ask_user`（把闸门收来的两段回答渲染成回执）、`write_memory` / `read_memory`——只动会话内 state，不产生真实副作用。`dispatch_subtasks` **不在这一层**：它是 `mcp_service/dispatch.py` 的普通 MCP 工具，走 `tool_node` |
 | `tool_node` | `ainvoke` 执行已批准的工具（MCP 工具是 async-only），结果作为 `ToolMessage` 回传 |
 | `compact_node` | **轮末折叠**：历史超预算（默认 60000 字符）时，把更早轮次**已消费的完整工具块**折成一条摘要系统消息（联网正文归档进 `notes`，需要时用 `read_note` 取回）；只在收尾跑，不碰当前轮 |
 
@@ -211,12 +211,19 @@ theta/
 │   ├── main.py                 # 程序入口（薄壳）：调 app.tui.run_tui()
 │   ├── config.py               # 环境配置（pydantic-settings，读 .env）
 │   ├── exception.py            # AgentError 体系（ConfigError / WorkspaceViolationError / InvalidArgumentError）
-│   ├── resource.py             # 落盘路径单点：workspace_key / session_db_path / memory_root
+│   ├── resource/               # 资源层：读 agent 之外的东西 → 内部表示
+│   │   ├── paths.py            #   落盘路径单点：workspace_key / session_db_path / memory_root
+│   │   ├── memory.py           #   长期记忆 memory.md 的读写与注入渲染
+│   │   ├── skills.py           #   技能（skill）扫描 / 解析 / 注入渲染（只读单点）
+│   │   ├── images.py           #   @图片路径 的调用期附图通道（data URI，不碰 state）
+│   │   └── profile.py          #   项目画像（工作区根 AGENT.md）的读取与注入块
 │   ├── platform/               # 事件基座（"图外面那层"；不 print、不读 stdin）
 │   │   ├── loop.py             # AgentPlatform：主事件循环（drain 待批 → 等 turn → 等输入）
 │   │   ├── approvals.py        # 统一审批 broker：队列 + 薄 HTTP 收件箱 + 排空/回填
 │   │   ├── turn.py             # 一次 run 的驱动原语：drive_turn（park/resume）+ _race
 │   │   ├── runtime.py          # 按 (工作区, 会话) 装配 db / checkpointer / 图
+│   │   ├── mcp.py              # 宿主侧 MCP 边界：连接配置 + 工具加载 + 运行体常驻
+│   │   ├── tool_results.py     # 工具返回归一化：format_tool_result / coerce_tool_result
 │   │   ├── ui.py               # UI 协议（emit / read_line / decide）
 │   │   └── commands/           # 控制面命令：/init /help /list session /new session /session
 │   ├── tui/                    # 终端前端（只取输入 + 渲染事件，不碰调度）
@@ -227,14 +234,10 @@ theta/
 │   ├── agent/                  # 图本体
 │   │   ├── graph.py            # 状态图构建与条件路由（langgraph.json 的注册入口在此文件）
 │   │   ├── state.py            # AgentState：消息 / 审批队列 / current_plan / notes
-│   │   ├── nodes.py            # LLM / Queue / Review / Orchestrate / Tool / Compact 节点
+│   │   ├── nodes.py            # LLM / Queue / Review / Orchestrate / Tool / Compact 节点 + 模型构造
 │   │   ├── prompt.py           # 系统提示词：行为契约 + 工作区上下文
-│   │   ├── model.py            # 聊天模型初始化（OpenAI 兼容）
-│   │   ├── mcp.py              # 以 stdio 子进程拉起四个 MCP server 并收集工具
-│   │   ├── tools.py            # agent 侧工具：编排 / read_note / dispatch / 记忆读写 / 技能加载
-│   │   ├── memory.py           # 长期记忆 memory.md 的读写与注入渲染
-│   │   ├── skills.py           # 技能（skill）扫描 / 解析 / 注入渲染（只读单点）
-│   │   ├── utils.py            # format_tool_result / coerce_tool_result（工具结果归一化）
+│   │   ├── gates.py            # 闸门判定材料：策略表读取 + 免审判定 + 提问校验
+│   │   ├── tools.py            # agent 侧工具：计划 / read_note / ask_user / 记忆读写 / 技能加载
 │   │   ├── tool.json           # 审批策略集中登记（need_review / source / worker_allow）
 │   │   └── command_policy.json # 终端命令的免审白名单（只读 git 子命令等）
 │   └── schema/                 # 数据形状（agent / approval / ui / session 四个域）
@@ -243,6 +246,7 @@ theta/
 │   ├── terminal.py             # 终端进程管理器（任意命令 + 进程组托管 + sudo 硬拒绝）
 │   ├── web_search.py           # Tavily 联网检索四件套 + 上游失败翻译
 │   ├── sub_agent.py            # worker（子 agent）MCP server：run_subtask（spawn 即走，只读）
+│   ├── dispatch.py             # 派发 MCP server：dispatch_subtasks（并发 spawn 多个 worker）
 │   └── utils.py                # guard 异常收口装饰器（只 return 不 raise）
 ├── skills/                     # 技能库（可插拔的领域包；命名空间包）。一个技能一个目录：
 │   └── github/                 #   SKILL.md（必备）+ 可选 server.py（有=能力型，无=知识型）
@@ -271,6 +275,9 @@ export WORKSPACE_PATH='C:\Users\<你>\AppData\Local\Temp'   # 见 python -c "imp
 
 > 不设 `WSLENV` 变量根本进不去子进程（会看到 "WORKSPACE_PATH 未设置"），且值要写 **Windows 路径**（别用 `/tmp`，那会被当成 `E:\tmp`）。纯 Linux/macOS 下把解释器换成 `python`、`WORKSPACE_PATH` 指向该系统的临时目录并跳过 `WSLENV` 即可。
 > Windows（PowerShell）：`$env:WORKSPACE_PATH="$env:TEMP"` 后再跑 `python -m pytest`。
+>
+> ⚠️ 想用命令替换取值（省得手抄路径）时**必须去掉行尾的 `\r`**：Windows 解释器打印的路径带 CRLF，粘进变量后 `Path.is_dir()` 为假、`file_io` 会在 import 期报"工作区不存在"。
+> `export WORKSPACE_PATH="$(.venv/Scripts/python.exe -c 'import tempfile;print(tempfile.gettempdir())' | tr -d '\r\n')"`
 
 > `app/config.py` 在 import 阶段就读 `.env`，跑测试/启动前 `.env` 必须存在（键全、值可空）。`tests/test_file_io_sandbox.py` 的符号链接逃逸用例在 Windows（无符号链接权限）会 skip。
 

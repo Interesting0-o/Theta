@@ -17,7 +17,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import Command
 
 import app.platform.commands as commands_mod
-import app.resource as resource
+import app.resource.paths as resource
 from app.platform.commands import PROMPT_COMMANDS
 from app.platform.loop import AgentPlatform
 from app.platform.runtime import UserMailbox

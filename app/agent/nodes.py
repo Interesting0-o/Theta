@@ -1,34 +1,45 @@
 import asyncio
-import base64
 import inspect
 import json
-import re
 import shlex
 import time
-from functools import lru_cache
 from inspect import signature
 from pathlib import Path
 from typing import Callable
 
+from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
-from app.agent.memory import memory_block
-from app.agent.skills import get_meta, read_tool_policies, skills_block
+from app.agent import gates
+from app.exception import ConfigError
+from app.resource import images, profile
+from app.resource.memory import memory_block
+from app.resource.skills import get_meta, read_tool_policies, skills_block
 from app.agent.state import AgentState
-from app.agent.utils import coerce_tool_result, format_tool_result
+from app.platform.tool_results import coerce_tool_result, format_tool_result
 from app.agent.prompt import SYSTEM_PROMPT, handoff_pointer_block, workspace_context_block
+from app.config import get_settings
 from app.schema.agent_schema import ImageRef, NoteEntry, PlanStep
 from app.schema.approval_schema import GATE_ASK_USER, GATE_TOOL_APPROVAL
 
-_TOOL_CONFIG_PATH = Path(__file__).with_name("tool.json")
+# 顶部读一次 settings 是**行为契约**，不是随手一行：它让"缺 .env"在 import 期就响亮报错，而不是
+# 拖到第一次真去建模型时才炸（`app/agent/model.py` 于 2026-09-21 并入本模块，那行随之下移到这里；
+# 并入时**刻意保留**该时机，见 docs/TODO.md 该条）。懒加载（+ 入口把 ValidationError 翻成
+# ConfigError）是 docs/EXCEPTION_DESIGN.md 里另一条**尚未落地**的待办，落地时连同这一行一起改。
+settings = get_settings()
 
 
 #----------------------工具调用日志（审核节点逐条输出）----------------------
 
-def _short(text: str, limit: int = 120) -> str:
-    """压成单行并截断，用于控制台日志的紧凑展示。"""
+def _one_line(text: str, limit: int = 120) -> str:
+    """把多行文本**折叠成单行**（所有空白收敛成一个空格）再截断，用于控制台日志的紧凑展示。
+
+    ⚠️ 与 `CompactNode._first_line` **语义不同、刻意不合并**（2026-09-21 审计：两者曾经同名
+    `_short` 但一个折叠空白、一个取首行，读起来极易看错）：本函数要的是"JSON 参数压成一行"
+    （取首行会把参数丢掉一半），那个要的是"取首个非空行当摘要"。
+    """
     text = " ".join((text or "").split())
     return text if len(text) <= limit else text[:limit] + "…"
 
@@ -41,43 +52,24 @@ def _tool_call_log(tool_call: dict) -> str:
         brief = json.dumps(args, ensure_ascii=False, sort_keys=True)
     except TypeError:
         brief = str(args)
-    return f"→ 工具调用: {name}  {_short(brief)}"
+    return f"→ 工具调用: {name}  {_one_line(brief)}"
 
 #-------------------大模型节点----------------------
 
-# 工作区根的项目画像文件名（`/init` 命令生成的就是它；与 file_io 沙箱同一根）
-AGENT_MD_FILENAME = "AGENT.md"
-
-# 画像注入上限（与 memory.py::MEMORY_INJECT_CAP 同量级）：超长只截断、不做压缩/摘要
-AGENT_MD_INJECT_CAP = 8000
-
-# 注入块标题：AGENT.md 由模型/人自由撰写，加一行标题让模型知道这段是什么
-_PROFILE_BLOCK_HEADER = "# 项目画像（工作区 AGENT.md）\n\n"
-
-#-------------------@图片路径 的调用期附图通道----------------------
-# 用户在消息里写 @路径（相对工作区或绝对），LLMNode 构造请求体副本时把图**临时**附上：
-# state 里的消息始终是带 @路径 的纯文本，base64 只活在副本那一瞬、从不进
-# messages/checkpoint——所以没有"轮末剔除"这回事，从一开始就没写进去。
-# 勘察与方案见 docs/TODO.md「图像输入」条目。
-
-# 扩展名 → data URI 的 mime。命中才算"长得像图片"（宽进策略：不像的 @token 是普通文本，
-# 原样放行——@人名、@note.txt 不该被碰）
-_IMAGE_MIME = {
-    "png": "image/png",
-    "jpg": "image/jpeg",
-    "jpeg": "image/jpeg",
-    "gif": "image/gif",
-    "webp": "image/webp",
-    "bmp": "image/bmp",
-}
-_IMAGE_EXT_RE = re.compile(r"\.(?:png|jpe?g|gif|webp|bmp)", re.IGNORECASE)
-# 单张体积上限：超限不读盘、给模型一行说明。这是**本地上限**，不是厂商限额（未实测核实）
-_MAX_IMAGE_BYTES = 5 * 1024 * 1024
-# 一条消息最多附几张，多的只给说明（防 payload 失控）
-_MAX_IMAGES_PER_MESSAGE = 4
-
-# read_bytes 失败的哨兵（与"文件不存在"区分：前者给"读取失败"，后者给"未找到"）
-_UNREADABLE = object()
+# 思考模式：`CHAT_THINKING` 的三态（app/config.py）到此映射成 provider 参数。**换 provider 只改
+# 这一个静态方法**——厂商各叫各的（智谱/GLM 是 `thinking.type`；部分平台 `enable_thinking`；OpenAI
+# 自家 `reasoning_effort`；DeepSeek 干脆靠换 model 名），把参数散到别处等于把厂商知识灌进核心节点。
+#
+# 三件记在案的事（都实测过，见 tests/test_thinking_config.py）：
+# - **不配 `clear_thinking`**：服务端默认（`true`）就是"历史轮次的思考不随上下文给模型"，正是我们
+#   要的（思考不占历史）。要"跨轮保留思考"是另一件大事（要求把思考逐字回传，与不占历史冲突）。
+# - **思考 token 计入 `completion_tokens`，因此也计入 `max_tokens`**：实测 `enabled` + 偏小的
+#   `max_tokens` 会让思考吃光预算、正文变空（300 时就是这样）。本仓库不设 `max_tokens`，故安全；
+#   哪天要设，必须把思考的额度算进去。
+# - **思考内容进不了 `messages`**：`langchain-openai` 有意不提取 `reasoning_content`（转换函数是
+#   白名单式的），所以我们不需要剥离代码——但这条**依赖库的行为**，由上面那个测试文件里的契约
+#   用例钉住：哪天库开始提取，用例会红，届时在 LLMNode 的写回点补剥离。
+_THINKING_TYPES = ("enabled", "disabled")
 
 
 class LLMNode:
@@ -116,6 +108,48 @@ class LLMNode:
         # AttributeError: 'RunnableBinding' object has no attribute 'bind_tools'。
         self._bound: Runnable | None = None
         self._bound_key: tuple | None = None
+
+    #-------------------模型构造（原 app/agent/model.py，2026-09-21 并入）-------------------
+    # 并入理由（docs/TODO.md「节点过度实现」一）：模型是"这一拍要发给谁"，属本节点；独立成模块
+    # 只多一层间接。**留作静态方法而非内联**——沿用 profile.py 并入时的先例：测试仍可直接调用它，
+    # 不必构造 LLMNode 实例（构造要 workspace、toolset、mailbox）。
+    # ⚠️ **`model` 参量必须保持可注入**：evaluation 的层 A 回放与一批单测靠
+    # `get_main_agent_graph(model=…)` 塞替身模型——这里是"默认构造跟着本节点走"，不是让
+    # `__init__` 自己造模型。
+
+    @staticmethod
+    def thinking_extra_body(mode: str) -> dict | None:
+        """把 `CHAT_THINKING` 翻成 `ChatOpenAI` 的 `extra_body`；**不下发（留空）→ `None`**。
+
+        用 `None` 而不是空 dict 表示"不下发"，是沿用库自己的约定：`_default_params` 里的
+        `exclude_if_none` 会把值为 `None` 的键**整个丢掉**（`langchain_openai/chat_models/base.py:1266-1292`），
+        所以 `extra_body=None` 与"根本没有这个参数"在请求体上等价——而空 dict 会以 `{}` 发出去。
+
+        取值写错**当场抛** `ConfigError`，不静默按"没配"处理：静默的后果是"用户以为开了思考、
+        实际没开"，而这种偏差在行为上几乎不可观测。
+        """
+        text = (mode or "").strip().lower()
+        if not text:
+            return None
+        if text not in _THINKING_TYPES:
+            raise ConfigError(
+                f"CHAT_THINKING 只能是 {' / '.join(_THINKING_TYPES)}（或留空 = 不下发），收到的是 {mode!r}"
+            )
+        return {"thinking": {"type": text}}
+
+    @staticmethod
+    def main_chat_model():
+        """按 settings 构造主对话模型（生产路径的默认模型）。"""
+        return init_chat_model(
+            model=settings.CHAT_MODEL_NAME,
+            base_url=settings.CHAT_MODEL_URL,
+            api_key=settings.CHAT_MODEL_API_KEY,
+            model_provider="openai",
+            # 思考模式：`None` = 不下发该参数（见 thinking_extra_body）。`extra_body` 是 ChatOpenAI
+            # 的一等字段（透传给 SDK 的 `extra_body=`），不是"未知 kwargs"——不会走 model_kwargs
+            # 那条带警告的路，字面与行为一致。
+            extra_body=LLMNode.thinking_extra_body(settings.CHAT_THINKING),
+        )
 
     @staticmethod
     def format_plan_status(step: PlanStep) -> str:
@@ -182,9 +216,9 @@ class LLMNode:
                 )
             )
         if self.inject_session_context and self.workspace_path:
-            profile = await self._read_profile()
-            if profile:
-                system_messages.append(SystemMessage(content=profile))
+            profile_text = await self._read_profile()
+            if profile_text:
+                system_messages.append(SystemMessage(content=profile_text))
             block = await asyncio.to_thread(memory_block, self.workspace_path)
             if block:
                 system_messages.append(SystemMessage(content=block))
@@ -204,12 +238,13 @@ class LLMNode:
                 system_messages.append(SystemMessage(content=skill_text))
 
         messages = [*system_messages, *state["messages"]]
-        # @图片 的调用期附图：改的是**请求体副本**，state["messages"] 始终是纯文本（@路径
-        # 原样留在历史里，本身就是"看过哪张图"的日志）。新附上的图记账写回 state，下一轮
+        # @图片 的调用期附图：解析/读盘/转码在资源层（app/resource/images.py），本节点只决定
+        # "这一拍要不要附图、把记账写回哪"。改的是**请求体副本**，state["messages"] 始终是纯文本
+        # （@路径原样留在历史里，本身就是"看过哪张图"的日志）。新附上的图记账写回 state，下一轮
         # 据此不再重发（首次-only）。worker 已在构造期关掉这条通道。
         newly_attached: list[ImageRef] = []
         if self.attach_images and self.workspace_path:
-            messages, newly_attached = await self.attach_images_to_payload(
+            messages, newly_attached = await images.attach_images_to_payload(
                 messages, state.get("attached_images") or [], self.workspace_path
             )
         model = await self._model_for(state)
@@ -242,184 +277,51 @@ class LLMNode:
             self._bound_key = key
         return self._bound
 
-    @staticmethod
-    def agent_md_block(workspace_path: str, cap: int = AGENT_MD_INJECT_CAP) -> str:
-        """读工作区根的 AGENT.md，返回注入用的正文（带块标题）；没有该文件/内容为空 → `""`。
-
-        超 `cap` 截断并附一行提示——画像本应精简，截断只是兜底。
-
-        原为独立模块 `app/agent/profile.py`（2026-09-12 并入）：生产侧只有本节点一个消费者，
-        独立成模块的收益（与 memory.py 成对、常量集中）不抵一层间接。**留作静态方法而非内联**
-        ——测试仍可直接调用它，不必构造 LLMNode 实例。
-        """
-        path = Path(workspace_path) / AGENT_MD_FILENAME
-        if not path.is_file():
-            return ""
-        text = path.read_text(encoding="utf-8").strip()
-        if not text:
-            return ""
-        if len(text) > cap:
-            text = text[:cap] + f"\n…（AGENT.md 超长已截断，共 {len(text)} 字符；用 read_file 看全文）"
-        return _PROFILE_BLOCK_HEADER + text
-
     async def _read_profile(self) -> str:
         """项目画像只读一次（会话首启读入，§4）：实例内 memo——画像默认慢变。
 
-        注意这份 memo 是**实例内**的：TUI 路径下每个会话新建一张图/一个实例，改了 AGENT.md
+        读盘与截断在资源层（`app/resource/profile.py::agent_md_block`）；**留在本节点的是
+        "读一次还是每轮读"这个决定**——那是"这一拍做什么"，不是资源访问（2026-09-21 剥离时
+        划的线，判据见 docs/ARCHITECTURE.md §4 的 A/B/C）。
+
+        ⚠️ 这份 memo 是**实例内**的：TUI 路径下每个会话新建一张图/一个实例，改了 AGENT.md
         重开会话即生效；但零参入口（langgraph dev）一图多 thread、同一实例跨会话复用，那条
         路径下不重开进程就不会刷新（与 `_model_for` 注释里记的是同一类偏差）。
         """
         if self._profile_block is None:
             self._profile_block = await asyncio.to_thread(
-                self.agent_md_block, self.workspace_path
+                profile.agent_md_block, self.workspace_path
             )
         return self._profile_block
 
-    #-------------------@图片 的调用期附图通道----------------------
+#-------------------ToolMessage 的结构化戳（**生产端单点**）-------------------
+# 形状：`additional_kwargs` 里 `{error_type: <语义标记>}` 或 `{decision: "denied"}`（首次落地
+# 2026-09-16）。**生产端 = 本模块的 ToolNode / ReviewNode**（全仓只有这两个写出点，且都经
+# `_tool_stamp` 构造）；**消费端 = `CompactNode._tm_status`**（只读这两把钥匙）。
+#
+# 为什么要有这个单点（2026-09-21）：此前形状由两侧注释互相指认——生产端写 `additional_kwargs`、
+# 消费端"读它的 docstring 里说的那两个键"，没有一方是权威。按"归生产端、消费端只读"定在这里：
+# 改键名/加键 = 改这一块，消费者跟着读常量，不必去猜。
+STAMP_ERROR_TYPE = "error_type"
+STAMP_DECISION = "decision"
+STAMP_DENIED = "denied"
 
-    @staticmethod
-    def _image_tokens(text: str) -> list[tuple[int, int, str, str]]:
-        """扫出文本里的 @图片引用：返回 (起始, 结束, 原始路径, mime)，区间即 @token 的原位替换范围。
 
-        mime 在**收词时**一并定下（用命中的那个扩展名反查 _IMAGE_MIME）。调用方别再拿
-        `Path(raw).suffix` 反推：那是"最后一个点号之后"的整段，而收词口径是"任意处命中"，
-        两者不等价——`@"shot.png "` 的 suffix 是 `.png `、`@"a.png（新版）"` 是 `.png（新版）`，
-        反推出来的键根本不在表里。
+def _tool_stamp(*, error_type: str | None = None, decision: str | None = None) -> dict:
+    """构造 ToolMessage 的结构化戳（生产端唯一构造入口）。"""
+    stamp: dict = {}
+    if error_type:
+        stamp[STAMP_ERROR_TYPE] = error_type
+    if decision:
+        stamp[STAMP_DECISION] = decision
+    return stamp
 
-        - 引号形式 `@"…"`：路径可含空格，整段须有图片扩展名才算引用，否则整个引号段原样放行；
-        - 裸 token 到首个空白为止；整 token 不以图片扩展名收尾（中文习惯 `@a.png帮我看` 不打
-          空格）时**截到首个图片扩展名处**，余下字符留在正文里；
-        - 扩展名不在 _IMAGE_MIME 里的 @token 根本不是引用（@人名、@note.txt），原样放行
-          （宽进策略，2026-09-14 与用户议定）。
-        """
-        tokens: list[tuple[int, int, str]] = []
-        i = 0
-        while (i := text.find("@", i)) != -1:
-            j = i + 1
-            if j >= len(text) or text[j].isspace():
-                i += 1  # 裸 @ 或后面是空白：不是引用
-                continue
-            if text[j] == '"':
-                end = text.find('"', j + 1)
-                if end == -1:  # 引号没闭合：当普通文本
-                    i += 1
-                    continue
-                raw = text[j + 1 : end]
-                m = _IMAGE_EXT_RE.search(raw)
-                if m:
-                    tokens.append((i, end + 1, raw, _IMAGE_MIME[m.group(0)[1:].lower()]))
-                i = end + 1  # 无论是不是引用都跳过整个引号段
-                continue
-            k = j
-            while k < len(text) and not text[k].isspace():
-                k += 1
-            token = text[j:k]
-            m = _IMAGE_EXT_RE.search(token)
-            if m:
-                tokens.append(
-                    (i, j + m.end(), token[: m.end()], _IMAGE_MIME[m.group(0)[1:].lower()])
-                )
-                i = j + m.end()  # 从路径结束处继续扫（余下字符回正文，其中的 @ 还能命中）
-            else:
-                i = k
-        return tokens
-
-    @staticmethod
-    def _resolve_image_path(raw: str, workspace_path: str) -> Path:
-        """解析 @路径：相对路径以工作区为基准、绝对路径原样（含 ~ 展开），resolve() 消掉
-        `../` 与符号链接。
-
-        与 mcp_service/file_io.py::_resolve_path 同形但**不 import 它**：那个模块在 import 期
-        就校验 WORKSPACE_PATH env（主进程没设，import 即炸），且锚死 MCP server 的全局
-        工作区；这里锚本节点收到的 workspace_path，也**不做沙箱拒绝**——@ 是用户亲手输入的
-        通道，沙箱约束的是模型的工具调用，不约束用户自己（截图在桌面/下载是常态）。
-        """
-        p = Path(raw).expanduser()
-        if not p.is_absolute():
-            p = Path(workspace_path) / p
-        return p.resolve()
-
-    @staticmethod
-    async def attach_images_to_payload(
-        messages: list,
-        already_attached: list[ImageRef],
-        workspace_path: str,
-    ) -> tuple[list, list[ImageRef]]:
-        """把最后一条 HumanMessage 里的 @图片引用临时附进**请求体副本**（不动 state）。
-
-        返回 (新消息列表, 本次新附上的 ImageRef)。每个 @token 的处置都写成正文里的状态说明，
-        模型自然会把失败转告用户（LLMNode 没有 Notice 通道，让模型当信使）：
-        `[图片已附加: …]` / `[图片已在上文发送过…: …]` / `[图片未找到: …]` /
-        `[图片过大…: …]` / `[图片读取失败: …]`。base64 只活在本函数的调用栈里；记账由
-        调用方写回 state["attached_images"]，下一轮据此不再重发（首次-only 语义；进程重启
-        也不怕——记账里的图重读盘即得）。
-
-        只解析 **HumanMessage** 且只是最后一条：AIMessage/ToolMessage 里的 @ 一律不认——
-        否则模型输出 `@C:\\…` 就等于模型能指挥宿主读任意本地文件送进 API。
-        """
-        sent = {ref["path"] for ref in already_attached}
-        last_human = max(
-            (i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=None
-        )
-        if last_human is None or not isinstance(messages[last_human].content, str):
-            return messages, []
-        text = messages[last_human].content
-        tokens = LLMNode._image_tokens(text)
-        if not tokens:
-            return messages, []
-
-        def _load(p: Path):
-            if not p.is_file():
-                return None
-            try:
-                return p.read_bytes()
-            except OSError:
-                return _UNREADABLE
-
-        parts: list[str] = []
-        blocks: list[dict] = []
-        newly: list[ImageRef] = []
-        pos = 0
-        for start, end, raw, mime in tokens:
-            resolved = LLMNode._resolve_image_path(raw, workspace_path)
-            key = str(resolved)
-            if key in sent or any(ref["path"] == key for ref in newly):
-                marker = f"[图片已在上文发送过，不重复附图: {raw}]"
-            elif len(newly) >= _MAX_IMAGES_PER_MESSAGE:
-                marker = f"[图片数量超上限（{_MAX_IMAGES_PER_MESSAGE} 张），未附加: {raw}]"
-            else:
-                data = await asyncio.to_thread(_load, resolved)
-                if data is None:
-                    marker = f"[图片未找到: {raw}]"
-                elif data is _UNREADABLE:
-                    marker = f"[图片读取失败: {raw}]"
-                elif len(data) > _MAX_IMAGE_BYTES:
-                    marker = (
-                        f"[图片过大（上限 {_MAX_IMAGE_BYTES // (1024 * 1024)}MB），未附加: {raw}]"
-                    )
-                else:
-                    b64 = base64.b64encode(data).decode()
-                    blocks.append(
-                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
-                    )
-                    newly.append(ImageRef(path=key, mime=mime))
-                    marker = f"[图片已附加: {raw}]"
-            parts.append(text[pos:start])
-            parts.append(marker)
-            pos = end
-        parts.append(text[pos:])
-
-        out = list(messages)
-        out[last_human] = HumanMessage(
-            content=[{"type": "text", "text": "".join(parts)}, *blocks]
-        )
-        return out, newly
 
 #-------------------工具调用节点-----------------------
 class ToolNode:
     """执行已批准的普通 MCP 工具，并把工具返回渲染成 ToolMessage 回传模型。
 
-    工具返回的归一化已抽到 app/agent/utils.py（format_tool_result 产模型可见文本、
+    工具返回的归一化在 app/platform/tool_results.py（format_tool_result 产模型可见文本、
     coerce_tool_result 还原结构化 ToolResult 供打戳，ToolNode 与 dispatch 共用），
     本节点只负责 ainvoke 执行已批准工具 + 拼 ToolMessage。
     """
@@ -464,7 +366,7 @@ class ToolNode:
                         ),
                         tool_call_id=tool_call_id,
                         name=tool_name,
-                        additional_kwargs={"error_type": "unknown_tool"},
+                        additional_kwargs=_tool_stamp(error_type="unknown_tool"),
                     )
                 )
                 continue
@@ -479,10 +381,10 @@ class ToolNode:
                 # 压缩消费端直接读字段、不必解析 content 前缀。
                 tr = coerce_tool_result(result_value)
                 if tr is not None and not tr.success:
-                    extra = {"error_type": tr.error_type or "tool_error"}
+                    extra = _tool_stamp(error_type=tr.error_type or "tool_error")
             except Exception as exc:
                 result_content = f"工具执行失败: {exc}"
-                extra = {"error_type": "tool_error"}
+                extra = _tool_stamp(error_type="tool_error")
 
             msg_kwargs: dict = {
                 "content": result_content,
@@ -494,113 +396,6 @@ class ToolNode:
             results.append(ToolMessage(**msg_kwargs))
 
         return {"messages": results, "approved_tool_calls": []}
-
-
-#----------------------终端命令的免审判定--------------------
-
-# 免审命令的**策略表是数据，不是代码**：加一族命令 = 改 app/agent/command_policy.json，
-# 判定逻辑一行不动——这就是"把命令审核从逻辑里解耦出来"的具体含义。
-#
-# 为什么要这张表：终端工具在 tool.json 里一律 need_review:true，唯独落在表里的形态免人工审批。
-# 这是**新增授权**（不是把旧行为平移过来）——git 用法一律走 run_command（原先那批 git_* 原子
-# 工具已随 mcp_service/git.py 一并删除），只读的读操作若每次都要人按 y，摩擦就是净增。
-_COMMAND_POLICY_PATH = Path(__file__).with_name("command_policy.json")
-
-
-@lru_cache(maxsize=1)
-def _command_policy() -> dict:
-    """command_policy.json 的解析结果（整进程只读一次，口径同 tool.json）。
-
-    列表在这里归一成元组/冻结集合——调用方要的是"能 startswith 的序列"和"能 O(1) 判成员的
-    集合"，别把裸 list 递给 `str.startswith`（它只认 str 或 tuple）。
-    """
-    with _COMMAND_POLICY_PATH.open("r", encoding="utf-8") as file:
-        raw = json.load(file)
-    return {
-        "free_commands": {name: frozenset(subs) for name, subs in raw["free_commands"].items()},
-        "write_flags": tuple(raw["git_write_flags"]),
-        "global_skip": frozenset(raw["git_global_skip"]),
-        "branch_list_flags": frozenset(raw["git_branch_list_flags"]),
-    }
-
-
-# cmd.exe 的元字符：出现即不判免审。`;` `&&` `|` `>` 能改写一条命令的作用域与去向，
-# `^` 是 cmd 的转义符（可用来拆词绕过白名单）。换行同理（一条命令伪装成两条）。
-#
-# **这一条刻意留在代码里、不进 JSON**：它是解析器的**词法定义**，不是审批策略。放进数据文件
-# 意味着有人能在不改代码的情况下削弱解析器——把 `&&` 从表里删掉，命令拼接的口子就开了。
-# 词法事实也没有"按工作区 / 按命令族调"的诉求。
-# 注：`%` 是 cmd 的变量展开符，但它同时是 git 格式化串的常客（`--format=%h`），而只读 git
-# 命令里它不构成写向量——等 `cat` 那类**按路径判定**的命令进表时，再连它一起处理。
-_SHELL_METACHARS: tuple[str, ...] = (";", "&&", "||", "|", "&", "`", "$(", ">", "<", "^", "\n", "\r")
-
-
-# ---------------------- 提问闸门的参数契约 ----------------------
-# 选项上限：面板与人的注意力都有限，"5 个选项比 1 个问题更难答"。开放式提问（0 项）不限。
-_MAX_ASK_OPTIONS = 5
-
-# 题目的模态：单选 / 复选。面板据此决定提示语，以及"用户输入多个序号"时是收下还是重问。
-_ASK_SELECT_MODES: tuple[str, ...] = ("one", "many")
-_ASK_SELECT_DEFAULT = "one"
-
-
-def _ask_request(args: dict) -> tuple[dict | None, str | None]:
-    """校验并归一提问参数，返回 `(归一后的请求, 问题说明)`；无问题时前者为 None。
-
-    **为什么校验在闸门这里**：编排工具不走 langchain 的参数校验管线
-    （`OrchestrateNode._invoke` 直接调底层函数，见该处说明），"必填"与"上限"都得自己拦。
-    而拦的位置必须是**弹面板之前**——把一个空问题、或 8 个选项摆到人面前，比回一条可行动回执
-    让模型自己改要糟得多。
-    """
-    why = str(args.get("why") or "").strip()
-    question = str(args.get("question") or "").strip()
-    raw_options = args.get("options")
-    options = (
-        [str(item).strip() for item in raw_options if str(item).strip()]
-        if isinstance(raw_options, list)
-        else []
-    )
-    # 缺省 = 单选（也是历史行为的默认值，模型不传就一切照旧）
-    select = str(args.get("select") or _ASK_SELECT_DEFAULT).strip()
-
-    problems: list[str] = []
-    if not why:
-        problems.append("why（为什么问）为空")
-    if not question:
-        problems.append("question（问题本身）为空")
-    if len(options) > _MAX_ASK_OPTIONS:
-        problems.append(f"options 给了 {len(options)} 项，超过上限 {_MAX_ASK_OPTIONS} 项")
-    if select not in _ASK_SELECT_MODES:
-        # fail-closed：模态说不清就不摆问题（与 why 为空同档），回执教它怎么改
-        problems.append(
-            f"select 只能是 {' / '.join(repr(m) for m in _ASK_SELECT_MODES)}，收到 {select!r}"
-        )
-    if problems:
-        return None, (
-            "提问未发出：" + "；".join(problems) + "。请补齐后重发"
-            f"（options 至多 {_MAX_ASK_OPTIONS} 项，也可以留空做开放式提问）。"
-        )
-    return {"why": why, "question": question, "options": options, "select": select}, None
-
-
-def _normalize_ask_answer(decision, options: list[str]) -> dict:
-    """把闸门收到的回答归一成 `AskAnswer`（写进 state.ask_answers 的形状）。
-
-    - **序号按 options 逐个校验**：越界的、非整数的**丢掉那一项**，保留其余合法的，并去重保序
-      （单选与复选走同一段代码，单选只是长度 0 或 1 的特例）。取向同 `_decide` 的 fail-closed
-      ——宁可让模型看到"用户没选这几项"，也不能把对不上号的序号当成有效选择喂过去。
-      面板侧在输入时就提示过越界（单选直接重问），所以这里**不把丢弃项回灌给模型**；
-    - 补充去首尾空白，空串归一成 None——让"**两段皆空 = 未回答**"这条判据在 state 里直接可读，
-      消费端不必各自再判一次空白。
-    """
-    payload = decision if isinstance(decision, dict) else {}
-    raw = payload.get("option_indexes")
-    indexes: list[int] = []
-    for item in raw if isinstance(raw, list) else []:
-        if isinstance(item, int) and 0 <= item < len(options) and item not in indexes:
-            indexes.append(item)
-    supplement = str(payload.get("supplement") or "").strip() or None
-    return {"option_indexes": indexes, "supplement": supplement}
 
 
 #----------------------工具审核节点--------------------
@@ -619,19 +414,20 @@ class ReviewNode:
     `OrchestrateNode`（同批次里可能有 write_memory）。本节点满足该约束：interrupt 之前只有
     一行日志 print；工具的执行与副作用一律交给下游执行器。
 
-    与 ToolNode/OrchestrateNode 共用同一份 tool.json（_tool_config 整进程缓存）。
+    与 ToolNode/OrchestrateNode 共用同一份 tool.json（读取与缓存单点在 app/agent/gates.py）。
     """
 
-    # "state 工具"在 tool.json 的 source 取值集合：命中即分流进 approved_orchestrate_calls，
-    # 交 OrchestrateNode（通用 state 工具执行器）处理。plan=编排；notes=笔记读回；
+    # 编排工具在 tool.json 的 source 取值集合：命中即分流进 approved_orchestrate_calls，
+    # 交 OrchestrateNode（通用编排执行器）处理。plan=编排；notes=笔记读回；
     # ask=向用户提问（见下 ASK_SOURCE 的说明）；
-    # dispatch=并发资料收集派发（app/agent/tools.py::dispatch_subtasks）；
-    # memory=长期记忆读写（同文件 write_memory/read_memory，靠注入的 workspace 定位记忆文件）；
-    # skill=技能加载/卸载（同文件 get_skill/drop_skill）。
-    # 注意：技能**带来**的工具不走这里——它们的 source 取 `skills/<name>`，不命中本集合 → 进普通
-    # 工具队列。这正是想要的：get_skill 是编排动作，它带来的工具不是。
+    # memory=长期记忆读写（app/agent/tools.py 的 write_memory/read_memory，靠注入的 workspace
+    # 定位记忆文件）；skill=技能加载/卸载（同文件 get_skill/drop_skill）。
+    # 注意两处**不在**这里的：① 技能**带来**的工具——它们的 source 取 `skills/<name>`，不命中本
+    # 集合 → 进普通工具队列（get_skill 是编排动作，它带来的工具不是）；② `dispatch_subtasks`
+    # ——2026-09-21 起它是 `mcp_service/dispatch` 这个 server 的工具（派生 worker = 独立进程
+    # 与独立 Agent runtime，四问的第四问），走 ToolNode，**不再进编排队列**。
     ORCHESTRATE_SOURCES: frozenset[str] = frozenset(
-        {"plan", "notes", "ask", "dispatch", "memory", "skill"}
+        {"plan", "notes", "ask", "memory", "skill"}
     )
 
     # 人机闸门的第二种载荷（docs/MULTI_AGENT.md §6）：source=ask 的工具（当前只有 ask_user）
@@ -639,20 +435,13 @@ class ReviewNode:
     # 回答经 state 的 ask_answers 交给工具体渲染成回执，见下面 __call__ 的 ASK 分支。
     ASK_SOURCE = "ask"
 
-    @classmethod
-    @lru_cache(maxsize=1)
-    def _tool_config(cls) -> dict[str, dict]:
-        """tool.json 解析结果：{tool_name: {need_review, source}}。整进程只读一次。"""
-        with _TOOL_CONFIG_PATH.open("r", encoding="utf-8") as file:
-            return json.load(file)
-
     def __init__(self, log: bool = True, toolset=None, allow_ask: bool = True) -> None:
         """log=False 供 stdio MCP server 型 worker 使用（stdout 即 JSON-RPC 协议，不能 print）。
 
         toolset：给了才做"存在性 + 漏登记"那道防线（主图给；worker 与单测不给 → 行为与改造前一致）；
         allow_ask=False 供 worker 用：**本图不承载提问载荷**（见 __call__ 的 ASK 分支）。
         """
-        self.tool_review = self._tool_config()
+        self.tool_review = gates.tool_config()
         self.log = log
         self.toolset = toolset
         self.allow_ask = allow_ask
@@ -688,61 +477,6 @@ class ReviewNode:
                 return conf
         return {}
 
-    @staticmethod
-    def _free_shell_verdict(tool_args: dict) -> bool:
-        """run_command 的免审判定：这条命令是名单里的**只读**形态 → True（不弹审批面板）。
-
-        保守优先（fail-closed）：拿不准一律 False，照常弹面板让人看一眼——误判成 review 只是多
-        按一次 y，误判成 free 却是静默放行一次没人看过的命令。判定链（全过才 True）：
-        ① 命令文本不含 cmd 元字符；② 能切分出词；③ 首词在免审命令表里；
-        ④ 跳过 git 全局选项后子命令在白名单；⑤ 无写文件选项；⑥ branch 只认列分支用法。
-
-        ③–⑥ 的口径全部来自 `app/agent/command_policy.json`（经 `_command_policy()`）——加一族
-        命令是改那张表，不是改本函数。①（元字符）刻意留在代码里，理由见 `_SHELL_METACHARS`。
-        """
-        policy = _command_policy()
-        command = tool_args.get("command")
-        if not isinstance(command, str) or not command.strip():
-            return False
-        if any(char in command for char in _SHELL_METACHARS):
-            return False
-        try:
-            # posix=False 是**必须的**：终端跑在 cmd.exe 上，POSIX 规则会把 `C:\work\a` 的
-            # 反斜杠当转义符吃掉，切出与实际执行不同的词串——而"解析结果 ≠ 实际执行的命令"
-            # 正是这类判定最不能有的性质。
-            tokens = shlex.split(command, posix=False)
-        except ValueError:  # 引号不闭合等
-            return False
-        if not tokens:
-            return False
-
-        head = tokens[0].strip("\"'").lower()
-        allowed = policy["free_commands"].get(head)
-        if allowed is None:
-            return False
-
-        # 找子命令：跳过带值的全局选项（`-C <dir>` 占两个词）
-        index = 1
-        while index < len(tokens):
-            token = tokens[index].strip("\"'")
-            if token in policy["global_skip"]:
-                index += 2 if token == "-C" else 1
-                continue
-            break
-        if index >= len(tokens):
-            return False
-        subcommand = tokens[index].strip("\"'")
-        if subcommand not in allowed:
-            return False
-
-        rest = [token.strip("\"'") for token in tokens[index + 1 :]]
-        if any(token.startswith(policy["write_flags"]) for token in rest):
-            return False
-        if subcommand == "branch":
-            # 只认列分支：不能有位置实参，选项也得在列表 flag 白名单里（挡住 -d/-D/-m/-c …）
-            return all(token in policy["branch_list_flags"] for token in rest)
-        return True
-
     def _decide(
         self,
         tool_name: str | None,
@@ -755,7 +489,7 @@ class ReviewNode:
         - **unknown**：名字不在当前工具表里（模型编的，或它所属技能刚被卸载）→ 回执、**不弹面板**。
           否则模型每编一个名字就打断人一次，而它无论如何都会被 ToolNode 拒掉；
         - **free（命令级）**：tool.json 标了 `free_when: readonly_shell` 的工具（当前只有
-          run_command），**还要它的参数**判为只读终端命令才算数，见 `_free_shell_verdict`。
+          run_command），**还要它的参数**判为只读终端命令才算数，见 `gates.free_shell_verdict`。
           判定不过就落回 review —— 这条路是加宽免审面的唯一入口，失败方向必须是收紧。
         - **review**：策略说 `need_review: true`（内置表或技能自己的 skill.json）；**或**它在
           工具表里却两头都没有政策条目 —— 这条是 §13.4 的第二道防线（fail-closed）：有人往
@@ -768,7 +502,7 @@ class ReviewNode:
         known = self._known_names(state)
         if known is not None and tool_name not in known:
             return "unknown"
-        if tool_cfg.get("free_when") == "readonly_shell" and self._free_shell_verdict(tool_args or {}):
+        if tool_cfg.get("free_when") == "readonly_shell" and gates.free_shell_verdict(tool_args or {}):
             return "free"
         if tool_cfg.get("need_review"):
             return "review"
@@ -794,7 +528,7 @@ class ReviewNode:
                     name=current_tool.get("name"),
                     tool_call_id=current_tool.get("id"),
                     content=content,
-                    additional_kwargs={"error_type": error_type},
+                    additional_kwargs=_tool_stamp(error_type=error_type),
                 )
             ],
         }
@@ -858,7 +592,7 @@ class ReviewNode:
                             "先向用户说明意图或提出替代方案。"
                         ),
                         # 结构化戳：压缩消费端读 decision=denied 即可判定，不必解析前缀
-                        additional_kwargs={"decision": "denied"},
+                        additional_kwargs=_tool_stamp(decision=STAMP_DENIED),
                     )
                 )
 
@@ -877,7 +611,7 @@ class ReviewNode:
         elif tool_cfg.get("source") == self.ASK_SOURCE:
             # 人机闸门的第二种载荷：把问题摆给人、等回答（docs/MULTI_AGENT.md §6）。
             # 参数先在弹面板**之前**校验——空问题 / 超限选项摆到人面前是最糟的形态。
-            request, problem = _ask_request(current_tool.get("args") or {})
+            request, problem = gates.ask_request(current_tool.get("args") or {})
             if problem is not None:
                 return self._receipt_result(state, current_tool, problem, "invalid_ask")
             # 不带 current_step：那是审批面板的遗留样式（恒为 "1/1"），提问面板不需要。
@@ -896,7 +630,7 @@ class ReviewNode:
             # 由 ask_user 工具（下游 OrchestrateNode 执行）按 tool_call_id 取回、渲染成回执。
             # 闸门的产出是 state，执行器消费 state——与 approved_* 队列同一条路子。
             ask_answers = dict(state.get("ask_answers") or {})
-            ask_answers[current_tool.get("id")] = _normalize_ask_answer(
+            ask_answers[current_tool.get("id")] = gates.normalize_ask_answer(
                 decision, request["options"]
             )
 
@@ -924,18 +658,35 @@ class ReviewNode:
 
 #----------------------编排节点----------------------
 
-# 编排工具可以写回的"额外" state 切片（current_plan 不在此列——它有链式语义、单独处理，
-# 且最终返回恒带上它）。**加新切片只改这一行 + state.py**，别再去 __call__ 里加分支。
+#-------------------编排工具返回切片的**形状定义处**（协议权威，2026-09-21）-------------------
+# 编排工具（app/agent/tools.py）的返回值是一个 dict，键只有三类：
+#   - `messages`：**必给**，工具自己拼好的 ToolMessage 回执（原样并入对话，不解析内容）；
+#   - `current_plan`：可选，有链式语义——同回合的后续编排调用看得到上一步改过的它；
+#   - `_EXTRA_SLICE_KEYS` 里列的：可选，写回 state 的同名切片（**加新切片 = 改这一行 + state.py**）。
+# 下划线前缀的键一律忽略（`_EXTRA_SLICE_KEYS` 之外的新切片不会生效，只会被静默丢弃）。
+#
+# **权威为什么在消费端（本节点）而不是生产端**：两者分居 `nodes.py` / `tools.py`，而
+# `nodes.py` **刻意不 import `tools.py`**（它拿的是构图期传进来的工具对象，见本文件顶部对
+# `_invoke` 的说明）——权威放生产端就得造一条反向 import。所以约定写成"**执行器定义协议、
+# 生产端按它写**"：`tools.py` 的模块 docstring 只描述**本组工具给哪些键**，形状规则以这里为准。
 _EXTRA_SLICE_KEYS: tuple[str, ...] = ("loaded_skills",)
 
 
 class OrchestrateNode:
     """消费编排类调用（approved_orchestrate_calls），执行编排工具并合并写回 state。
 
-    编排工具（app/agent/tools.py 的 orchestrate_tool）与普通工具的关键区别：
-    不产生真实副作用，返回的是"要写回 state 的切片"——`{current_plan?, messages}`
-    其中 messages 是工具已经拼好的 ToolMessage 回执。因此本节点不像 ToolNode 那样
-    `ainvoke` 后 format_tool_result，而是：
+    编排工具 = **改变 agent 自身编排语义**的工具（计划 / 笔记 / 提问 / 记忆 / 技能），与
+    改变或读取外部世界的 MCP 工具相对（判据见 docs/ARCHITECTURE.md §4「工具面」）。它们住在主
+    进程、需要注入，但**改变的方式各不相同**——故本节点**不假设统一的返回值形状**，只做两件事：
+    把工具产出的消息并入 messages、把工具写回的切片合并进 state。**不调 format_tool_result**
+    （那是 MCP 侧的跨进程解封装；返回切片的形状规则见本节点上方那段权威说明）。当前出现两种
+    形状（**现状描述，不是规则**）：
+
+    - **带切片**：`{current_plan?, loaded_skills?, messages}`——计划三件套、`get_skill` / `drop_skill`；
+    - **纯回执**：`{"messages": [ToolMessage]}`——`read_note`、`ask_user`、`write_memory` /
+      `read_memory`。
+
+    执行细节：
 
     - 逐个调用编排工具的底层原函数，显式注入 `state`（整份 AgentState）与
       `tool_call_id`（本次调用 id）——这两个参数用 InjectedState / InjectedToolCallId
@@ -945,6 +696,13 @@ class OrchestrateNode:
     - 把工具返回的 ToolMessage 原样并入 messages 交回模型；工具失败/未注册时生成
       对应的错误 ToolMessage，且不改动 current_plan；
     - 结束后清空 approved_orchestrate_calls；不动 approved_tool_calls（留给 tool_node）。
+
+    ⚠️ **本节点不承载 interrupt，也不得把它搬进来**：编排工具**并非都无真实副作用**——只有
+    计划三件套、`read_note`、`ask_user`、`read_memory` 是只碰会话内 state 的；另外三个**有真实
+    副作用**：`write_memory`（写盘）、`get_skill` / `drop_skill`（起/关技能运行体）。而 resume 会
+    **把整节点从头重跑**、且**不回滚外部副作用**（约束全文见 ReviewNode 的 docstring）——把
+    interrupt 放进这里，重跑一次就多写一次盘、多重起一次运行体。**闸门的唯一落点在 ReviewNode。**
+    （`dispatch_subtasks` 2026-09-21 已搬去 `mcp_service/dispatch.py`，不再进本节点。）
     """
 
     def __init__(
@@ -1123,10 +881,13 @@ class CompactNode:
     纯确定性逻辑，不调 LLM。压缩的内部纯函数只被本节点使用，故收成静态方法，不外泄。
     """
     _FOLD_HEADER = "# 历史工具记录（已折叠）"
-    # 已知失败标记（ToolNode / ReviewNode 注入 content 的前缀；供无戳旧消息回退判定）
+    # **回退路径**用的 content 前缀表：只服务"戳落地前写进 checkpoint 的旧消息"。
+    # 取值必须与生产端的 `error_type` 一致（`mcp_service/utils.py::guard` 的分类 + 各 server
+    # 手写的 io_error）。`ConfigError` 经 `_type_token` 去 "Error" 后缀 → `config`（**不是**
+    # config_error——2026-09-21 核对时发现旧表这一项从来没匹配上过）。
     _FAIL_PREFIXES: tuple[str, ...] = (
         "[approval_denied]", "[workspace_violation]", "[io_error]", "[internal_error]",
-        "[invalid_argument]", "[config_error]",
+        "[invalid_argument]", "[config]",
     )
     # 进笔记区的工具：仅联网四件套——其结果花钱、不可免费重取（时效性/可重取性判据）；
     # 其余工具（文件读/命令输出/git/终端）结果时效强、重取便宜，折叠即弃、绝不进笔记。
@@ -1165,25 +926,20 @@ class CompactNode:
     # ---------- 压缩内部纯函数（只被本节点单方使用 → 静态方法，保证职责单一） ----------
 
     @staticmethod
-    def _short(text: str, limit: int = 60) -> str:
-        """取多行文本首行、超长截断——用于摘要行的紧凑 detail。"""
-        line = next((ln.strip() for ln in (text or "").splitlines() if ln.strip()), "")
-        return line if len(line) <= limit else line[:limit] + "…"
-
-    @staticmethod
     def _tm_status(message) -> tuple[str, str]:
         """从一条 ToolMessage 判定其工具块状态。
 
-        优先读 additional_kwargs 的结构化戳（ToolNode/ReviewNode 生产端已挂）：
+        优先读 additional_kwargs 的结构化戳（键与构造器由生产端单点给出：ToolNode / ReviewNode
+        经 `_tool_stamp` 写，见本节顶部的说明）：
         - decision=denied → denied（未执行）；
         - error_type=… → failed（该类型）。
         未挂戳的旧消息再回退解析 content 前缀（[approval_denied] / [error_type]…）。
         判定只信工具回执，绝不信模型 content。
         """
         extra = getattr(message, "additional_kwargs", None) or {}
-        if extra.get("decision") == "denied":
+        if extra.get(STAMP_DECISION) == STAMP_DENIED:
             return "denied", "未执行"
-        error_type = extra.get("error_type")
+        error_type = extra.get(STAMP_ERROR_TYPE)
         if error_type:
             return "failed", str(error_type)
 
@@ -1197,7 +953,7 @@ class CompactNode:
             if text.startswith(tag):
                 return "failed", tag.strip("[]")
         if text.startswith(("工具不存在或未注册", "工具执行失败", "工具返回格式非法")):
-            return "failed", CompactNode._short(text)
+            return "failed", CompactNode._first_line(text, 60)
         return "ok", ""
 
     @staticmethod
@@ -1233,8 +989,10 @@ class CompactNode:
         return content.strip() if isinstance(content, str) else ""
 
     @staticmethod
-    def _first_line(text: str, limit: int = 80) -> str:
-        """取文本首行用于 notes 标题。"""
+    def _first_line(text: str, limit: int) -> str:
+        """取首个非空行并截断——摘要行 detail 与 notes 标题共用（2026-09-21 前是两份逐字相同的
+        拷贝，只有默认 limit 不同：60 / 80）。`limit` 由调用点显式给，不再各带一个默认值。
+        """
         line = next((ln.strip() for ln in (text or "").splitlines() if ln.strip()), "")
         return line if len(line) <= limit else line[:limit] + "…"
 
@@ -1328,7 +1086,7 @@ class CompactNode:
                         content_cap = content if len(content) <= _NOTE_MAX else content[:_NOTE_MAX] + "…"
                         archived[ref] = {
                             "kind": CompactNode._notes_kind(name),
-                            "title": CompactNode._first_line(content),
+                            "title": CompactNode._first_line(content, 80),
                             "source_tool": name,
                             "content": content_cap,
                             "created": int(time.time()),

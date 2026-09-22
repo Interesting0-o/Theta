@@ -29,7 +29,7 @@ app/platform/turn.py::drive_turn 的 park/resume 是评估的原型——这里�
 - 加 max_rounds 上限：拒绝路径若死循环，评估必须能报错收场而不是挂死。
 
 已知代价：每任务建图会各自拉起一次 MCP 子进程组（mcp.py 按工作区缓存工具 schema，
-实际运行体按 (工作区, 任务名) 懒起、任务结束即关，见 app/agent/mcp.py）。
+实际运行体按 (工作区, 任务名) 懒起、任务结束即关，见 app/platform/mcp.py）。
 TODO：按工作区分组复用编译图。
 """
 from __future__ import annotations
@@ -47,7 +47,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from app.agent.graph import get_main_agent_graph
-from app.agent.mcp import close_session_pool
+from app.platform.mcp import close_session_pool
 from app.agent.state import AgentState
 from app.config import get_settings
 from app.platform.turn import decision_to_resume

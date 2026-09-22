@@ -1,14 +1,24 @@
 """agent 侧工具（模型可见的都在这）。
 
-- `orchestrate_tool`：编排工具（create_plan / update_plan_step / clear_plan），
-  由编排节点（orchestrate_node）消费。与普通工具的关键区别：
+本模块的**编排工具**按 docs/ARCHITECTURE.md §4 的**四问**判定：改动的是 **agent 自身的运行
+语义**（plan / notes / ask_user / memory / skill），不是外部世界。**它们改变的方式各不相同、
+返回值形状也不统一**——不要拿返回类型给"编排工具"下定义。**副作用有无也不一**：
+`write_memory`（写盘）、`get_skill` / `drop_skill`（起/关技能运行体）**有**；计划三件套、
+`read_note`、`ask_user`、`read_memory` 无。
 
-  * 只操作会话内的 `current_plan`（跨轮持久、放在 AgentState 里），不产生真实副作用；
+（`dispatch_subtasks` **不在本模块**：2026-09-21 起它是 `mcp_service/dispatch.py` 那个 server 的
+工具——它派生 worker = 独立进程与独立 Agent runtime，命中四问的第四问。）
+
+- `orchestrate_tool`：计划三件套（create_plan / update_plan_step / clear_plan），
+  由编排节点（orchestrate_node）消费。下面几条**只描述这一组**：
+
+  * 只操作会话内的 `current_plan`（跨轮持久、放在 AgentState 里），**不产生真实副作用**；
   * `state`（读当前计划）与 `tool_call_id`（消息回执）用 `InjectedState` /
     `InjectedToolCallId` 标注，会从模型可见 schema 里剔除——模型只看到真正的业务参数
     （如 `steps` / `step_id` / `status`）；
-  * 返回值 = "要写回 state 的切片" `{current_plan: [...], messages: [ToolMessage]}`，
-    编排节点负责把切片合并写回、把消息交给模型；
+  * 返回值 = "要写回 state 的切片"：本组给 `current_plan` + `messages`。**形状规则以执行器
+    为准**（nodes.py::OrchestrateNode，那里是本协议的权威——messages 必给、current_plan 可选且
+    链式、其余切片要在 `_EXTRA_SLICE_KEYS` 里登记）；本模块只按它写，不另立一份说法；
   * 计划的核心逻辑（规划、推进状态、清空、快照回显）由本模块内实现，
     不放在 utils.py——工具自成一个整体，docstring 即给模型的使用手册。
 
@@ -19,15 +29,12 @@
 - 工具响应会把最新计划快照回显，供模型跨轮跟踪；没有独立的"查看计划"工具。
 """
 import asyncio
-import json
 import logging
-import os
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 from datetime import date
-from functools import lru_cache
 from importlib.machinery import PathFinder
 from pathlib import Path
 from typing import Annotated, List, Literal, get_args
@@ -35,14 +42,15 @@ from typing import Annotated, List, Literal, get_args
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, InjectedToolArg, InjectedToolCallId, tool
 from langgraph.prebuilt import InjectedState
-from app.agent import mcp, memory, skills
+from app.agent import gates
+from app.platform import mcp
+from app.resource import memory, skills
 from app.agent.state import AgentState
-from app.agent.utils import format_tool_result
 from app.config import skill_env
 from app.exception import ConfigError
 from app.schema.agent_schema import PlanStatus, PlanStep, SkillMeta
 
-# 项目根：spawn worker 子进程时 cwd 用项目根使 .env 可读（worker 内懒加载 get_main_chat_model）
+# 项目根：spawn worker 子进程时 cwd 用项目根使 .env 可读（worker 内懒加载 LLMNode.main_chat_model）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 logger = logging.getLogger(__name__)
@@ -55,33 +63,34 @@ PLAN_STATUSES: tuple[str, ...] = get_args(PlanStatus)
 # worker 定位 = 主 agent 的并发资料收集助手，其可用工具按 tool.json 过滤：
 #   工作区只读检索（file_io 读，need_review:false，免审批）
 #   ∪ 联网检索四件套（web_search 系，need_review:true → 触发主侧审批）。
-# 终端（连只读 process_*）、plan/notes/dispatch 一概不进 worker。
+# 终端（连只读 process_*）、plan/notes 一概不进 worker；dispatch_subtasks 同理——它现在是
+# 普通 MCP 工具（source: mcp_service/dispatch），两条 source 规则都不命中、也没有 worker_allow，
+# 天然被剔除（这条防线专防**递归派发**，别把它加进 _WORKSPACE_SOURCES）。
 _WORKSPACE_SOURCES: frozenset[str] = frozenset({"mcp_service/file_io"})
 _WEB_SOURCES: frozenset[str] = frozenset({"mcp_service/web_search"})
 # tool.json 里显式标了 worker_allow 的工具：**逐条授权**，不按 source 批量放行。
 # 为什么需要它：现有的两条规则都是"source 命中 ∧ need_review:false"，而 run_command 是
 # need_review:true（它必须能触发审批），加不进任何一条。终端工具下放的语义也不是"这个 source
 # 对 worker 开放"，而是"这几条命令工具交给 worker 用"——所以按名字授权，且权威仍在 tool.json。
-_WORKER_TOOL_CONFIG = Path(__file__).with_name("tool.json")
 
 
 def worker_tools(tools, cfg: dict | None = None):
     """从工具表筛出 worker 可用子集（工作区只读检索 + 联网检索）。
 
-    - cfg：tool.json 解析结果 {tool_name: {need_review, source}}；默认读 app/agent/tool.json。
+    - cfg：tool.json 解析结果 {tool_name: {need_review, source}}；默认取 `gates.tool_config()`
+      （解析与缓存的单点，与 ReviewNode 读的是同一份）。
     - 保留三类：① `need_review:false` 且 source∈{file_io}——免审的只读检索；
       ② source∈{web_search}——联网四件套；③ tool.json 标了 `worker_allow` 的工具——终端下放。
     - **①② 免审批、③ 走审批**：worker 的终止/命令类工具会经主侧统一 broker 请人批准
       （跨进程回传，见 mcp_service/sub_agent.py）。其中 run_command 还带
       `free_when: readonly_shell`——只读 git 子命令**免审**，所以"派 worker 去看仓库状态"
       不会产生任何审批；写命令才惊动人。
-    - 剔除：写/删/plan/notes/dispatch/memory 等（或改状态、或需更高权限、或会再派生子任务；
-      memory 被剔除 = worker 不读写长期记忆，保持调查隔离）。
+    - 剔除：写/删/plan/notes/memory 等（或改状态、或需更高权限），以及 dispatch_subtasks
+      （会再派生子任务 → 递归）；memory 被剔除 = worker 不读写长期记忆，保持调查隔离。
     - 纯函数：不依赖 MCP 加载，便于单测注入假 cfg 验证过滤语义。
     """
     if cfg is None:
-        with _WORKER_TOOL_CONFIG.open("r", encoding="utf-8") as file:
-            cfg = json.load(file)
+        cfg = gates.tool_config()
     allowed: set[str] = set()
     for name, conf in cfg.items():
         source = conf.get("source")
@@ -343,7 +352,7 @@ def ask_user(
     raw_indexes = answer.get("option_indexes")
     indexes = raw_indexes if isinstance(raw_indexes, list) else []
     supplement = (answer.get("supplement") or "").strip()
-    # ⚠️ 选项归一（去首尾空白 / 丢空项）**必须与闸门的 `nodes.py::_ask_request` 同口径**，且与
+    # ⚠️ 选项归一（去首尾空白 / 丢空项）**必须与闸门的 `gates.ask_request` 同口径**，且与
     # 面板编号（`app/tui/ui.py::_ask` 拿的是闸门归一后那份清单）一致：序号是这三处各自算出来的，
     # 口径一旦分叉，用户选的号会在其中一边越界、被静默当成"没选"。
     # 序号合法性本身由闸门在写回前把关（它拿的就是同一份清单），此处按"没选中任何给定选项"降级即可。
@@ -374,157 +383,20 @@ ask_tool: List[BaseTool] = [
     ask_user,
 ]
 
-# ------------------------- 派发子任务（dispatch，source="dispatch"）-------------------------
-# 仿 create_plan、走 orchestrate 层（不普通 MCP 工具）。设计：不静态绑 worker，每次调用按
-# 子任务"现场 spawn"独立 worker（mcp_service/sub_agent.py）跑 run_subtask，N 个经
-# asyncio.gather 并发、干完即回收——不受"先启动服务 / 最多一个子 agent"限制。
-# worker_runner 做成模块级可替换，便于测试注入假执行器、不真 spawn。
-
-
 class InjectedWorkspace(InjectedToolArg):
     """标记"需要工作区"的工具参数为运行时注入（对模型隐藏）。
 
-    由 OrchestrateNode 按签名代填（nodes.py::OrchestrateNode._invoke）：dispatch 往该工作区
-    spawn worker，memory 系列工具用它定位 `resource/<ws_key>/memory/memory.md`。模型看不到
-    这个参数，也就无法指定记忆文件路径。
+    由 OrchestrateNode 按签名代填（nodes.py::OrchestrateNode._invoke）：memory 系列工具用它定位
+    `resource/<ws_key>/memory/memory.md`（模型看不到这个参数，也就无法指定记忆文件路径），
+    技能加载/卸载用它决定能力型 server 在哪个工作区里跑。
+
+    **它是"住在主进程"的后果，不是判据**（2026-09-21 拍板）：按 docs/ARCHITECTURE.md §4 的四问，
+    凡"改变 agent 自身运行语义"的工具都住在主进程；而住主进程就拿不到启动 env 里的工作区，只能
+    靠注入。反例是 `file_io`——它同样需要工作区，却是普通工具，因为工作区就是它的启动配置。
+    `dispatch_subtasks` 2026-09-21 搬去 `mcp_service/dispatch.py`（它派生独立进程 = 独立 Agent
+    runtime，命中四问的第四问），工作区随改成从启动 env 取，离开了这条注入路径。
     """
 
-
-def _worker_child_env(workspace: str) -> dict[str, str]:
-    """worker 子进程的 env。
-
-    子进程 env 是**整体替换**（不继承父进程），所以该带的都得显式带上：
-    - `WORKSPACE_PATH`：worker 只读干活的工作区；
-    - `PYTHONPATH`：cwd 已切到项目根，靠它保证 `python -m mcp_service.*` 能 import 到包；
-    - `AGENT_INBOX_URL`：**主侧审批收件箱的实际地址**——由主侧启动收件箱时写进本进程 env。
-      只在确实给了地址时才带（空值不传：worker 那边把空串当"未设置"处理，但传个空变量本身就是噪声）。
-    """
-    env = {"WORKSPACE_PATH": str(workspace), "PYTHONPATH": str(_PROJECT_ROOT)}
-    inbox_url = os.environ.get("AGENT_INBOX_URL", "").strip()
-    if inbox_url:
-        env["AGENT_INBOX_URL"] = inbox_url
-    return env
-
-
-async def _spawn_subagent_worker(task: str, workspace: str) -> str:
-    """默认 worker 执行器：现场 spawn 一个 sub_agent stdio 子进程跑 run_subtask。
-
-    langchain_mcp_adapters 的 get_tools 工具是"每次调用开一个新会话"：每次 ainvoke 拉起
-    一个 `python -m mcp_service.sub_agent` 子进程、调用 run_subtask、结束后回收，因此
-    N 次并发 = N 个独立 worker 进程，无预启动、无常驻泄漏。cwd=项目根使 worker 进程能
-    读到项目 .env 的 CHAT_*；WORKSPACE_PATH 指向本 agent 工作区（worker 在其上只读干活）。
-
-    子进程的 env 由 `_worker_child_env` 组装（含把主侧的审批收件箱地址转发进去——子进程 env 是
-    整体替换、不继承，不转发的话主侧一换端口 worker 就还在往默认端口发）。
-    """
-    from langchain_mcp_adapters.client import MultiServerMCPClient  # noqa: PLC0415
-
-    client = MultiServerMCPClient(
-        {
-            "worker": {
-                "transport": "stdio",
-                "command": sys.executable,
-                "args": ["-m", "mcp_service.sub_agent"],
-                "cwd": str(_PROJECT_ROOT),
-                "env": _worker_child_env(workspace),
-            }
-        }
-    )
-    tools = await client.get_tools()
-    run_subtask = next(t for t in tools if t.name == "run_subtask")
-    result = await run_subtask.ainvoke({"task": task})
-    # MCP adapters 返回 content-block 形态 → 复用工具结果归一化（utils），空正文兜底
-    return format_tool_result(result) or "（worker 未返回正文）"
-
-
-# 模块级可替换的 worker 执行器；None = 用默认 _spawn_subagent_worker（测试注入假执行器）
-worker_runner = None
-
-
-async def run_subtask_batch(
-    sub_tasks: list[str],
-    workspace: str,
-    runner=None,
-) -> list[dict]:
-    """并发跑一批资料收集子任务；每个子任务一个独立 worker（默认 spawn sub_agent 进程）。
-
-    返回按输入顺序排列的 [{task, ok, content}]；单 worker 失败不拖垮整批
-    （记 ok=False，content 带原因），由调用方决定是否重试/换法。
-    """
-    run = runner or worker_runner or _spawn_subagent_worker
-
-    async def _one(task: str) -> dict:
-        try:
-            content = await run(task, workspace)
-            return {"task": task, "ok": True, "content": str(content)}
-        except Exception as exc:  # noqa: BLE001 —— worker 进程失败等，收口为条目
-            return {"task": task, "ok": False, "content": f"worker 执行失败：{exc}"}
-
-    return list(await asyncio.gather(*(_one(t) for t in sub_tasks)))
-
-
-@tool
-async def dispatch_subtasks(
-    sub_tasks: list[str],
-    workspace: Annotated[str, InjectedWorkspace],
-    tool_call_id: Annotated[str, InjectedToolCallId],
-) -> dict:
-    """把多个**相互独立**的查证/调研问题，并行派给一批一次性 worker 子 agent 快速收集资料，
-    拿回每个的结论正文。
-
-    何时用：当前任务需要"先并行搜集一堆互不相关的资料/事实"时——例如分别调研工作区里几个
-    模块各自怎么实现、分别查几份 API 文档/报错资料、分别读几块代码的职责。把每个独立问题写成
-    一条 sub_task 一次派出，由系统对每条起一个独立 worker 进程**并发**执行，比你自己逐条串行
-    读/搜快得多。派发本身免审批。
-
-    worker 的能力边界（重要）：
-    - worker 能：只读当前工作区（文件检索）+ **终端**（run_command 等）+ **联网检索**。
-      其中只读 git 子命令（status/log/diff/show/branch/fetch）与文件检索**免审批**；
-      其余命令与联网调用会以"子任务审批"形式出现在人工审批、可能等待。
-    - worker 不能：**改动工作区文件**、做最终决策——它返回"结论正文 + 出处"，**只是给
-      你做判断的素材**；它上下文独立，看不到其它 worker 的结果。
-    - ⚠️ 也正因如此，**并行派多个 worker 时审批会从多路并来**：每个 worker 的写命令/联网都
-      各占一次人工审批（面板上会标 `worker:<id>` 并附上那条子任务原文，便于你判断来由）。
-      一次别派太多，别把审批面板变成队列。
-    - 因此真正"干活"（改动、验证、给用户答复）仍是你自己：收到结论先汇总/交叉核对，需要落地
-      改动时由你用写/命令工具执行，不要指望 worker 替你改。
-
-    何时别用：子问题之间有依赖（下游要吃上游产物、需按先后做）——那不该并发，留给你自己按
-    计划推进；或单问单答、拆无可拆——直接自己做即可，不要为派发而派发。
-
-    用法提示：每条 sub_task 写成一条**自包含**的调研问题（含想要拿到的结论要点与出处要求），
-    让 worker 查完即可回报、不必依赖别人；一次别派太多（建议 ≤5 条），太长就分批，避免并行
-    结果过长、审批轰炸。
-
-    Args:
-        sub_tasks: 相互独立的调研/资料收集问题列表（每条约一个调查目标，含期望结论要点）。
-            每条各由一个独立 worker 执行；互不共享上下文。
-
-    Returns:
-        汇总文本：逐个子任务的结果（✓/✗ + 结论或失败原因）。
-    """
-    results = await run_subtask_batch(sub_tasks, workspace)
-    # 汇总正文很短，直接内联（不再抽独立渲染函数）
-    lines = [f"已并发派出 {len(results)} 个资料收集 worker，结果："]
-    for i, r in enumerate(results, 1):
-        mark = "✓" if r["ok"] else "✗"
-        lines.append(f"[{i}] ({mark}) 子任务「{r['task']}」")
-        lines.append(str(r["content"]))
-    summary = "\n".join(lines)
-    return {
-        "messages": [
-            ToolMessage(
-                name="dispatch_subtasks",
-                tool_call_id=tool_call_id,
-                content=summary,
-            )
-        ]
-    }
-
-
-dispatch_tool: List[BaseTool] = [
-    dispatch_subtasks,
-]
 
 # ------------------------- 长期记忆（source="memory"）-------------------------
 # 记忆 = 跨会话、按工作区共享的稳定结论，落 resource/<ws_key>/memory/memory.md——磁盘上的
@@ -532,8 +404,9 @@ dispatch_tool: List[BaseTool] = [
 # workspace 经 app.resource.memory_root 算出、**对模型隐藏**：模型只给 type/content/key。
 #
 # 与 read_note 的分工：notes 是会话内折叠归档（短命、ref=rN，随 checkpoint 存亡），memory 跨
-# 会话长存（ref=mN）；两者并存、语义分开。与 dispatch 同走 OrchestrateNode，因为都需要注入
-# 工作区（对模型隐藏的 InjectedWorkspace）。
+# 会话长存（ref=mN）；两者并存、语义分开。**留在编排工具**（2026-09-21 拍板）：按四问它命中
+# 第三问（涉及"持久化 / workspace"等资源）→ 方向是资源单点，不是 MCP；附带好处是读写都在主
+# 进程，避开"注入在主进程读、写入在子进程写"这对跨进程碰同一批文件的组合。
 #
 # 两个工具都写成 **async** 且把落盘交给 asyncio.to_thread：读写会碰 os.stat / os.mkdir
 # （Path.exists / mkdir / resolve 底下），langgraph dev 的 blockbuster 会在事件循环里拦截这类
@@ -696,27 +569,12 @@ memory_tool: List[BaseTool] = [
 # 的 blockbuster）；drop_skill 要 await 关运行体，也必须是 async（编排节点原生支持 async）。
 #
 # 两个工具**都注入 workspace**：能力型技能要按工作区造连接（server 的 cwd = 工作区、env 里带
-# WORKSPACE_PATH），与 memory/dispatch 那两组同款（`InjectedWorkspace` 对模型隐藏）。
+# WORKSPACE_PATH），与 memory 那组同款（`InjectedWorkspace` 对模型隐藏）。
 # 技能**源**仍在项目根（不随工作区变），变的只是"它被拉起来时待在哪个工作区里"。
 #
 # 能力型的完整链路（§13）：get_skill 读正文 → 校验（目录名/会话/env/工具登记）→ 起 server →
 # 把工具加进本会话（mcp.register_server）→ 工具随下一次模型调用出现；drop_skill 反向移除。
 # **加载失败一律拒绝加载**（不写 loaded_skills）：语义一致——"已加载"意味着正文与工具都到位。
-
-
-@lru_cache(maxsize=1)
-def _tool_config() -> dict[str, dict]:
-    """`tool.json` 的解析结果（进程内只读一次）。审批策略与 source 的唯一权威表。
-
-    单独抽出来是为了给测试留缝：校验"技能的工具是否已登记"必须能注入假表，否则用例只能去改
-    仓库里真的 tool.json。
-
-    ⚠️ 同一份文件在 `nodes.py::ReviewNode._tool_config` 还有一份**独立的** `lru_cache`
-    （那边要的是审批策略，这边要的是 source 登记，测试缝也各留各的）。两份都"读一次用一辈子"，
-    所以**改 tool.json（含给新技能登记工具）要重启进程**——不是只重启一处生效。
-    """
-    with _WORKER_TOOL_CONFIG.open("r", encoding="utf-8") as file:
-        return json.load(file)
 
 
 def _skill_server_name(meta_or_name) -> str:
@@ -1160,7 +1018,7 @@ skill_tool: List[BaseTool] = [
 # 同名会让模型的两份 schema 指向同一个名字，而 tool.json 放不下两条同键登记。
 _ORCHESTRATE_TOOL_NAMES: frozenset[str] = frozenset(
     t.name
-    for t in (orchestrate_tool + note_tools + ask_tool + dispatch_tool + memory_tool + skill_tool)
+    for t in (orchestrate_tool + note_tools + ask_tool + memory_tool + skill_tool)
 )
 
 

@@ -15,7 +15,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 import app.agent.nodes as nodes_module
-from app.agent.nodes import _MAX_ASK_OPTIONS, ReviewNode, _ask_request, _normalize_ask_answer
+from app.agent.gates import MAX_ASK_OPTIONS, ask_request, normalize_ask_answer
+from app.agent.nodes import ReviewNode
 from app.agent.tools import ask_user, worker_tools
 from app.schema.approval_schema import GATE_ASK_USER
 from evaluation.models import ReplayChatModel
@@ -211,27 +212,27 @@ def test_invalid_ask_never_reaches_the_human(monkeypatch, args, hint):
 
 def test_ask_request_normalizes_and_caps():
     """归一：去空白、丢掉空选项；5 项刚好放行、6 项拦下；select 缺省 = 单选。"""
-    ok, problem = _ask_request(
+    ok, problem = ask_request(
         {"why": " w ", "question": " q ", "options": ["  甲  ", "", "乙"]}
     )
     assert problem is None
     assert ok == {"why": "w", "question": "q", "options": ["甲", "乙"], "select": "one"}
 
-    _, problem = _ask_request(
-        {"why": "w", "question": "q", "options": [str(i) for i in range(_MAX_ASK_OPTIONS + 1)]}
+    _, problem = ask_request(
+        {"why": "w", "question": "q", "options": [str(i) for i in range(MAX_ASK_OPTIONS + 1)]}
     )
     assert problem is not None
 
 
 def test_ask_request_accepts_multi_select():
-    ok, problem = _ask_request({"why": "w", "question": "q", "select": "many"})
+    ok, problem = ask_request({"why": "w", "question": "q", "select": "many"})
 
     assert problem is None and ok["select"] == "many"
 
 
 def test_ask_request_rejects_unknown_select():
     """模态说不清就**不摆问题**（fail-closed，与 why 为空同档）——回执教它合法的取值。"""
-    ok, problem = _ask_request({"why": "w", "question": "q", "select": "all"})
+    ok, problem = ask_request({"why": "w", "question": "q", "select": "all"})
 
     assert ok is None
     assert problem is not None and "'one'" in problem and "'many'" in problem
@@ -239,7 +240,7 @@ def test_ask_request_rejects_unknown_select():
 
 def test_normalize_ask_answer_rejects_non_integer_index():
     """非整数序号只丢**那一项**（不是整条作废）——同一段归一同时服务单选与复选。"""
-    assert _normalize_ask_answer({"option_indexes": ["1"], "supplement": ""}, ["甲"]) == {
+    assert normalize_ask_answer({"option_indexes": ["1"], "supplement": ""}, ["甲"]) == {
         "option_indexes": [],
         "supplement": None,
     }
@@ -247,9 +248,9 @@ def test_normalize_ask_answer_rejects_non_integer_index():
 
 def test_normalize_ask_answer_tolerates_a_malformed_payload():
     """上游形状给歪（裸标量 / 缺字段 / 整个不是 dict）也不能炸：一律按"没选"降级。"""
-    assert _normalize_ask_answer({"option_indexes": 1}, ["甲"])["option_indexes"] == []
-    assert _normalize_ask_answer({}, ["甲"])["option_indexes"] == []
-    assert _normalize_ask_answer(None, ["甲"])["option_indexes"] == []
+    assert normalize_ask_answer({"option_indexes": 1}, ["甲"])["option_indexes"] == []
+    assert normalize_ask_answer({}, ["甲"])["option_indexes"] == []
+    assert normalize_ask_answer(None, ["甲"])["option_indexes"] == []
 
 
 def test_ask_multi_select_reaches_the_panel(captured_interrupts):
@@ -420,7 +421,7 @@ def _ask_ai_message() -> AIMessage:
 async def _drive(workspace, session: str, model, resume: dict) -> tuple[dict, dict]:
     """建真图（真 MCP 运行体）→ 脚本模型跑到挂起 → resume → 返回 (payload, 终态)。"""
     from app.agent.graph import get_main_agent_graph
-    from app.agent.mcp import _reset_pools_for_tests, close_session_pool
+    from app.platform.mcp import _reset_pools_for_tests, close_session_pool
     from app.platform.turn import build_turn_state
 
     _reset_pools_for_tests()

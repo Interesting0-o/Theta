@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from app.agent import skills
+from app.resource import skills
 from app.agent.nodes import OrchestrateNode, ReviewNode
 from app.agent.tools import drop_skill, get_skill, orchestrate_tool, skill_tool, skill_tools_for
 

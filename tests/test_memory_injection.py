@@ -5,7 +5,7 @@
 - 画像**会话首启读入**（实例内 memo，不每轮重读）；记忆每轮实时读盘；
 - worker：`inject_session_context=False` → 两样都不注入（临时资料收集器，只读隔离）。
 
-落盘一律 monkeypatch app.resource.RESOURCE_ROOT 到 tmp，不碰真实 resource 目录。
+落盘一律 monkeypatch app.resource.paths.RESOURCE_ROOT 到 tmp，不碰真实 resource 目录。
 import app.agent.* 经 __init__ 触发 get_settings()，需 .env 存在（CLAUDE.md 前提）。
 """
 import asyncio
@@ -15,9 +15,10 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 import app.agent.graph as graph_mod
-import app.agent.memory as memory
-import app.agent.skills as skills_mod
-import app.resource as resource
+import app.resource.memory as memory
+import app.resource.profile as profile_mod
+import app.resource.skills as skills_mod
+import app.resource.paths as resource
 from app.agent.nodes import LLMNode
 
 
@@ -131,15 +132,15 @@ def test_profile_read_once_per_node_instance(tmp_path, monkeypatch):
     """画像 = 会话首启读入（实例内 memo）：同一 LLMNode 多轮只读一次盘。"""
     ws = _seed(tmp_path, monkeypatch)
     calls: list[str] = []
-    real_agent_md_block = LLMNode.agent_md_block
+    real_agent_md_block = profile_mod.agent_md_block
 
     def counting(workspace, *args, **kwargs):
         calls.append(workspace)
         return real_agent_md_block(workspace, *args, **kwargs)
 
-    # 打桩在**类**上而非模块上（2026-09-12 起它是 LLMNode 的静态方法）；必须包一层
-    # staticmethod——否则经实例访问会变成绑定方法，把 self 当 workspace 传进去。
-    monkeypatch.setattr(LLMNode, "agent_md_block", staticmethod(counting))
+    # 打桩在资源层模块上（2026-09-21 起画像读盘在 app/resource/profile.py::agent_md_block，
+    # LLMNode._read_profile 只做实例内 memo、经模块属性查表调用）。
+    monkeypatch.setattr(profile_mod, "agent_md_block", counting)
     node = LLMNode(model=_CaptureModel(), workspace_path=ws)
 
     asyncio.run(node({"messages": [HumanMessage(content="第一轮")]}))
