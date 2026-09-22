@@ -265,7 +265,7 @@ interrupt 的契约 = **阻塞图、不阻塞进程**（LangGraph 原生）：ru
 **模块落点（2026-09-08 定稿；2026-09-10 补基座与命令层）**：worker 子图归 **app/agent**，mcp_service 只留 server/run 壳；**主程序侧已分家**为基座 `app/platform` + 终端前端 `app/tui`：
 
 - **基座 `app/platform/`**（图外那层，不 print/不读 stdin）：`loop.py::AgentPlatform`（主事件循环：drain 待批 → 等 turn → 等输入）、`approvals.py`（统一审批 broker + 薄 HTTP 收件箱）、`turn.py`（drive_turn park/resume + `_race`）、`runtime.py`（按 (工作区,会话) 装配 db/checkpointer/图）、`ui.py`（UI 协议）、`commands/`（控制面命令：`/init`、`/help`、`/list session`、`/new session`、`/session <id>`）；
-  - 收件箱地址**主侧权威、单点供给**：默认端口是共用常量（`app/schema/approval_schema.py::DEFAULT_INBOX_PORT`，主侧与 worker 侧都从它派生），`AGENT_INBOX_PORT` 可覆盖；主侧启动后把**实际**地址写进 `AGENT_INBOX_URL`，spawn worker 时转发进子进程 env（子进程 env 是**替换制、不继承**父进程，不转发就会主侧换了端口、worker 仍往默认端口发）。端口被占时抛带解法提示的 `ConfigError`，由 `app/main.py` 在入口翻成人话；
+  - 收件箱地址**主侧权威、单点供给**：默认端口是共用常量（`app/schema/approval_schema.py::DEFAULT_INBOX_PORT`，主侧与 worker 侧都从它派生），`AGENT_INBOX_PORT` 可覆盖（**2026-09-22 起是 `Settings` 的可选键**：`.env` 与 shell env 都生效，此前读 `os.environ` 导致写进 `.env` 静默失效）；主侧启动后把**实际**地址写进 `AGENT_INBOX_URL`，spawn worker 时转发进子进程 env（子进程 env 是**替换制、不继承**父进程，不转发就会主侧换了端口、worker 仍往默认端口发）。端口被占时抛带解法提示的 `ConfigError`，由 `app/main.py` 在入口翻成人话；
 - **终端前端 `app/tui/`**（只取输入 + 渲染）：`input.py`（stdin 线程+pump）、`panels.py`（终端渲染素材）、`ui.py::TerminalUI`（实现 UI 协议）、`runner.py::run_tui`（`app/main.py` 只调它）。将来的 web 前端 = UI 协议的另一个实现，复用同一基座；
 - worker 子图（本节以下各条）：
 - 子图构建 → `app/agent/graph.py::get_sub_agent_graph(read_tools, workspace_path, model=None,

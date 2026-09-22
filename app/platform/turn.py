@@ -18,6 +18,7 @@ from langgraph.types import Command
 
 from app.platform.approvals import LOCAL_WORKER_ID
 from app.schema.approval_schema import (
+    DECISION_ANSWER,
     GATE_ASK_USER,
     GATE_TOOL_APPROVAL,
     ApprovalRequest,
@@ -67,7 +68,7 @@ def decision_to_resume(decision: Decision) -> dict:
 
     同一份映射也被 `evaluation/runner.py` 用——评估绕过 UI 协议，但走的是同一条图契约。
     """
-    if decision.kind == "answer":
+    if decision.kind == DECISION_ANSWER:
         return {
             "option_indexes": list(decision.option_indexes),
             "supplement": decision.supplement,

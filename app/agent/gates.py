@@ -29,6 +29,8 @@ import shlex
 from functools import lru_cache
 from pathlib import Path
 
+from app.schema.agent_schema import ASK_SELECT_DEFAULT, ASK_SELECT_MODES
+
 _TOOL_CONFIG_PATH = Path(__file__).with_name("tool.json")
 
 
@@ -146,9 +148,9 @@ def free_shell_verdict(tool_args: dict) -> bool:
 # 选项上限：面板与人的注意力都有限，"5 个选项比 1 个问题更难答"。开放式提问（0 项）不限。
 MAX_ASK_OPTIONS = 5
 
-# 题目的模态：单选 / 复选。面板据此决定提示语，以及"用户输入多个序号"时是收下还是重问。
-ASK_SELECT_MODES: tuple[str, ...] = ("one", "many")
-ASK_SELECT_DEFAULT = "one"
+# 题目的模态词表（单选 / 复选）归 `app/schema/agent_schema.py`：它**多处使用**（本模块校验、
+# tools 的签名、approvals 透传、panels/tui 的渲染分支），按 §4.6 该由 schema 给出唯一一份，
+# 消费方 import——这里只保留"校验它在不在取值域内"这条判定。
 
 
 def ask_request(args: dict) -> tuple[dict | None, str | None]:

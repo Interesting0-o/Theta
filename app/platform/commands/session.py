@@ -31,10 +31,11 @@ from app.schema.ui_schema import Notice
 if TYPE_CHECKING:  # 只为类型：不真 import，避免与 loop 成环
     from app.platform.loop import AgentPlatform
 
-# 摘要（末条 AI 正文首行）截断长度
-_SUMMARY_LIMIT = 60
+# 摘要（末条 AI 正文首行）截断的**字符数**
+_SUMMARY_CHARS = 60
 
-# 默认只给最近这么多个会话读 checkpoint；更早的只列 id + 时间（省得开一堆库）
+# 默认只给最近这么**多个**会话读 checkpoint；更早的只列 id + 时间（省得开一堆库）
+# ⚠️ 与上面那个不是同类（字符数 vs 条数），名字因此带单位/量词——2026-09-22 改名消歧。
 DEFAULT_SUMMARIZE_LIMIT = 10
 
 
@@ -47,7 +48,7 @@ class _ReadResult:
     summary: str
 
 
-def _short_line(text: str, limit: int = _SUMMARY_LIMIT) -> str:
+def _short_line(text: str, limit: int = _SUMMARY_CHARS) -> str:
     """取首个非空行并截断（摘要用）。"""
     line = next((ln.strip() for ln in (text or "").splitlines() if ln.strip()), "")
     return line if len(line) <= limit else line[:limit] + "…"

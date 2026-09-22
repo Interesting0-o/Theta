@@ -126,7 +126,7 @@ resource/
 
 实现注记：AGENT.md 在会话建立时被程序检测/读入，作为该会话的常驻项目画像与 SYSTEM_PROMPT/workspace 同源拼装；memory.md 每轮实时读盘。AGENT.md 的生成不归 `write_memory`（那是 resource 私有记忆），归 `/init` 命令（写进工作区、随仓库走）。
 
-**读取侧已落地（2026-09-10）**：`LLMNode.agent_md_block()` 读工作区根的 AGENT.md（加一行 `# 项目画像` 块标题；缺文件/空白 → 空串；超 cap 8000 截断），`LLMNode` 在 `inject_session_context` 打开时注入——顺序 `SYSTEM_PROMPT → 工作区上下文 → 计划 → 项目画像 → 长期记忆`，画像**实例内 memo**（会话首启读入，不每轮重读；改画像重开会话即生效），worker 与记忆一起关掉。（曾独立为 `app/agent/profile.py`，**2026-09-12 并入 `LLMNode` 静态方法**——生产侧只有该节点一个消费者，45 行、stdlib-only，独立成模块的收益不抵一层间接。`memory.py` 反之保留独立模块：它有三个消费者——`nodes` / `tools` / `runtime`。）
+**读取侧已落地（2026-09-10）**：读工作区根的 AGENT.md（加一行 `# 项目画像` 块标题；缺文件/空白 → 空串；超 cap 8000 截断）——**2026-09-21 起读盘/截断在 `app/resource/profile.py::agent_md_block()`**，`LLMNode` 只保留"会话首启读一次"的实例内 memo，`LLMNode` 在 `inject_session_context` 打开时注入——顺序 `SYSTEM_PROMPT → 工作区上下文 → 计划 → 项目画像 → 长期记忆`，画像**实例内 memo**（会话首启读入，不每轮重读；改画像重开会话即生效），worker 与记忆一起关掉。（位置史：`app/agent/profile.py` → **2026-09-12 并入 `LLMNode` 静态方法**（理由：生产侧只有该节点一个消费者）→ **2026-09-21 剥到 `app/resource/profile.py`**（理由：并入的那条理由站不住了——`memory_block` 同样只被 `LLMNode` 调用，却一直住在自己的模块里；判据见 docs/ARCHITECTURE.md §4 的 A/B/C。`memory.py` 同时搬进 `app/resource/`。）
 
 ---
 

@@ -17,6 +17,7 @@ from app.agent.nodes import (
 )
 from app.agent.prompt import WORKER_SYSTEM_PROMPT
 from app.platform.mcp import load_mcp_tool
+from app.resource.paths import DEFAULT_WORKSPACE
 from app.agent.tools import (
     SessionToolset,
     orchestrate_tool,
@@ -26,11 +27,8 @@ from app.agent.tools import (
     skill_tools_for,
 )
 
-# 项目根：模块导入期由 __file__ 算好，避免在运行时调用阻塞式 os.getcwd()
-# （langgraph dev 的 blockbuster 会拦截事件循环内的同步阻塞调用）
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-# 默认工作区：项目根的 tmp 子目录，作为模型的默认沙箱（不直接指向仓库本身）
-DEFAULT_WORKSPACE = PROJECT_ROOT / "tmp"
+# 基准（项目根）与默认工作区都归 app/resource/paths.py——这里只是借名字用，别自算
+# （见 paths.py 的"规定"：基准不许自算，否则文件一挪就静默指向别处）。
 
 
 def _resolve_workspace(workspace_path: str | None = None) -> str:

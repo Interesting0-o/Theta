@@ -52,7 +52,9 @@ uv sync
 cp .env.example .env
 ```
 
-`.env` 必须包含 `app/config.py` 声明的全部键（键不可缺、值可为空）。**聊天模型必填**；嵌入模型当前未启用可留空；`TAVILY_API_KEY` 留空则联网检索不可用（对应 MCP server 自动跳过，不阻塞主流程）：
+`.env` 必须包含 `app/config.py` 声明的全部键（键不可缺、值可为空）。
+
+> ⚠️ **`.env` 里的值只经 `get_settings()` 可见**：pydantic-settings 读 `.env` 但**不把值注入 `os.environ`**。所以凡是由 `os.environ` 直接读的键（第三方库的 `LANGSMITH_*` / `LANGCHAIN_*`、子进程的 `WORKSPACE_PATH`、运行时的 `AGENT_INBOX_URL`）**写进 `.env` 不生效**，要在 shell 里 export。产品旋钮（含 `AGENT_INBOX_PORT`）都走 `Settings`，两条路都生效。**聊天模型必填**；嵌入模型当前未启用可留空；`TAVILY_API_KEY` 留空则联网检索不可用（对应 MCP server 自动跳过，不阻塞主流程）：
 
 ```bash
 CHAT_MODEL_API_KEY=sk-...            # 聊天模型 Key（默认走 DeepSeek）
@@ -212,7 +214,7 @@ theta/
 │   ├── config.py               # 环境配置（pydantic-settings，读 .env）
 │   ├── exception.py            # AgentError 体系（ConfigError / WorkspaceViolationError / InvalidArgumentError）
 │   ├── resource/               # 资源层：读 agent 之外的东西 → 内部表示
-│   │   ├── paths.py            #   落盘路径单点：workspace_key / session_db_path / memory_root
+│   │   ├── paths.py            #   路径单点：基准(项目根) + 各落点(记忆/会话库/AGENT.md/HANDOFF.md)
 │   │   ├── memory.py           #   长期记忆 memory.md 的读写与注入渲染
 │   │   ├── skills.py           #   技能（skill）扫描 / 解析 / 注入渲染（只读单点）
 │   │   ├── images.py           #   @图片路径 的调用期附图通道（data URI，不碰 state）

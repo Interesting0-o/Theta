@@ -155,7 +155,7 @@ def test_read_missing_file_reports_and_does_not_create_it(tmp_path, monkeypatch)
     out = _msg(_read(ws))
 
     assert "还没有长期记忆" in out
-    assert not memory.memory_path(ws).exists()
+    assert not resource.memory_path(ws).exists()  # 落点函数归 app/resource/paths.py
 
 
 def test_read_empty_template_reports_no_entries(tmp_path, monkeypatch):

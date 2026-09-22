@@ -38,17 +38,17 @@ import keyword
 import logging
 from pathlib import Path
 
+from app.config import TEXT_BUDGET_CHARS
+from app.resource.paths import SKILLS_DIR
 from app.schema.agent_schema import SkillMeta, SkillPreflight
 
 logger = logging.getLogger(__name__)
 
 # ---------------------- 常量 ----------------------
 
-# 项目根：技能源的位置（与 graph.py / tools.py 同一算法）
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-
-# 技能源目录（随 Theta 出厂；首个技能 = skills/github/）
-SKILLS_DIR = _PROJECT_ROOT / "skills"
+# 技能源目录（随 Theta 出厂；首个技能 = skills/github/）。
+# ⚠️ 这个**名字是"借"来的**（真值在 app/resource/paths.py，由 PROJECT_ROOT 派生）：本模块的函数
+# 读的是**本模块的全局**，所以测试 monkeypatch `skills.SKILLS_DIR` 依然有效（见 paths.py docstring）。
 
 # 技能定义文件名。固定叫 SKILL.md（两型都是），扫描逻辑因此只有一套。
 SKILL_FILENAME = "SKILL.md"
@@ -64,10 +64,10 @@ SKILL_CONFIG_FILENAME = "skill.json"
 # 模块级常量便于测试 monkeypatch —— 测试把临时技能目录挂到另一个包名下，子进程才 import 得到。
 SKILLS_PACKAGE = "skills"
 
-# 正文注入预算（字符，口径同 memory.MEMORY_INJECT_CAP / LLMNode.AGENT_MD_INJECT_CAP）。
+# 正文注入预算（字符；值归 app/config.py::TEXT_BUDGET_CHARS，与记忆/画像/归档同族一处出处）。
 # 满了**不淘汰**：由 get_skill 拒绝新加载并要求模型先 drop_skill（§3.5——知识型没有可观测的
 # "使用事件"，自动淘汰无法定义）。
-SKILL_BODY_BUDGET = 8000
+SKILL_BODY_BUDGET = TEXT_BUDGET_CHARS
 
 # 目录条数上限（§3.6：目录与正文是两个预算，别混用一个数）。目录**不可淘汰**（淘汰 =
 # 不可发现 = 技能等于不存在），溢出只能截断——所以设宽一点，且溢出必须告警。

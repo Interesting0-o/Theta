@@ -20,7 +20,7 @@ from app.resource.skills import get_meta, read_tool_policies, skills_block
 from app.agent.state import AgentState
 from app.platform.tool_results import coerce_tool_result, format_tool_result
 from app.agent.prompt import SYSTEM_PROMPT, handoff_pointer_block, workspace_context_block
-from app.config import get_settings
+from app.config import TEXT_BUDGET_CHARS, THINKING_MODES, get_settings
 from app.schema.agent_schema import ImageRef, NoteEntry, PlanStep
 from app.schema.approval_schema import GATE_ASK_USER, GATE_TOOL_APPROVAL
 
@@ -69,7 +69,7 @@ def _tool_call_log(tool_call: dict) -> str:
 # - **思考内容进不了 `messages`**：`langchain-openai` 有意不提取 `reasoning_content`（转换函数是
 #   白名单式的），所以我们不需要剥离代码——但这条**依赖库的行为**，由上面那个测试文件里的契约
 #   用例钉住：哪天库开始提取，用例会红，届时在 LLMNode 的写回点补剥离。
-_THINKING_TYPES = ("enabled", "disabled")
+
 
 
 class LLMNode:
@@ -131,9 +131,9 @@ class LLMNode:
         text = (mode or "").strip().lower()
         if not text:
             return None
-        if text not in _THINKING_TYPES:
+        if text not in THINKING_MODES:  # 取值域与 CHAT_THINKING 键同处声明（app/config.py）
             raise ConfigError(
-                f"CHAT_THINKING 只能是 {' / '.join(_THINKING_TYPES)}（或留空 = 不下发），收到的是 {mode!r}"
+                f"CHAT_THINKING 只能是 {' / '.join(THINKING_MODES)}（或留空 = 不下发），收到的是 {mode!r}"
             )
         return {"thinking": {"type": text}}
 
@@ -295,25 +295,20 @@ class LLMNode:
         return self._profile_block
 
 #-------------------ToolMessage 的结构化戳（**生产端单点**）-------------------
-# 形状：`additional_kwargs` 里 `{error_type: <语义标记>}` 或 `{decision: "denied"}`（首次落地
+# 形状：`additional_kwargs` 里 `{"error_type": <语义标记>}` 或 `{"decision": "denied"}`（首次落地
 # 2026-09-16）。**生产端 = 本模块的 ToolNode / ReviewNode**（全仓只有这两个写出点，且都经
-# `_tool_stamp` 构造）；**消费端 = `CompactNode._tm_status`**（只读这两把钥匙）。
+# `_tool_stamp` 构造）；**消费端 = `CompactNode._tm_status`**（读这两个键）。
 #
-# 为什么要有这个单点（2026-09-21）：此前形状由两侧注释互相指认——生产端写 `additional_kwargs`、
-# 消费端"读它的 docstring 里说的那两个键"，没有一方是权威。按"归生产端、消费端只读"定在这里：
-# 改键名/加键 = 改这一块，消费者跟着读常量，不必去猜。
-STAMP_ERROR_TYPE = "error_type"
-STAMP_DECISION = "decision"
-STAMP_DENIED = "denied"
-
-
+# 为什么不把键名/取值做成常量：**它们是字典的键，用变量承接与直接写字面量没有区别**
+# （2026-09-22 用户拍板）——常量该留给"要按值分派或校验"的地方（如 `GATE_*` / `ASK_SELECT_*`）。
+# 真正有价值的是 `_tool_stamp` 这个**构造器**：它保证两个生产端写出同一种形状。
 def _tool_stamp(*, error_type: str | None = None, decision: str | None = None) -> dict:
     """构造 ToolMessage 的结构化戳（生产端唯一构造入口）。"""
     stamp: dict = {}
     if error_type:
-        stamp[STAMP_ERROR_TYPE] = error_type
+        stamp["error_type"] = error_type
     if decision:
-        stamp[STAMP_DECISION] = decision
+        stamp["decision"] = decision
     return stamp
 
 
@@ -592,7 +587,7 @@ class ReviewNode:
                             "先向用户说明意图或提出替代方案。"
                         ),
                         # 结构化戳：压缩消费端读 decision=denied 即可判定，不必解析前缀
-                        additional_kwargs=_tool_stamp(decision=STAMP_DENIED),
+                        additional_kwargs=_tool_stamp(decision="denied"),
                     )
                 )
 
@@ -663,7 +658,12 @@ class ReviewNode:
 #   - `messages`：**必给**，工具自己拼好的 ToolMessage 回执（原样并入对话，不解析内容）；
 #   - `current_plan`：可选，有链式语义——同回合的后续编排调用看得到上一步改过的它；
 #   - `_EXTRA_SLICE_KEYS` 里列的：可选，写回 state 的同名切片（**加新切片 = 改这一行 + state.py**）。
-# 下划线前缀的键一律忽略（`_EXTRA_SLICE_KEYS` 之外的新切片不会生效，只会被静默丢弃）。
+# **白名单之外的键一律被静默丢弃**（与键名有没有下划线无关）：这是刻意的——state 的写入面必须
+# 显式，工具返回里多出来的东西（写错的键、顺手塞的调试字段）不该悄悄进 state。
+# ⚠️ 代价是"两侧靠约定相连"：生产者（tools.py 的各编排工具）**不知道这张白名单存在**，只是照
+# 惯例返回 `{"loaded_skills": …}`——白名单删一项、或工具开始返回新切片，症状都是**静默丢弃**
+# （回执正常、状态没生效）。所以 `tests/test_plan_tools.py` 有一条契约用例扫 tools.py 各工具返回
+# 的键，断言它们 ⊆ {messages, current_plan} ∪ `_EXTRA_SLICE_KEYS`。
 #
 # **权威为什么在消费端（本节点）而不是生产端**：两者分居 `nodes.py` / `tools.py`，而
 # `nodes.py` **刻意不 import `tools.py`**（它拿的是构图期传进来的工具对象，见本文件顶部对
@@ -855,8 +855,8 @@ class QueueNode:
 # 由 CompactNode(content_budget_chars=…) 构造参数覆盖（默认取此值），实例化时可调。
 _CONTEXT_BUDGET_DEFAULT = 60000
 
-# 归档正文截断上限（字符）
-_NOTE_MAX = 8000
+# 归档正文截断上限（字符；值归 app/config.py::TEXT_BUDGET_CHARS，与记忆/画像/技能同族一处出处）
+_NOTE_MAX = TEXT_BUDGET_CHARS
 
 
 def needs_compact(state, budget: int) -> bool:
@@ -937,9 +937,9 @@ class CompactNode:
         判定只信工具回执，绝不信模型 content。
         """
         extra = getattr(message, "additional_kwargs", None) or {}
-        if extra.get(STAMP_DECISION) == STAMP_DENIED:
+        if extra.get("decision") == "denied":
             return "denied", "未执行"
-        error_type = extra.get(STAMP_ERROR_TYPE)
+        error_type = extra.get("error_type")
         if error_type:
             return "failed", str(error_type)
 
@@ -955,15 +955,6 @@ class CompactNode:
         if text.startswith(("工具不存在或未注册", "工具执行失败", "工具返回格式非法")):
             return "failed", CompactNode._first_line(text, 60)
         return "ok", ""
-
-    @staticmethod
-    def _notes_kind(tool: str) -> str:
-        return {
-            "web_search": "web",
-            "extract_urls": "extract",
-            "crawl_website": "crawl",
-            "deep_research": "research",
-        }.get(tool, "web")
 
     @staticmethod
     def _render_line(reason: str, tool: str, status: str, detail: str = "", note_ref: str = "") -> str:
@@ -1085,7 +1076,6 @@ class CompactNode:
                         ref = f"notes#r{ref_num}"
                         content_cap = content if len(content) <= _NOTE_MAX else content[:_NOTE_MAX] + "…"
                         archived[ref] = {
-                            "kind": CompactNode._notes_kind(name),
                             "title": CompactNode._first_line(content, 80),
                             "source_tool": name,
                             "content": content_cap,

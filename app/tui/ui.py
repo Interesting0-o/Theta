@@ -12,7 +12,8 @@ from __future__ import annotations
 import asyncio
 import queue
 
-from app.schema.approval_schema import GATE_ASK_USER, Decision
+from app.schema.agent_schema import ASK_SELECT_MANY
+from app.schema.approval_schema import DECISION_ANSWER, DECISION_APPROVAL, GATE_ASK_USER, Decision
 from app.schema.ui_schema import (
     Notice,
     ReadyForInput,
@@ -184,8 +185,8 @@ class TerminalUI:
         line = await self._prompt_line("是否批准该操作？(y/n): ")
         if line is None:
             print("（输入已结束，无人确认——按未批准处理）")
-            return Decision(kind="approval", approved=False)
-        return Decision(kind="approval", approved=line.strip().lower() in ("y", "yes", "是"))
+            return Decision(kind=DECISION_APPROVAL, approved=False)
+        return Decision(kind=DECISION_APPROVAL, approved=line.strip().lower() in ("y", "yes", "是"))
 
     async def _ask(self, value: dict) -> Decision:
         """收回答的**两段**：先选选项（可跳过），再补一句（可留空）。
@@ -205,19 +206,19 @@ class TerminalUI:
         否则两边会错位。
         """
         options = [str(item) for item in (value.get("options") or [])]
-        many = value.get("select") == "many"
+        many = value.get("select") == ASK_SELECT_MANY   # 词表归 schema，别在这里写字面量
 
         indexes: list[int] = []
         while True:
             line = await self._prompt_line("选择序号（回车 = 不选）: ")
             if line is None:
                 print("（输入已结束，无人作答——按未回答处理）")
-                return Decision(kind="answer")
+                return Decision(kind=DECISION_ANSWER)
 
             text = line.strip()
             raw = parse_option_indexes(text)
             if raw is None:  # 不是序号列表 → 整串当补充，跳过第二问
-                return Decision(kind="answer", supplement=text)
+                return Decision(kind=DECISION_ANSWER, supplement=text)
             if not raw:  # 空回车 / 只有分隔符 → 不选
                 break
 

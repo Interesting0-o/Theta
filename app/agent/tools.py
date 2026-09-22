@@ -36,22 +36,28 @@ import urllib.error
 import urllib.request
 from datetime import date
 from importlib.machinery import PathFinder
-from pathlib import Path
 from typing import Annotated, List, Literal, get_args
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, InjectedToolArg, InjectedToolCallId, tool
 from langgraph.prebuilt import InjectedState
 from app.agent import gates
+from app.resource.paths import PROJECT_ROOT
 from app.platform import mcp
 from app.resource import memory, skills
 from app.agent.state import AgentState
 from app.config import skill_env
 from app.exception import ConfigError
-from app.schema.agent_schema import PlanStatus, PlanStep, SkillMeta
+from app.schema.agent_schema import (
+    ASK_SELECT_DEFAULT,
+    ASK_SELECT_MANY,
+    AskSelectMode,
+    PlanStatus,
+    PlanStep,
+    SkillMeta,
+)
 
-# 项目根：spawn worker 子进程时 cwd 用项目根使 .env 可读（worker 内懒加载 LLMNode.main_chat_model）
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+# 项目根（归 app/resource/paths.py）：技能依赖预检要用它拼子进程的搜索路径
 
 logger = logging.getLogger(__name__)
 
@@ -310,7 +316,7 @@ def ask_user(
     state: Annotated[AgentState, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId],
     options: list[str] | None = None,
-    select: Literal["one", "many"] = "one",
+    select: AskSelectMode = ASK_SELECT_DEFAULT,
 ) -> dict:
     """在动手之前，把"你判断不了、只能由用户定"的问题摆给用户选，并等他的回答。
 
@@ -362,7 +368,7 @@ def ask_user(
     if picked:
         # 序号展示是 **1 起始**（面板口径），内部一律 0 起始
         chosen = "、".join(f"{number}. {text}" for number, text in picked)
-        if select == "many":
+        if select == ASK_SELECT_MANY:
             # **多选即使只勾 1 项也写明总数**：否则模型会怀疑"是不是丢了几项"
             content = f"[user_answer] 用户选择了（多选，共 {len(picked)} 项）：{chosen}"
         else:
@@ -658,7 +664,7 @@ def _missing_requirements(meta: SkillMeta, workspace: str) -> list[str]:
     declared = skills.read_requirements(meta)
     if not declared:
         return []
-    search = [workspace, str(_PROJECT_ROOT), *sys.path]
+    search = [workspace, str(PROJECT_ROOT), *sys.path]
     missing: list[str] = []
     for name in declared:
         try:

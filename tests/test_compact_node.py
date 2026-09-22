@@ -185,8 +185,7 @@ def test_web_search_result_archives_to_notes():
     out = _run(messages)
     assert "notes" in out and "notes#r1" in out["notes"]
     note = out["notes"]["notes#r1"]
-    assert note["kind"] == "web"
-    assert note["source_tool"] == "web_search"
+    assert note["source_tool"] == "web_search"   # kind 字段已于 2026-09-22 删除（悬空：只写不读）
     assert "光伏" in note["content"]
 
     sys_msg = next(m for m in out["messages"] if isinstance(m, SystemMessage))
@@ -204,9 +203,9 @@ def test_existing_notes_ref_continues_numbering():
         HumanMessage(content="嗯", id="h2"),
         AIMessage(content="好了。", id="ans2"),
     ]
-    out = _run(messages, notes={"notes#r3": {"kind": "web", "title": "旧", "content": "旧", "created": 1, "size": 1}})
+    out = _run(messages, notes={"notes#r3": {"title": "旧", "content": "旧", "created": 1, "size": 1}})
     assert "notes#r4" in out["notes"]
-    assert out["notes"]["notes#r4"]["kind"] == "research"
+    assert out["notes"]["notes#r4"]["source_tool"] == "deep_research"
 
 
 def test_single_round_never_folds():

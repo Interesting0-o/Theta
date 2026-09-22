@@ -37,6 +37,22 @@ GATE_TOOL_APPROVAL = "tool_approval"
 GATE_ASK_USER = "ask_user"
 
 
+# ---------------------- 取值常量（供**按值分派**的消费方引用）---------------------
+# `Decision.kind` 与 `ApprovalStatus.status` 的取值散在 6+ 处比较里，字面量写错不会报错、
+# 只会静默走岔（如把 answer 当 approval）——这类"要分派"的值用常量承接（与"字典键不值得用
+# 变量承接"是两回事：键没有分派语义，值有）。
+DECISION_APPROVAL = "approval"
+DECISION_ANSWER = "answer"
+STATUS_PENDING = "pending"
+STATUS_DECIDED = "decided"
+
+# ⚠️ 两套词表指的是同一件事，别在脑子里各记一套（2026-09-22 记）：
+#     GATE_TOOL_APPROVAL "tool_approval"  ↔  DECISION_APPROVAL "approval"
+#     GATE_ASK_USER      "ask_user"       ↔  DECISION_ANSWER   "answer"
+# 前者是**给的载荷**（interrupt payload 的 type，前端据此决定怎么问），后者是**人的回答**
+# （Decision.kind）。唯一映射点是 app/platform/turn.py::decision_to_resume。
+
+
 @dataclass(frozen=True)
 class Decision:
     """人类对一条闸门请求的回答——`UI.decide` 的返回值，**唯一能让 park 的 run 继续的东西**。

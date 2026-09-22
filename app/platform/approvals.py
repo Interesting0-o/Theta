@@ -50,13 +50,18 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from app.config import get_settings
 from app.exception import ConfigError
 from app.platform.ui import UI
+from app.schema.agent_schema import ASK_SELECT_DEFAULT
 from app.schema.approval_schema import (
+    DECISION_ANSWER,
+    DECISION_APPROVAL,
     DEFAULT_INBOX_HOST,
-    DEFAULT_INBOX_PORT,
     GATE_ASK_USER,
     GATE_TOOL_APPROVAL,
+    STATUS_DECIDED,
+    STATUS_PENDING,
     INBOX_BLOCK_SECONDS,
     ApprovalRecord,
     ApprovalRequest,
@@ -129,7 +134,7 @@ class ApprovalInbox:
             return None
         decided = item.record["decided"]
         return {
-            "status": "decided" if decided is not None else "pending",
+            "status": STATUS_DECIDED if decided is not None else STATUS_PENDING,
             "approved": decided.approved if decided is not None else None,
         }
 
@@ -177,7 +182,11 @@ class ApprovalInbox:
         ]
         for item in undecided:
             asked = (item.record["payload"] or {}).get("type") == GATE_ASK_USER
-            decision = Decision(kind="answer") if asked else Decision(kind="approval", approved=False)
+            decision = (
+                Decision(kind=DECISION_ANSWER)
+                if asked
+                else Decision(kind=DECISION_APPROVAL, approved=False)
+            )
             self.complete(item.record["approval_id"], decision)
         return len(undecided)
 
@@ -250,7 +259,7 @@ def build_app(queue: ApprovalInbox) -> Starlette:
             return JSONResponse({"error": "请求不存在"}, status_code=404)
         # HTTP 面**只承载审批**（worker 只会审批，提问在它那侧结构性不可达）——所以这里把
         # wire 上的 bool 包成 Decision，broker 内部则只认 Decision 一种表示。
-        queue.complete(approval_id, Decision(kind="approval", approved=approved))
+        queue.complete(approval_id, Decision(kind=DECISION_APPROVAL, approved=approved))
         return JSONResponse(queue.status(approval_id))
 
     return Starlette(
@@ -276,9 +285,8 @@ class ApprovalInboxServer:
 
     def __init__(self, host: str = DEFAULT_INBOX_HOST, port: int | None = None) -> None:
         self.host = host
-        self.port = (
-            port if port is not None else int(os.environ.get("AGENT_INBOX_PORT", DEFAULT_INBOX_PORT))
-        )
+        # 没显式给端口才去读配置（惰性）：显式给端口 = 调用方自己定，无需 .env
+        self.port = port if port is not None else get_settings().AGENT_INBOX_PORT
         self.queue = ApprovalInbox()
         self._app = build_app(self.queue)
         self._uvicorn = None
@@ -399,7 +407,7 @@ def _record_to_value(record: ApprovalRecord) -> dict:
         value["options"] = list(payload.get("options") or [])
         # 模态：面板据此提示"可多选"，并决定输入多个序号时收下还是重问。缺省 = 单选，
         # 与 `app/agent/gates.py::ask_request` 的默认值同源（那里是唯一权威，这里只做透传兜底）。
-        value["select"] = payload.get("select") or "one"
+        value["select"] = payload.get("select") or ASK_SELECT_DEFAULT
     else:
         value["tool_name"] = payload.get("tool_name", "?")
         value["tool_args"] = payload.get("tool_args") or {}

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, get_args
 
 from pydantic import BaseModel
 
@@ -26,10 +26,12 @@ class NoteEntry(TypedDict):
 
     定位：给"花钱、不可免费重取"的大结果（联网检索等）一个指针常驻、正文按需取回的落点，
     让折叠可以更激进。不做跨会话语义库——值钱结论由 agent 主动 promote 进 repo。
-    kind 约定：research / web / crawl / extract / command_output …（系统按 kind + 体积阈值归档）。
     created：unix 秒；size：content 的字符数；content：markdown payload（消费者是模型）。
+
+    曾有一个 `kind` 字段（web / extract / crawl / research），**2026-09-22 删除**：它只被写、
+    从没有任何地方读它或按它分派（悬空字段，同当年删掉的 topic/tags）——判据见
+    docs/ARCHITECTURE.md §4.6。
     """
-    kind: str
     title: str
     source_tool: str
     content: str
@@ -50,6 +52,16 @@ class ImageRef(TypedDict):
 
     path: str
     mime: str
+
+
+# ---------------------- ask_user 的题目模态（跨模块词表：闸门校验 / 工具 schema / 面板渲染）---------------------
+# 三处以上在用（gates 校验、tools 的签名、approvals 透传、panels 与 tui 的渲染分支），故按
+# "多处使用 → app/schema" 定在这里；消费方一律 import，不再各写一份 `("one", "many")`。
+AskSelectMode = Literal["one", "many"]
+ASK_SELECT_ONE: AskSelectMode = "one"
+ASK_SELECT_MANY: AskSelectMode = "many"
+ASK_SELECT_DEFAULT: AskSelectMode = ASK_SELECT_ONE      # 模型不传时的默认（单选）
+ASK_SELECT_MODES: tuple[str, ...] = get_args(AskSelectMode)
 
 
 class AskAnswer(TypedDict):

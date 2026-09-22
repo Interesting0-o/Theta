@@ -35,6 +35,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from app.exception import ConfigError, InvalidArgumentError
+from app.resource.paths import PROJECT_ROOT
 from app.schema.agent_schema import ToolResult
 from mcp_service.utils import guard
 
@@ -42,10 +43,9 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP("Dispatch")
 
-# 项目根：spawn worker 子进程时 cwd 用项目根，使 worker 能读到项目 .env（worker 内懒加载模型）。
-# **不能靠 cwd 反推**：stdio_connection 给 server 设的 cwd 是**工作区**（见 app/platform/mcp.py），
-# 项目根只能由 __file__ 算（或 env PYTHONPATH，那个也是主侧塞进来的项目根）。
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# 项目根：spawn worker 子进程时 cwd 用它，使 worker 能读到项目 .env（worker 内懒加载模型）。
+# **不能靠 cwd 反推**：stdio_connection 给 server 设的 cwd 是**工作区**（见 app/platform/mcp.py）。
+# 真值归 app/resource/paths.py（只依赖 stdlib，子进程 import 得起）。
 
 
 def _resolve_workspace() -> str:
@@ -74,7 +74,7 @@ def _worker_child_env(workspace: str) -> dict[str, str]:
       再经 `_build_servers` 透传进本 server 的 env（见模块 docstring 的转发链）。只在确实
       拿到地址时才带（空值不传：worker 那边把空串当"未设置"处理，但传个空变量本身就是噪声）。
     """
-    env = {"WORKSPACE_PATH": str(workspace), "PYTHONPATH": str(_PROJECT_ROOT)}
+    env = {"WORKSPACE_PATH": str(workspace), "PYTHONPATH": str(PROJECT_ROOT)}
     inbox_url = os.environ.get("AGENT_INBOX_URL", "").strip()
     if inbox_url:
         env["AGENT_INBOX_URL"] = inbox_url
@@ -97,7 +97,7 @@ async def _spawn_subagent_worker(task: str, workspace: str) -> str:
                 "transport": "stdio",
                 "command": sys.executable,
                 "args": ["-m", "mcp_service.sub_agent"],
-                "cwd": str(_PROJECT_ROOT),
+                "cwd": str(PROJECT_ROOT),
                 "env": _worker_child_env(workspace),
             }
         }

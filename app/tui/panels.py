@@ -14,6 +14,8 @@ langsmith 传递装上）：装了就把模型答复渲染成有标题/列表/�
 """
 import json
 
+from app.schema.agent_schema import ASK_SELECT_MANY
+
 try:  # 可选依赖：没装则两个名字为 None，render_markdown 据此退回纯文本
     from rich.console import Console
     from rich.markdown import Markdown
@@ -123,7 +125,7 @@ def format_ask(value: dict) -> str:
         lines.extend(
             f"    {index}. {truncate(item)}" for index, item in enumerate(options, start=1)
         )
-        if value.get("select") == "many":
+        if value.get("select") == ASK_SELECT_MANY:  # 词表归 app/schema，别写字面量
             lines.append("  （这题**可多选**：逗号分隔多个序号，如 1,3）")
     else:
         lines.append("  （本次没有给定选项，直接写下你的想法即可）")

@@ -31,7 +31,12 @@ from mcp.server.fastmcp import FastMCP
 
 from app.exception import ConfigError, InvalidArgumentError
 from app.schema.agent_schema import ToolResult
-from app.schema.approval_schema import DEFAULT_INBOX_HOST, DEFAULT_INBOX_PORT, INBOX_BLOCK_SECONDS
+from app.schema.approval_schema import (
+    DEFAULT_INBOX_HOST,
+    DEFAULT_INBOX_PORT,
+    INBOX_BLOCK_SECONDS,
+    STATUS_DECIDED,
+)
 from mcp_service.utils import guard
 
 mcp = FastMCP("SubAgent")
@@ -140,7 +145,7 @@ async def _await_main_decision(
             if rr.status_code != 200:
                 raise RuntimeError(f"等待审批决定失败: HTTP {rr.status_code}")
             decision = rr.json()
-            if decision.get("status") == "decided":
+            if decision.get("status") == STATUS_DECIDED:
                 return bool(decision.get("approved"))
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"等待审批决定超时（{timeout:.0f}s），未获得主侧决定")

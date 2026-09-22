@@ -100,3 +100,125 @@ LangGraph 擅长的：把"一条 agent run"描述成带状态机、可中断、�
 编排工具返回切片的协议由执行器（`OrchestrateNode` + `_EXTRA_SLICE_KEYS`）定义、`tools.py` 按它写。
 **为什么切片的权威在消费端**：生产者与执行器分居 `nodes.py` / `tools.py`，而 `nodes.py` 刻意不
 import `tools.py`，"权威放生产端"就得造一条反向 import——写成"执行器定义协议、生产端照写"即可。
+
+### 4.2 文本渲染的落点：受众 / 形状主人 / 消费者数（2026-09-22 定）
+
+散乱的从来不是"家"，是"规矩"。全仓的渲染函数分布其实很整齐：跨模块的那几个都已经住在**形状
+主人**那里（工具回执 → `app/platform/tool_results.py`；注入块 → `prompt.py` / `memory.py` /
+`skills.py`；面板 → `app/tui/panels.py`），只有一个消费者的就近留着（`CompactNode._render_line`、
+`_tool_call_log`、`_snapshot`、`_render_session_line` …）。所以只补一条判据，**不新建"formatters 袋"**：
+
+1. **受众是谁** —— 给模型 / 给人 / 给磁盘。它决定验证方式（给模型的改动要跑 `--live`），也决定
+   **能不能合**：`panels.truncate`（人看的 `" ...(共 N 字符，已截断)"`）与 `skills/github._clip`
+   （教模型补救的 `"…（已截断，完整内容共 N 字符；可用参数缩小范围再取）"`）受众与后缀语义都不同，
+   **判过、不合**。
+2. **这段文本的形状由谁定义** —— 渲染跟着形状主人走：ToolResult → MCP 边界模块；state 切片 → 那个
+   节点；技能目录 → `app/resource/skills.py`；记忆文件 → `app/resource/memory.py`。
+3. **几个消费者** —— 1 个：留在消费者里（就近，别提前抽象）；>1：提到形状主人那一层；>1 **且跨层**
+   （agent ↔ platform/tui）：放中立层（只依赖 stdlib / schema），否则**写明"为什么不合"**。
+
+**命名**：注入给模型的块统一叫 `*_block`（`workspace_context_block` / `handoff_pointer_block` /
+`memory_block` / `skills_block` / `catalog_block` / `agent_md_block`）——这是既存的事实约定，只是
+从没人写下来；`format_tool_result` 是唯一例外（它也给模型，但名字已是对外契约，改了只有成本）。
+
+**为什么不集中**：`app/format.py` 之类会变回无序工具袋（本项目删过一次同性质的
+`app/agent/utils.py` 并留了警告 docstring），而且受众不同的函数放一起会持续诱导后人合并。
+
+**已知重复、判过不合**：`app/platform/commands/session.py::_short_line` ↔ `nodes.py` 的
+`CompactNode._first_line`（逐字相同，但跨层 import 的代价 > 4 行重复；2026-09-21 拍板方案 B）。
+
+### 4.6 枚举 / 标签的真相（判据，2026-09-22 定）
+
+"枚举"在这里指**一切封闭词表**：`Literal`、状态字符串、`source` 标签、工具名清单、`error_type` 取值、
+模态名……它们散落时不会编译错，只会**静默走岔**（词写错 → 落到别的分支或落盘成垃圾）。所以规矩只有
+一句：**一个词表只有一份真相，且它落在"谁定义这个词"的那一侧**。
+
+| 词表在哪一侧 | 真相该住哪 | 消费方怎么用 |
+| --- | --- | --- |
+| **跨边界**（模型可见 / 进 state / 过 checkpoint / 过进程） | `app/schema`（`Literal` 或常量） | 直接 import；能派生的**一定派生**（`PLAN_STATUSES = get_args(PlanStatus)` 是先例） |
+| **停在单个模块** | 留那个模块，但**要有类型**（`Literal`），不许裸 `str` | 模块内直接读；跨模块消费就该升级成上一行 |
+| **住在数据文件里**（`tool.json` 的 `source` / `worker_allow` / `free_when`） | **数据是登记处**，但**取值清单要在代码里有一处声明** | 代码侧用它做分流与校验；另加一条契约测试把数据与清单对齐 |
+
+**三条补充（2026-09-22 用户拍板）**：
+
+- **悬空判据**：枚举的意义是"用规范的字段传递消息"——**生产了却没有任何地方按它拆解**的词表/字段
+  就是悬空的，**直接删**（实例如 `NoteEntry.kind`：只写不读，连带它的映射表一起删）；只有生产侧、
+  消费侧却硬编码字面量的叫"半悬空"，处置是**给一份可引用的常量**（如 `DECISION_ANSWER`）。
+- **字典的键不值得用变量承接**：`stamp[STAMP_ERROR_TYPE]` 与 `stamp["error_type"]` 没有区别——
+  键名写字面量，常量留给"要按值分派或校验"的地方（`GATE_*` / `ASK_SELECT_*`）。
+- **多处使用 → `app/schema`**：一个词表被三处以上引用（校验 / 给模型的 schema / 渲染分支）时，
+  真相进 `app/schema`，消费方一律 import（`AskSelectMode` / `ASK_SELECT_*` 即如此）。
+
+**两条配套**：① **同义不许两套拼写**——同一件事有两个词表（如闸门 `Decision.kind ∈ {approval, answer}`
+↔ 载荷 `type ∈ {GATE_*}`）时，必须在**一处**写明映射，不能只靠某个 `if` 分支隐含；② **名字清单不许手抄**
+——"哪几个工具是联网四件套"这类，若能从既有分组/登记处派生，就不许再列一遍（手抄的那份会随数据改动
+漂）。**已量出的四类分布与分批计划**见 [[docs/TODO]]「枚举 / 标签的真相在哪」条。
+
+### 4.5 函数的返回值形态（判据，2026-09-22 定）
+
+**只有两种合法形态**：
+
+1. **单一类型**（含 `X | None`）。`| None` 是"**有没有**"（存在性），不是"多类型"——Python 里它
+   仍是单一语义，不必为它造包装。
+2. **数据结构体**（`frozen dataclass` / `TypedDict`）——"两个以上字段一起返回"时用它。
+
+**禁止两样**：① 把**互斥的结果**塞进元组（`(载荷, 错误)`、`(命中, 候选清单)`）；② 三元组以上的位置
+返回。理由：位置返回**没有名字**——调用方只能靠顺序记"哪一半是错误"，类型上也区分不出来；而值对象
+自带字段名，还能带上 tag。
+
+**正例（照抄它们）**：`ToolResult(success, content, error_type)`（app/schema —— "成败 + 载荷/原因"）；
+`parse_command → PromptCommand | ActionCommand`（app/platform/commands —— "用数据结构体表达互斥"）。
+
+**配套约定**（让这条判据不必去打所有 `X | None`）：**"只有一条载荷、且那是一句可行动的错误文案"的
+函数统一返回 `str | None`，`None` = 通过**——`_register_skill_runtime` / `_check_skill_tools` /
+`_skill_preflight_line` 已经是这样。它与第①条禁令不冲突：那条禁的是"两种**载荷**互斥"，这里只有
+一种载荷 + 存在性。
+
+**刻意例外（写明，别顺手改）**：
+
+- **编排工具返回的 state 切片**（`dict`）—— LangGraph 合并 state 的规定，必须 dict；
+- **UI 协议载荷**（`approvals._record_to_value` 的 dict）—— 形状由 `app/schema/approval_schema.py`
+  的常量与测试钉住，是**跨边界形状**；
+- **`turn._race` 的 `(idx, value)`** —— select 原语，`idx` = 哪一路胜出，"编号 + 值"就是它的语义；
+- **`mcp.py::_make_shim` 的 `(content, None)`** —— langchain `content_and_artifact` 契约要求。
+
+**落点**（沿用既有惯例）：跨边界/进 state 的值对象 → `app/schema`（`TypedDict`）；只服务生产模块的
+值对象 → 留生产者模块（`frozen dataclass`）。**已量出的 12 处清单与分批计划**见 [[docs/TODO]]
+「函数返回值：多类型 → 值对象」条。
+
+### 4.4 路径的取得方式（规定，2026-09-22 定；落地见 `app/resource/paths.py` 的 docstring）
+
+路径是唯一"**便宜到没有约束**"的资源：可拼、可上溯、`..` 随便接，所以"能不能拿到"从不构成限制，
+约束只剩规定。四条（**规矩本身写在 `app/resource/paths.py` 顶部**，那里同时是全仓的资源清单）：
+
+1. **落点只能调用、不许拼** —— 约定资源（名字与位置由我们定死，如 `AGENT.md`）一律经具名函数取：
+   `agent_md_path(ws)` / `handoff_md_path(ws)` / `memory_path(ws)` / `session_db_path(ws, sid)`。判据是
+   **约定 vs 发现**：`<ws>/**/*.py` 是发现（由内容与模式决定）→ 拼接 + glob 正当。
+2. **拼接的权利只属于"这段布局的主人"，且只在自己根以下** —— `skills.py` 拼
+   `SKILLS_DIR/<dir>/skill.json` 正当（目录里摆什么是它的知识）；**别人不许替它拼**，多一个 `..` 也不行。
+3. **基准不许自算** —— 不许用 `Path(__file__).parents[N]` 推断项目根（文件一挪，它不报错、只是静默
+   指向别处）；基准只由 `paths.PROJECT_ROOT` 给出，其余（`RESOURCE_ROOT` / `SKILLS_DIR` /
+   `DEFAULT_WORKSPACE` / `.env` 定位）全部派生。
+4. **`..` 在生产代码里基本是禁令** —— 唯一合法例外是**解析别人给的路径**（`file_io` 的沙箱解析、
+   `images` 的 `@路径`、`config` 的 `.env` 定位）：那是输入处理，`resolve()` 后必须过校验。
+
+**刻意不归 paths 的两处**：`tool.json` / `command_policy.json`（闸门判定材料必须与解析器同住，
+`app/agent/gates.py` 用 `Path(__file__).with_name(...)` 自拼）与 `evaluation/fixtures.py`（评估框架
+自己的样本目录，app 不该知道评估存在）。**规定可检查**：`tests/test_resource.py` 末尾两条用例钉住
+"基准只算一处"与"落点函数存在"——谁在别处就近算一下项目根，测试立刻变红。
+
+### 4.3 配置的归属（判据，2026-09-22 定）
+
+`config.py` 收**两类**东西（2026-09-22 修订）：
+
+1. **环境配置**（`Settings`，`.env` 驱动）：随环境 / 部署 / 人变，且改它不该动代码——凭证、端点、
+   模型名、开关、技能白名单。
+2. **跨模块共用的量级常量**（模块级常量，**不是 .env 键**）：一处值、多处调用；放这里是为了避免
+   同一量级在各模块各写一遍、再靠注释互相指认"同量级"（`TEXT_BUDGET_CHARS` 就是这么合出来的）。
+   ⚠️ 若某个量真成了用户旋钮（随部署变、改它不该动代码），再从第 2 类升级成第 1 类（`Settings` 字段）。
+
+**配置键的取值域跟键同处声明**（`THINKING_MODES` 挨着 `CHAT_THINKING`）——取值域属于键，不归消费方。凡"改了要重审行为、要跟测试与文档"的，都是**口径**（预算 / 上限 /
+超时 / 词法 / 协议标记），留在代码里、并尽量给构造参量缝（`CompactNode(content_budget_chars=…)`、
+`LLMNode(cap=…)`）——搬进 `.env` 只会多出一个"没人评审就能改行为"的静默面。
+⚠️ 子进程侧读 `os.environ` 是**运输**不是配置：真值在 `get_settings()`，由 host 经
+`stdio_connection(extra_env)` / `skill_env` 注入。审计与两处缺口见 [[docs/TODO]]「配置的归属」条。

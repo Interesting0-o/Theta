@@ -40,12 +40,35 @@ DENY = Decision(kind="approval", approved=False)
 
 
 def test_default_inbox_port_is_shared_constant(monkeypatch):
-    """默认端口是主侧/worker **共用的一份常量**（两边各写字面量迟早会漂），且 env 仍可覆盖。"""
-    monkeypatch.delenv("AGENT_INBOX_PORT", raising=False)
-    assert ApprovalInboxServer().port == DEFAULT_INBOX_PORT
+    """默认端口是主侧/worker **共用的一份常量**：`Settings` 的默认值就是它（两边各写字面量迟早会漂）。
 
-    monkeypatch.setenv("AGENT_INBOX_PORT", "12345")
-    assert ApprovalInboxServer().port == 12345
+    这里用 `model_fields` 读声明本身——**不实例化 Settings**，本文件因此仍无需 .env。
+    """
+    from app.config import Settings
+
+    assert Settings.model_fields["AGENT_INBOX_PORT"].default == DEFAULT_INBOX_PORT
+
+
+def test_port_comes_from_settings_not_os_environ(monkeypatch):
+    """端口从 `Settings` 取（2026-09-22 修）：`.env` 里写它必须生效。
+
+    此前的实现读 `os.environ`——而 pydantic-settings 读 `.env` **但不把值注入 `os.environ`**，
+    于是"按文档写进 .env"静默失效、只有 shell export 有效（README/CLAUDE/MULTI_AGENT 里
+    都把它写成用户旋钮）。改走 Settings 后两条路都生效（shell env 优先级更高）。
+    """
+    from types import SimpleNamespace
+
+    import app.platform.approvals as approvals_mod
+
+    monkeypatch.setattr(
+        approvals_mod, "get_settings", lambda: SimpleNamespace(AGENT_INBOX_PORT=25011)
+    )
+    assert ApprovalInboxServer().port == 25011
+    # 真值只有 Settings 一个出口：os.environ 里的同名键不再被直接读
+    monkeypatch.setenv("AGENT_INBOX_PORT", "9999")
+    assert ApprovalInboxServer().port == 25011
+    # 调用方显式给端口 → 完全不读配置
+    assert ApprovalInboxServer(port=0).port == 0
 
 
 def test_worker_side_default_url_uses_same_constant():

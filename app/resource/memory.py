@@ -1,8 +1,8 @@
 """长期记忆：记忆 md 的读写单点（已落地；"Phase B" 是当时的设计阶段名）。
 
-落点：`resource/<ws_key>/memory/memory.md`（路径经 `app/resource/paths.py::memory_root` 算，
-文件名白名单硬编码在本模块——模型只给 type/content/key，永远不碰路径，见
-LONG_TERM_MEMORY.md §5）。文件形态见 §3：
+落点：`resource/<ws_key>/memory/memory.md`（路径经 `app/resource/paths.py::memory_path` 算，
+文件名也归那里——模型只给 type/content/key，永远不碰路径，见 LONG_TERM_MEMORY.md §5）。
+文件形态见 §3：
 
     # 长期记忆（工作区 <ws_key>）
     <说明行>
@@ -29,15 +29,13 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.resource.paths import memory_root, workspace_key
+from app.config import TEXT_BUDGET_CHARS
+from app.resource.paths import memory_path, workspace_key
 from app.schema.agent_schema import MemoryEntry
 
-# 记忆文件名（白名单单点：模型无法指定路径）
-MEMORY_FILENAME = "memory.md"
-
-# 注入用整份 md 的字符上限（docs/LONG_TERM_MEMORY.md §3 暂定 6–8k，这里取 8k；与
-# nodes.py::_NOTE_MAX 同量级）。超限只注入"最新的、装得下的条目"+ 一行省略提示。
-MEMORY_INJECT_CAP = 8000
+# 注入用整份 md 的字符上限（docs/LONG_TERM_MEMORY.md §3 暂定 6–8k）。超限只注入"最新的、
+# 装得下的条目"+ 一行省略提示。**值归 app/config.py::TEXT_BUDGET_CHARS**（同族四个预算一处出处）。
+MEMORY_INJECT_CAP = TEXT_BUDGET_CHARS
 
 # 条目标题行：`## [m3] decision · 2026-09-08`
 _HEADING_RE = re.compile(r"^## \[(?P<key>m\d+)\]\s*(?P<type>[^·]*?)\s*·\s*(?P<date>\d{4}-\d{2}-\d{2})\s*$")
@@ -69,11 +67,6 @@ def _template(key: str) -> str:
         "一句话结论，可附出处。\n"
         "-->\n"
     )
-
-
-def memory_path(workspace_path: str) -> Path:
-    """某工作区的记忆文件路径（`resource/<ws_key>/memory/memory.md`）。"""
-    return memory_root(workspace_path) / MEMORY_FILENAME
 
 
 def ensure_memory_template(workspace_path: str) -> Path:

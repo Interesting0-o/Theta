@@ -503,6 +503,194 @@ memory 留在编排工具，这条靠 `InjectedWorkspace` 继续对模型隐藏�
   （批准 → 工具真执行、拒绝 → 回灌 `[approval_denied]`，断言不变）、`tests/test_mcp.py` 补一跳转发用例。
 
 
+## [x] 枚举 / 标签的真相在哪（2026-09-22 审计 + 第一批已落地）
+
+**判据已落纸**（`docs/ARCHITECTURE.md` §4.6）：一个词表只有一份真相，落在"谁定义这个词"的那一侧——
+跨边界 → `app/schema`（能派生就派生）；停在单模块 → 留模块但用 `Literal`（别裸 `str`）；住在数据文件
+（`tool.json`）→ 数据是登记处、**取值清单要在代码里有一处**供派生与校验。外加两条：同义不许两套拼写、
+名字清单不许手抄。
+
+**实测分布（四类；按"静默失败"风险排）**：
+
+**A · 已有单一真相（标杆，别动）**：`PlanStatus`（+`PLAN_STATUSES` 用 `get_args` 派生）、
+`SearchDepth/Topic/TimeRange`（贴上游 Tavily）、`Decision.kind` / `ApprovalStatus` / `GATE_*`、
+`_ORCHESTRATE_TOOL_NAMES`（由工具对象派生）。**例外两处**：`LLMNode.format_plan_status` 的
+`status_map` 手抄三种状态、`approvals._record_to_value` 的 `or "one"` 抄了 `ASK_SELECT_DEFAULT`。
+
+**B · 同义两套词（同一件事两种拼写）**：
+
+| 词表 | 两套写在哪 | 唯一映射点 | 问题 |
+| --- | --- | --- | --- |
+| 闸门种类 | `Decision.kind ∈ {approval, answer}`（schema）↔ payload `type ∈ {tool_approval, ask_user}`（`GATE_*`） | 只有 `turn.decision_to_resume` 的 if 分支 | **没有一处同时写着两张词**，人得读两个模块才敢确定对应关系 |
+| 可选模态 | `"one"/"many"`：`tools.ask_user` 的 `Literal`、`gates.ASK_SELECT_MODES/_DEFAULT`、`approvals` 的 `or "one"`、`panels` 的 `== "many"`、`tui/ui.py` 的 `== "many"`、`prompt.py` 的说明 | 无 | **8 处字面量（6 处代码判断）**；加第三种模态要改 6 处 + 提示词，漏一处就静默不一致 |
+
+**C · 词表只活在散文里（写错不报错，最危险）**：
+
+| 词表 | 现状 | 消费链 | 漏了会怎样 |
+| --- | --- | --- | --- |
+| 记忆 `type`（`user-preference`/`decision`/`convention`/`project-fact`） | `write_memory(type: str)`、`MemoryEntry.type: str`——**只有 docstring 与工具说明** | 模型 → `memory.append_entry` 落盘 → `read_memory` 展示 | **写错静默落盘成垃圾条目**，无人报警 |
+| `NoteEntry.kind`（`web`/`extract`/`crawl`/`research`；docstring 还写了从没产出的 `command_output`） | `kind: str`；事实上的取值表是 `CompactNode._notes_kind` 的 dict | CompactNode → 注入 / `read_note` | 同上（只影响展示，危害小一档） |
+| `error_type` 取值 | 一半由 `guard._type_token` 从异常类名派生，一半**手写字面量**（`file_io` 的 `io_error`/`invalid_argument`、`web_search` 的 `upstream_error`/`no_results`、`nodes` 的 `tool_error`/`unknown_tool`） | 各 server / ToolNode → `format_tool_result` 的 `[前缀]` 约定 + `CompactNode._FAIL_PREFIXES` 回退表 | **没有取值清单**，谁都能造新值；回退表已漂过一次（`[config_error]` 从来匹配不上） |
+| `worker_id` 形态（`main` / `worker-xxxxxxxx`） | `LOCAL_WORKER_ID` 单点 ✅，构造在 `sub_agent` | 基座 / 面板渲染 | 轻 |
+
+**D · 名字清单的副本（"枚举 = 一组名字"）**：`source` 标签（`tool.json` 是登记处，代码里 **5 处**副本：
+`ORCHESTRATE_SOURCES` / `ASK_SOURCE` / `tools._WORKSPACE_SOURCES` / `_WEB_SOURCES` /
+`skills._skill_server_name` 的 `f"skills/{dir}"`）；`CompactNode.ARCHIVE_TOOLS`（4 个联网工具名，与
+tool.json 的 `source: mcp_service/web_search` 同义）；`_EXTRA_SLICE_KEYS`（`state.py` 字段名的副本）；
+`_FAIL_PREFIXES`（C 组副本）；`evaluation.DEFAULT_DENY_TOOLS`（评估自己的，可接受）。
+
+**第一批已落地（2026-09-22）**：
+
+- **删悬空**：`NoteEntry.kind`（只写不读，连带 `CompactNode._notes_kind` 与其"联网四件套工具名"
+  的第二份副本）——判据"生产了却没人按它拆解 → 删"，同当年 `topic/tags`。
+- **删字典键常量**：`STAMP_ERROR_TYPE` / `STAMP_DECISION` / `STAMP_DENIED`——字典的键用变量承接与
+  写字面量没有区别（用户拍板）；保留真正有价值的 `_tool_stamp()` 构造器（保证两个生产端同形）。
+- **多处使用的词表进 schema**：`AskSelectMode` / `ASK_SELECT_ONE` / `ASK_SELECT_MANY` /
+  `ASK_SELECT_DEFAULT` / `ASK_SELECT_MODES` 落 `app/schema/agent_schema.py`；六个消费点（gates 校验、
+  tools 签名、approvals 透传、tools 回执渲染、panels、tui）全部改 import，`"one"/"many"` 字面量清零。
+- **半悬空 → 给可引用常量**：`DECISION_APPROVAL` / `DECISION_ANSWER`（`turn.py` 的分派、`approvals`
+  与两个前端造 Decision 处）、`STATUS_PENDING` / `STATUS_DECIDED`（主侧写、**worker 跨进程读**）；
+  并在 `approval_schema.py` 一处写明 **`GATE_*` ↔ `DECISION_*` 两套词的映射**（此前只靠
+  `decision_to_resume` 的 if 隐含）。
+- **配置键的取值域跟键走**：`_THINKING_TYPES` 从 `nodes.py` 挪进 `app/config.py::THINKING_MODES`。
+
+**仍未做**：
+
+1. `source` 标签的 5 处副本（`ORCHESTRATE_SOURCES` 应改为从 tools.py 里既有的五组工具列表派生，
+   再加一条契约测试与 `tool.json` 对齐）——D 组主体；
+2. `CompactNode.ARCHIVE_TOOLS` 与 `tool.json` 的 `source: mcp_service/web_search` 同义（"谁进 notes"
+   ≡ "谁是联网四件套"）；
+3. `_EXTRA_SLICE_KEYS`（`state.py` 字段名的副本）；
+4. `LLMNode.format_plan_status` 的 `status_map` 手抄三种状态（A 组例外）。
+
+****原始建议（留档）****：
+
+1. 给 `记忆 type` / `NoteEntry.kind` / `select` 加 `Literal`，校验表用 `get_args` 派生（照
+   `PLAN_STATUSES` 的先例）——把 C 组的两处"写错静默落盘"变成当场报错；
+2. 把 `ORCHESTRATE_SOURCES` 的来源改成 tools.py 里**既有的五组工具列表**（`orchestrate_tool` /
+   `note_tools` / `ask_tool` / `memory_tool` / `skill_tool` 的分组本身就是"source → 工具"的真相），
+   再用一条契约测试把 `tool.json` 的 `source` 与它对齐——消掉 D 组的 5 处副本；
+3. 闸门那两套词（`kind` ↔ `GATE_*`）在 schema 里写明映射常数，别再只靠 `decision_to_resume` 的 if 隐含。
+
+**相关背景**：`docs/ARCHITECTURE.md` §4.6（判据）、§4（tool.json 的键语义与"表与解析器同住"那条纪律——
+注意 `ORCHESTRATE_SOURCES` 属**分流规则**，仍留代码，只是它的**词表**该与数据侧对齐）。
+
+## [ ] 散落的数值口径：归属清单（2026-09-22）
+
+**规则（2026-09-22 定）**：每个散落的数值常量都要能回答四问——**它是谁的**（owner 模块）/
+**谁读它** / **可不可调** / **跟谁同族**。答不上来就说明它没主。配套两条：**同组合并**（同族的
+值只留一个出处）、**多处调用 → 进 `app/config.py`**（config 是全局权威来源，见 §4.3 的两类内容）。
+命名与可见性：**跨模块读 → 公开名；只服务本模块 → `_` 前缀**；**名字要带单位/量词**（字符数 vs 条数）。
+
+| 常量 | 归属（owner） | 消费者 | 可调缝 | 同族/约束 |
+| --- | --- | --- | --- | --- |
+| `TEXT_BUDGET_CHARS = 8000` | **`app/config.py`**（同组合并后的**唯一出处**） | `memory.MEMORY_INJECT_CAP` / `profile.AGENT_MD_INJECT_CAP` / `skills.SKILL_BODY_BUDGET` / `nodes._NOTE_MAX`（各自名字保留——语义不同） | 四个 `cap=` / 构造参量 | 同族自身（此前 8000 抄四遍、靠注释互指"同量级"） |
+| `_CONTEXT_BUDGET_DEFAULT = 60000` | `nodes.CompactNode` | CompactNode | `CompactNode(content_budget_chars=)` | — |
+| `SKILL_CATALOG_CAP = 60` | `resource/skills.py` | `catalog_block` | 参量 `cap` | — |
+| `MAX_ASK_OPTIONS = 5` | `agent/gates.py` | `ask_request` 校验（提示词文案里也有"5"，属文案） | — | — |
+| `_MAX_IMAGES_PER_MESSAGE` / `_MAX_IMAGE_BYTES` | `resource/images.py` | `attach_images_to_payload` | — | 同族（一条消息的图） |
+| `_MAX_STEPS = 100` | `mcp_service/sub_agent.py` | worker 图 `recursion_limit` | 调用处 | — |
+| `_APPROVAL_TIMEOUT_S` / `_HTTP_TIMEOUT_S` | `sub_agent` | `_await_main_decision` / httpx | 函数参量 | **约束**：HTTP 超时必须 > `INBOX_BLOCK_SECONDS`（这条曾真出过 bug） |
+| `INBOX_BLOCK_SECONDS = 120` | **`app/schema`**（主侧与 worker 两侧共用） | 主侧长轮询 + worker 客户端 | — | 跨进程 → 归 schema（与 `DEFAULT_INBOX_PORT` 同理） |
+| `_PREFLIGHT_TIMEOUT` / `_STARTUP_PROBE_TIMEOUT` / `_STARTUP_PROBE_CHARS` | `agent/tools.py`（技能加载组） | 体检 / 启动探针 | — | 同族（技能加载的超时与截断） |
+| `_SUMMARY_CHARS = 60` | `platform/commands/session.py` | `_short_line` | 参量 `limit` | **不是**与 `DEFAULT_SUMMARIZE_LIMIT` 同类（字符数 vs 条数）——2026-09-22 改名消歧 |
+| `DEFAULT_SUMMARIZE_LIMIT = 10` | 同上 | `list_sessions` | 参量 `summarize_limit` | 同上 |
+| `_TIMEOUT_SECONDS` / `_MAX_CHARS` | `skills/github/server.py` | 该技能自己的 HTTP | — | 技能自带（跟技能目录走 ✓） |
+| 工具签名里的默认值（`run_command(timeout=300)`、`startup_wait=5` …） | 各 MCP server 的工具定义 | **模型**（schema 可见） | 调用参数 | **不是配置**：属工具契约，随服务端工具定义留原处 |
+
+**本轮已做**：`8000` 同组合并进 config（`TEXT_BUDGET_CHARS`）；`_SUMMARY_LIMIT` → `_SUMMARY_CHARS`；
+归属清单成形（本表）。**未做**：跨模块读的私有名（`nodes._EXTRA_SLICE_KEYS`）改公开名；`_CONTEXT_BUDGET_DEFAULT`
+之外还有几个"可调缝"缺失（如 `MAX_ASK_OPTIONS` 没有参量口）。
+
+**相关背景**：`docs/ARCHITECTURE.md` §4.3（config 的两类内容 + 进入判据）、本文件「配置的归属」条。
+
+## [ ] 函数返回值：多类型 → 值对象（2026-09-22 审计）
+
+**判据已落纸**（`docs/ARCHITECTURE.md` §4.5）：返回值只有两种合法形态——**单一类型**（含
+`X | None`，那是"有没有"）与**数据结构体**；禁止"把互斥结果塞进元组"与"三元组以上的位置返回"。
+配套约定：只有一句错误文案载荷的函数统一用 `str | None`（`None` = 通过）。
+**列表同形的正例**：`ToolResult`、`parse_command → PromptCommand | ActionCommand`。
+
+**实测清单（2026-09-22 grep `-> tuple[` + 多值 `return`；共 12 处）**：
+
+| # | 位置 | 现在返回 | 判定 |
+| --- | --- | --- | --- |
+| 1 | `gates.ask_request` | `tuple[dict \| None, str \| None]` | **该改**：请求 ↔ 问题说明互斥 |
+| 2 | `tools._probe_skill_credential` | `tuple[bool, str]` | **该改**：结果 + 原因 |
+| 3 | `commands.session.resolve_session_id` | `tuple[str \| None, list[str]]` | **该改**：命中一个 ↔ 候选清单互斥 |
+| 4 | `evaluation.fixtures.resolve` | `tuple[Fixture \| None, str \| None]` | **该改**：样本 ↔ 陈旧原因互斥 |
+| 5 | `sub_agent._value_to_approval` | `tuple[str, dict, str]` | **该改（复用）**：主侧已有 `ApprovalRequest`（`app/platform/turn.py` 就在用），worker 侧却自己拼三元组 |
+| 6 | `images.attach_images_to_payload` | `tuple[list, list[ImageRef]]` | 成对（请求体副本 + 记账）→ 值对象 |
+| 7 | `CompactNode._plan` | `tuple[list, list[str], dict]` | **三元组** → 值对象（将来搬 `compact.py` 时顺手） |
+| 8 | `CompactNode._tm_status` | `tuple[str, str]` | tag + 附注 → 值对象 |
+| 9 | `CompactNode._new_note_ref` | `tuple[str, int]` | ref + 序号（最小） |
+| 10 | `skills.{_split_frontmatter, _read_skill_md}` | `tuple[dict, str]` | frontmatter + 正文（两个函数同形，一起改） |
+| 11 | `runtime.build_session_runtime` | `(connection, step, mailbox)`，**且无返回注解** | 三个运行时句柄 → 值对象（形状现在只活在 docstring 里） |
+| 12 | `turn._race` / `loop._read_user_line` | `tuple[int, value]` | **刻意例外**：select 原语（编号 + 值），§4.5 已写明 |
+| 13 | `evaluation/checks.py` 各 `check` | `tuple[bool, str]` | 与 #2 同形，一起统一 |
+| 14 | 编排工具 state 切片 / `approvals._record_to_value` 的 UI 载荷 | `dict` | **刻意例外**：LangGraph 合并语义 / 跨边界协议形状，§4.5 已写明 |
+
+**分批计划（用户 2026-09-22 决定：先记录，暂不动代码）**：
+
+1. **第一批 = 互斥载荷那 5 处（#1–#5）**——最伤：读的人得靠顺序猜哪个是错误；#5 是**复用已有值对象**、
+   几乎零成本。值对象落点：`AskCheck` / `ProbeOutcome` 这类只服务生产模块的留生产者模块
+   （`frozen dataclass`）；worker 侧直接用 `app/schema` 的 `ApprovalRequest`（`TypedDict`，跨进程形状）。
+2. **第二批 = 成组/三元组（#6–#11、#13）**——纯清爽化；#7 与 #11 分别顺手做（前者等 `compact.py`、
+   后者补返回注解时就做）。
+3. **#12 / #14 只写明例外**（§4.5 已写），不改。
+
+**相关背景**：`docs/ARCHITECTURE.md` §4.5（判据与例外）、`app/schema/approval_schema.py`
+（`ApprovalRequest` / `Decision` —— 值对象与"用结构体表达互斥"的既有范例）。
+
+## [ ] 配置的归属：`config.py` 收什么（2026-09-22 审计）
+
+**判据**（已写进 `docs/ARCHITECTURE.md` §4.3）：`config.py`（`Settings`）收"**随环境 / 部署 / 人变，
+且改它不该动代码**"的值——凭证、端点、模型名、开关、技能白名单。凡"改了要重审行为、要跟测试与
+文档"的，都是**口径**（预算 / 上限 / 超时 / 词法 / 协议标记），留代码 + 构造参量缝。
+**子进程读 `os.environ` 是运输、不是配置**：真值在 `get_settings()`，由 host 经
+`stdio_connection(extra_env)` / `skill_env` 注入。
+
+**实测分布**（2026-09-22 全仓 grep `os.environ`）：
+
+| 读取点 | 性质 | 判定 |
+| --- | --- | --- |
+| `app/platform/approvals.py:280` 读 `AGENT_INBOX_PORT` | **部署配置**（用户可换端口） | **缺口一，见下** |
+| `app/platform/mcp.py::_inbox_env` 读 `AGENT_INBOX_URL`（透传给 dispatch server） | 运行时**握手值**（收件箱起来后主侧写回 env） | 不是配置；读取点重复 3 处（+`sub_agent` / `dispatch`），可收口，登记即可 |
+| `mcp_service/file_io.py`（import 期）+ `sub_agent` + `dispatch` 读 `WORKSPACE_PATH` | 子进程启动配置 / 图构造参量 | 不是配置（刻意不走 `.env`）；但**四处"取 env + resolve + 存在性校验 + 同文案报错"是真重复**（见本文件「减法审计遗留」条） |
+| `mcp_service/web_search.py` / `skills/github/server.py` 读 `TAVILY_API_KEY` / `GITHUB_TOKEN` | 子进程侧运输 | ✓ 正确形态（值由 config 取出、经 env 注入） |
+| `.env.example` 里的 `LANGCHAIN_*` / `LANGSMITH_*` | 第三方库自己读 `os.environ` | **写进 `.env` 不生效**，见缺口二 |
+
+**缺口一：`AGENT_INBOX_PORT` 的承诺未兑现（真 bug 级）。—— ✅ 已修（2026-09-22）** `CLAUDE.md` 与 `docs/MULTI_AGENT.md`
+都写着"主侧可 `AGENT_INBOX_PORT` 覆盖"，但它读的是 `os.environ`——而 `pydantic-settings` 读 `.env`
+**不会**把值注入 `os.environ`（这条坑就写在 `config.py` 自己的 docstring 里）。**后果：用户按惯例
+写进 `.env` 的端口被静默忽略，只有 shell 里 export 才生效。**
+**修法（已落地）**：`AGENT_INBOX_PORT: int = DEFAULT_INBOX_PORT` 进 `Settings`（可选键、带默认——
+默认值仍取自 `schema` 那份共用常量，主侧/worker 不会漂）；`ApprovalInboxServer` 改从 `get_settings()`
+取，且**显式给了端口就不读配置**（保持 `ApprovalInboxServer(port=0)` 这类调用不需要 .env）。
+走 Settings 后 **`.env` 与 shell env 都生效**（shell env 优先级更高）。
+**实测两条**（2026-09-22）：① `Settings` 里 `int` 键写空值（`AGENT_INBOX_PORT=`）→ **ValidationError**，
+所以 `.env.example` 里这一行是**注释掉的**（要用才取消注释），不是留空；② `.env` 里的键确实
+**不会**进 `os.environ`（`CHAT_MODEL_NAME` / `TAVILY_API_KEY` / `LANGSMITH_PROJECT` 实测皆 False）。
+**测试**：`tests/test_approval_inbox.py` 两条——`Settings.model_fields["AGENT_INBOX_PORT"].default`
+钉"默认值 = 共用常量"（不实例化 Settings，该文件仍无需 .env）、`test_port_comes_from_settings_not_os_environ`
+钉"真值只有 Settings 一个出口"（打桩 `get_settings`，并断言 `os.environ` 同名键不再被读）。
+
+**缺口二：`LANGCHAIN_*` / `LANGSMITH_*` 写进 `.env` 同样不生效**——同一根因。两条路：
+(a) 文档写明"**由 `os.environ` 读的键（`AGENT_*`、第三方库键）只认 shell env**"（最小代价）；
+(b) 入口用 `dotenv_values` 把 `.env` 一次性灌进 `os.environ`（能一并修好所有第三方键；
+代价是改变"哪些键在哪里可见"的心智模型——子进程 env 是替换制，不受影响）。
+**2026-09-22 走了 (a) 的一半**：`README` 的 `.env` 小节、`.env.example` 的 LangSmith 段、
+`CLAUDE.md` 都写明了这条（哪些键只认 shell env）；**(b) 仍未拍板**——真要做就是在 `app/main.py`
+入口灌一次，届时把这段升级成机制。
+
+**缺口三：`GITHUB_API_URL`（指向 GitHub Enterprise）不是漏了，是已知未做**——
+`docs/SKILL_DESIGN.md` §13.5 末记着：技能 env 机制只有"声明了就必须非空"这一种，声明它反而会让
+默认（官方 API）路径加载不上。要让用户真能指 GHE，得先给机制加"**可选键 + 默认值**"。在此之前它
+是**测试缝**（E2E 用它把请求指到本地桩）。
+
+**相关背景**：`docs/ARCHITECTURE.md` §4.3（判据）、`app/config.py`（`Settings` + `SKILL_ENV_WHITELIST`）、
+本文件「减法审计遗留」条（`WORKSPACE_PATH` 的四处重复）。
+
 ## [ ] 运行中转向：用户消息队列（输入不等整轮结束才递进）（2026-09-19）
 
 **场景**：用户给 agent 派了任务、指了 A 方向，agent 已开跑；跑到一半用户发现 A 不合意图、
@@ -1264,6 +1452,17 @@ turn，处置（未找到 / 过大>5MB / 超 4 张 / 读取失败）写进正文
   在 `mcp_service/file_io.py`（import 期校验）与 `app/platform/mcp.py::_validate_workspace`（构图期）
   各一份。抽到 `mcp_service/utils.py` 前先想清楚：file_io 那份是 **import 期**触发的，搬过去会
   把"import 即校验"也一起搬走——要么只抽纯函数（校验时机留在各调用点），要么显式拍板改时机。
+
+**2026-09-22 追加（路径名已收束，这条是剩下的那一半）**：路径的资源清单、基准与落点**已经**全部
+收进 `app/resource/paths.py`（规定见 docs/ARCHITECTURE.md §4.4；`Path(__file__)` 现在只许出现在
+白名单里，`tests/test_resource.py` 末尾有用例守着）。**没做的是"工作区是从哪来的 + 校验"**——
+现在有 5 个形近函数：`app/agent/graph.py::_resolve_workspace`（参量 / 默认 tmp）、
+`app/platform/mcp.py::{_normalize_workspace, _validate_workspace}`（归一 / 构图期校验）、
+`mcp_service/{sub_agent,dispatch}::_resolve_workspace`（env）、`app/tui/runner.py::resolve_tui_workspace`
+（cwd）、`mcp_service/file_io.py`（import 期 env）。**它们语义真的各不相同**（来源分别是参量 / cwd /
+env，时机分别是 import 期 / 构图期 / 调用期），所以不能一刀切合并——可共用的只有"归一化 +
+存在性校验 + 同文案报错"那一段，且 file_io 那份的**时机**（import 即校验）搬走就会变。真要动就
+按上面那条的原则来：**只抽纯函数，校验时机留各调用点**。
 - **小冗余**：`mcp_service/file_io.py:699-700` 的 `ext_set` 两次赋值可合一
   （`(e if e.startswith(".") else f".{e}").lower()` 一次到位）。
 - **远端 GBK**：`skills/github/server.py::github_file_read` 只做了二进制那半防线（NUL 探测），

@@ -7,7 +7,8 @@
 `import app.agent.nodes` 会经包 `__init__`（→ graph → model）触发 `get_settings()`，需 .env
 存在（CLAUDE.md 前提）。
 """
-from app.resource.profile import AGENT_MD_FILENAME, agent_md_block
+from app.resource.paths import AGENT_MD_FILENAME
+from app.resource.profile import agent_md_block
 
 
 def test_agent_md_filename_is_workspace_root_agent_md():

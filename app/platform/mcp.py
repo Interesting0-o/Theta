@@ -72,11 +72,12 @@ from mcp.shared.exceptions import McpError
 
 from app.config import get_settings
 from app.exception import ConfigError
+from app.resource.paths import PROJECT_ROOT
 from app.schema.agent_schema import MCPToolSpec
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+# 项目根归 app/resource/paths.py（同一份真值；本模块借名字，别自算）
 
 # "运行体坏了"的异常类型：命中即由 owner 关掉当前会话、重建、重试一次（见 _ServerWorker._invoke）。
 # 业务错误**不在**此列——mcp_service 的 guard 把工具失败收成普通返回值（ToolResult），

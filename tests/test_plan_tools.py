@@ -8,6 +8,8 @@
 注意：import app.agent.tools 会触发 app/agent/__init__ → graph → model 及
 模块顶层 get_settings()/TavilySearch()，要求 .env 存在（CLAUDE.md 前提）。
 """
+from pathlib import Path
+
 from app.agent.tools import clear_plan, create_plan, update_plan_step
 
 
@@ -73,3 +75,37 @@ def test_clear_plan_returns_empty():
     out = _call(clear_plan, {"current_plan": _plan(["a"])}, "c3")
     assert out["current_plan"] == []
     assert "已清空全部计划" in _message(out)
+
+
+def test_orchestrate_tools_only_return_declared_slice_keys():
+    """**契约用例**：编排工具返回的切片键必须都被 OrchestrateNode 认。
+
+    背景（`nodes.py::_EXTRA_SLICE_KEYS` 上方那段）：执行器只合并 `messages` / `current_plan` /
+    `_EXTRA_SLICE_KEYS` 里列的键，**白名单之外的键一律静默丢弃**。而生产者（本模块的各编排工具）
+    并不 import 那张白名单——所以"工具开始返回一个新切片、或白名单被删掉一项"的症状是**静默失效**
+    （回执正常、state 没生效）。这条用例把两侧钉在一起：扫 `app/agent/tools.py` 里所有
+    `return {…}` 的键，断言它们 ⊆ 白名单。
+
+    用 AST 扫而不是真调用工具：真调用要造 state / workspace / 真技能目录，而这里要守的是**形状**
+    （键名），不是行为——行为另有各工具的用例。
+    """
+    import ast
+
+    from app.agent.nodes import _EXTRA_SLICE_KEYS
+
+    tools_py = Path(__file__).resolve().parents[1] / "app" / "agent" / "tools.py"
+    tree = ast.parse(tools_py.read_text(encoding="utf-8"))
+    returned: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
+            returned |= {
+                key.value
+                for key in node.value.keys
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+
+    allowed = {"messages", "current_plan", *_EXTRA_SLICE_KEYS}
+    assert returned <= allowed, (
+        f"工具有返回白名单之外的切片键 {sorted(returned - allowed)}——"
+        f"要么改 _EXTRA_SLICE_KEYS（+ state.py），要么那是个写错的键"
+    )

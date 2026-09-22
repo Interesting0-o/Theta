@@ -20,7 +20,7 @@ worker 只有**项目画像与长期记忆两样**不注入（`inject_session_co
 loaded_skills 天然为空，所以一样不会出现。
 见 app/agent/nodes.py::LLMNode.__call__。
 """
-from pathlib import Path
+from app.resource.paths import HANDOFF_MD_FILENAME, handoff_md_path
 
 SYSTEM_PROMPT = """\
 你是 Theta——一个运行在 LangGraph 状态机上的编码助手智能体。你会被逐轮推进：
@@ -325,10 +325,9 @@ def workspace_context_block(workspace_path: str) -> str:
     )
 
 
-# 工作区根的交接材料文件名（project-handoff 技能的保存落点，见 skills/project-handoff/SKILL.md）
-HANDOFF_MD_FILENAME = "HANDOFF.md"
-
-_HANDOFF_POINTER_HEADER = "# 交接材料（工作区根 HANDOFF.md）\n\n"
+# 交接材料的文件名与落点都归 app/resource/paths.py（project-handoff 技能的保存落点，见
+# skills/project-handoff/SKILL.md）；这里只渲染指针块。
+_HANDOFF_POINTER_HEADER = f"# 交接材料（工作区根 {HANDOFF_MD_FILENAME}）\n\n"
 
 
 def handoff_pointer_block(workspace_path: str) -> str:
@@ -339,7 +338,7 @@ def handoff_pointer_block(workspace_path: str) -> str:
     新会话由此知道"有交接可接"；这正是 project-handoff 技能"提醒 → 保存 → 接续"
     三步里"接续"的入口。调用方：LLMNode 每轮 to_thread 里跑（blockbuster 不拦线程内阻塞）。
     """
-    if not (Path(workspace_path) / HANDOFF_MD_FILENAME).is_file():
+    if not handoff_md_path(workspace_path).is_file():
         return ""
     return (
         _HANDOFF_POINTER_HEADER

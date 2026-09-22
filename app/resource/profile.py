@@ -14,13 +14,11 @@ docs/ARCHITECTURE.md §4 的 A/B/C：读 agent 之外的文件、转成内部表
 """
 from __future__ import annotations
 
-from pathlib import Path
+from app.config import TEXT_BUDGET_CHARS
+from app.resource.paths import agent_md_path
 
-# 工作区根的项目画像文件名（`/init` 命令生成的就是它；与 file_io 沙箱同一根）
-AGENT_MD_FILENAME = "AGENT.md"
-
-# 画像注入上限（与 memory.py::MEMORY_INJECT_CAP 同量级）：超长只截断、不做压缩/摘要
-AGENT_MD_INJECT_CAP = 8000
+# 画像注入上限：超长只截断、不做压缩/摘要。值归 app/config.py::TEXT_BUDGET_CHARS（同族一处出处）。
+AGENT_MD_INJECT_CAP = TEXT_BUDGET_CHARS
 
 # 注入块标题：AGENT.md 由模型/人自由撰写，加一行标题让模型知道这段是什么
 PROFILE_BLOCK_HEADER = "# 项目画像（工作区 AGENT.md）\n\n"
@@ -31,7 +29,7 @@ def agent_md_block(workspace_path: str, cap: int = AGENT_MD_INJECT_CAP) -> str:
 
     超 `cap` 截断并附一行提示——画像本应精简，截断只是兜底。
     """
-    path = Path(workspace_path) / AGENT_MD_FILENAME
+    path = agent_md_path(workspace_path)  # 落点归 paths，别在这里拼（见 paths.py 的"规定"）
     if not path.is_file():
         return ""
     text = path.read_text(encoding="utf-8").strip()
