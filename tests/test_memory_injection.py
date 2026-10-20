@@ -48,6 +48,15 @@ def _system_contents(model) -> list[str]:
     return [m.content for m in model.seen if isinstance(m, SystemMessage)]
 
 
+def _human_contents(model) -> list[str]:
+    return [m.content for m in model.seen if isinstance(m, HumanMessage)]
+
+
+def _runtime_text(model) -> str:
+    """当前 user message 尾部内联的 RUNTIME_STATE 文本。"""
+    return _human_contents(model)[-1]
+
+
 def _write_profile(ws: str, text: str) -> None:
     """在工作区根写下 AGENT.md（工作区目录本身此前通常并不存在）。"""
     path = Path(ws) / "AGENT.md"
@@ -81,12 +90,15 @@ def test_main_llm_node_injects_memory_last(tmp_path, monkeypatch):
 
     out = asyncio.run(node(state))
 
-    assert out["messages"] == [model.reply]  # 只把模型回复写回 state
-    assert [type(m) for m in model.seen].count(SystemMessage) >= 3  # 契约 + 工作区 + 记忆
-    assert isinstance(model.seen[-1], HumanMessage)  # 系统消息只在头部，用户话在最后
-    contents = _system_contents(model)
-    # 记忆块带内容、且拼在系统消息最后（§4 的拼装顺序）
-    assert contents[-1].startswith("# 长期记忆") and "传输定案 stdio" in contents[-1]
+    # Human 没有 id（直接驱动单测）→ 只改请求副本，不写回 state
+    assert out["messages"] == [model.reply]
+    assert [type(m) for m in model.seen].count(SystemMessage) == 2  # 契约 + 工作区
+    assert isinstance(model.seen[-1], HumanMessage)  # 用户话在最后
+    human = _runtime_text(model)
+    # 记忆块带内容，内联在 user message 尾部（动态状态不再进系统前缀）
+    assert "<RUNTIME_STATE" in human
+    assert "# 长期记忆" in human and "传输定案 stdio" in human
+    assert not any(c.startswith("# 长期记忆") for c in _system_contents(model))
     assert len(state["messages"]) == 1  # state 未被注入的系统消息污染
 
 
@@ -102,6 +114,7 @@ def test_llm_node_skips_session_context_when_disabled(tmp_path, monkeypatch):
     contents = _system_contents(model)
     assert not any(c.startswith("# 长期记忆") for c in contents)
     assert not any(c.startswith("# 项目画像") for c in contents)
+    assert "# 长期记忆" not in _runtime_text(model)  # 动态块也不带记忆
 
 
 def test_llm_node_skips_memory_when_no_entries(tmp_path, monkeypatch):
@@ -112,10 +125,11 @@ def test_llm_node_skips_memory_when_no_entries(tmp_path, monkeypatch):
     asyncio.run(LLMNode(model=model, workspace_path=ws)({"messages": [HumanMessage(content="hi")]}))
 
     assert not any(c.startswith("# 长期记忆") for c in _system_contents(model))
+    assert "# 长期记忆" not in _runtime_text(model)
 
 
 def test_main_llm_node_injects_profile_before_memory(tmp_path, monkeypatch):
-    """项目画像拼在记忆**之前**（§4 顺序：… → 计划 → 项目画像 → 长期记忆）。"""
+    """画像留在稳定前缀；记忆进 user message 尾部的动态块。"""
     ws = _seed(tmp_path, monkeypatch)
     _write_profile(ws, "# Theta\n\nLangGraph 编码助手，工作区沙箱。")
     model = _CaptureModel()
@@ -123,9 +137,12 @@ def test_main_llm_node_injects_profile_before_memory(tmp_path, monkeypatch):
     asyncio.run(LLMNode(model=model, workspace_path=ws)({"messages": [HumanMessage(content="hi")]}))
 
     contents = _system_contents(model)
-    assert contents[-2].startswith("# 项目画像")  # 画像在前
-    assert "LangGraph 编码助手" in contents[-2]
-    assert contents[-1].startswith("# 长期记忆")  # 记忆在后
+    assert contents[-1].startswith("# 项目画像")  # 画像仍是最后一条稳定系统消息
+    assert "LangGraph 编码助手" in contents[-1]
+
+    human = _runtime_text(model)
+    assert "# 长期记忆" in human and "传输定案 stdio" in human
+    assert "# 项目画像" not in human  # 画像不重复进动态块
 
 
 def test_profile_read_once_per_node_instance(tmp_path, monkeypatch):
@@ -170,7 +187,7 @@ def test_worker_graph_builds_llm_node_without_context(monkeypatch):
 
 
 def test_main_llm_node_injects_loaded_skills_last(tmp_path, monkeypatch, skills_dir):
-    """已加载技能的正文进系统提示，拼在画像/记忆**之后**，抬头列出已加载清单。"""
+    """已加载技能正文进 user message 尾部的动态块，抬头列出已加载清单。"""
     ws = _seed(tmp_path, monkeypatch)
     _write_skill(skills_dir, "demo", "纪律正文：推送前先开分支")
     model = _CaptureModel()
@@ -181,10 +198,11 @@ def test_main_llm_node_injects_loaded_skills_last(tmp_path, monkeypatch, skills_
         )
     )
 
-    contents = _system_contents(model)
-    assert contents[-1].startswith("# 已加载技能")  # 拼在最后
-    assert "推送前先开分支" in contents[-1]
-    assert "当前已加载：demo" in contents[-1]  # 抬头——模型据此决定卸哪个（§3.5）
+    human = _runtime_text(model)
+    assert "# 已加载技能" in human
+    assert "推送前先开分支" in human
+    assert "当前已加载：demo" in human  # 抬头——模型据此决定卸哪个（§3.5）
+    assert not any(c.startswith("# 已加载技能") for c in _system_contents(model))
 
 
 def test_llm_node_skips_skills_when_none_loaded(tmp_path, monkeypatch, skills_dir):
@@ -196,6 +214,7 @@ def test_llm_node_skips_skills_when_none_loaded(tmp_path, monkeypatch, skills_di
     asyncio.run(LLMNode(model=model, workspace_path=ws)({"messages": [HumanMessage(content="hi")]}))
 
     assert not any(c.startswith("# 已加载技能") for c in _system_contents(model))
+    assert "# 已加载技能" not in _runtime_text(model)
 
 
 def test_skill_block_is_independent_of_session_context(tmp_path, monkeypatch, skills_dir):
@@ -217,4 +236,5 @@ def test_skill_block_is_independent_of_session_context(tmp_path, monkeypatch, sk
 
     contents = _system_contents(model)
     assert not any(c.startswith("# 项目画像") for c in contents)  # 画像照旧不注入
-    assert any(c.startswith("# 已加载技能") for c in contents)  # 技能照旧注入
+    assert "# 已加载技能" in _runtime_text(model)  # 技能照旧进动态块
+    assert "纪律正文" in _runtime_text(model)

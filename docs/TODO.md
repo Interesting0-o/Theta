@@ -4,6 +4,63 @@
 > 每条记录动机/现状，避免"当初为什么没做"再次翻车；勾掉前应能指到验证它的提交。
 > **已完成的条目移入 [docs/DONE.md](DONE.md)**（原文留档）；本文件只留未完成与进行中（`[~]`）。
 
+## [~] 上下文前缀缓存 + 低频 checkpoint（2026-10-20 开工）
+
+**动机（实测）**：当前 `CompactNode` 每轮末把摘要原位插回被删块的位置，等于每轮改写上一轮工具段；
+`LLMNode` 又把 plan / memory / skills / handoff 放在请求最前面的 SystemMessage 里。provider 的自动
+prefix cache 按前缀匹配（实测按 64 token 块）：改前缀开头 → `cache_read=0`；改中段早处 → 命中从改动点
+断开（31,616 → 25,984）；只改尾部 → 命中保持（31,616）。所以现状会让工具重的轮次反复重算上一轮最贵的
+部分，动态状态一更新又会打碎全部历史。
+
+**定案**：
+
+- **主路径**：把动态状态内联到**当前 user message 尾部**的 `<RUNTIME_STATE>` 块；尾部 SystemMessage
+  只作备选（实测 Human 后、真实 ToolMessage 后都被接受，thinking on 也 OK；但 inline 兼容面最大、
+  更容易解释“不是用户新需求”）。
+- **稳定前缀**：`SYSTEM_PROMPT` + 工作区上下文 + 项目画像（memo）+ 工具 schema。
+- **低频 checkpoint**：不在每轮末折；按“实际 usage token + 有效预算 + cache 经济学”触发，只在 turn
+  边界执行；一次吸收早于 recent K 的 fold summary、工具块、过期动态状态，保留最近 K 轮原文。
+- **双层压缩**：
+  - 确定性 event log：每个 tool_call 一行（状态戳 / 路径或 URL / 命令哈希 / error_type / 审批结果），
+    无上限落盘；上下文只放最近必要部分；
+  - 低频 LLM digest：只在 checkpoint 生成，字段 goal / hard_constraints / user_choices / facts /
+    decisions / open_questions / next / pointers；上下文放 digest + 关键事实表 + 指针索引。
+- **checkpoint 元数据**：`summary_version` + `covers_until_message_id`（另可加 event seq 范围、
+  recent window 起点、digest 状态）。
+- **ask_user 硬保证**：回答不能只因轮末折叠消失——至少落在“最近 K 轮原文 / checkpoint 的
+  user_choices / 持久 state”之一。当前计划 + 变更原因 + 被用户否掉的方案要留；历史计划快照可丢。
+- **阈值**：不使用 1M 窗口反推，也不用 60K 字符；用每次调用的 `usage.input_tokens` 与
+  `prompt_cache_hit_tokens / prompt_cache_miss_tokens` 实测，按成本/延迟目标定有效预算。
+
+**Phase 1（已完成 2026-10-20）**：动态状态迁到 inline RUNTIME_STATE + cache/token 日志；稳定系统
+前缀只留 SYSTEM_PROMPT / 工作区 / 画像；保留行为等价（plan / memory / handoff / skills 仍每轮可见）。
+`LLMNode` 在 Human 有 id 时把内联后的消息写回 state（按标记替换、去重），无 Human / 多模态 content
+时退回尾部 SystemMessage。全量 **671 passed / 7 skipped**；真实模型三轮 `llm_usage`：
+`input=12088 cache_read=0` → `input=12147 cache_read=11904` → `input=12206 cache_read=12032`，
+h1 里只保留一个 `<RUNTIME_STATE>` 块。⚠️ `SYSTEM_PROMPT` 改了，evaluation 层 A 的
+fixtures 已陈旧，跑评估前需 `--record`（或 `--live`）重录。
+
+**Phase 2（已完成 2026-10-20）**：确定性 event log 落在
+`resource/<ws_key>/sessions/<sid>/event_log.jsonl`（`app/resource/event_log.py`），每个
+tool_call 一行：`event_id / ts / session_id / tool_call_id / tool / target / args_hash /
+status / error_type / approval / content_chars / summary_version`（后者暂为 None）。
+写入点：`ToolNode`（执行成功/失败/未知工具）、`ReviewNode`（denied / unknown / invalid_ask）、
+`OrchestrateNode`（编排工具）；`_approval` 由 ReviewNode 下传（approved / not_required）。
+新增只读工具 `read_event_log(tool?, limit?)`（source=`events`，tool.json + ORCHESTRATE_SOURCES +
+静态工具表 + 提示词总览），默认最近 50 条、硬上限 200；模型按需读，上下文只放指针。
+全量 **684 passed / 7 skipped**。已知边界：worker 内部工具调用不进主会话 event log，只记
+`dispatch_subtasks` 这一条；`ask_user` 回答的用户选择仍待 Phase 4 的 user_choices；
+`read_events` 目前顺序扫描全文件（limit 用 deque 截尾），日志很大时后续改成从文件尾倒读/索引。
+
+**Phase 3（未开始）**：checkpoint 触发器 + 吸收旧 summary/工具块/过期动态状态 + recent K +
+`summary_version` / `covers_until_message_id`；LLM digest + 确定性 fallback。
+
+**Phase 4（未开始）**：`user_choices` 持久 state；计划变更原因 / 被否方案进 event log + digest。
+
+**待定**：event log 落点（resource 会话域 vs 工作区 `.theta/`）与读取工具；digest 的 schema/校验/
+失败回退；软/硬阈值与 recent K 的具体值；RUNTIME_STATE 是否每轮内联全量 memory/skills；轮内动态
+状态变化是否用尾部 SystemMessage 补 delta。
+
 ## [~] 枚举 / 标签的真相在哪（2026-09-22 审计；第一批已落地，四项未做）
 
 **判据已落纸**（`docs/ARCHITECTURE.md` §4.6）：一个词表只有一份真相，落在"谁定义这个词"的那一侧——

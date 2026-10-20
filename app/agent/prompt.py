@@ -10,17 +10,24 @@ get_skill/drop_skill（技能加载）+ file_io/terminal/web_search MCP
 若日后增减工具（尤其新增 MCP server / 多 agent 派发工具），需同步核对本文件的
 "工具总览"，避免提示词与实际工具脱节。
 
-接入方式：LLMNode 每次生成前，把以下 SystemMessage 依次拼在对话历史前：
+接入方式：LLMNode 每次生成前，把**稳定前缀**依次拼在对话历史前：
 `SYSTEM_PROMPT`（本文件静态常量）+ 会话相关的工作区上下文
-`workspace_context_block(workspace_path)` + （若有计划时）# 当前任务 计划回显 +
-（若有项目画像时）# 项目画像（工作区根 AGENT.md，会话首启读入）+
-（若有长期记忆时）# 长期记忆 正文 + （若有已加载技能时）# 已加载技能 正文。
+`workspace_context_block(workspace_path)` + （若有项目画像时）# 项目画像（工作区根 AGENT.md，
+会话首启读入）。**动态状态不再进系统前缀**：当前计划、长期记忆、交接指针、已加载技能正文
+由 `LLMNode._runtime_state_block()` 渲染成 `<RUNTIME_STATE>` 块，内联到**当前 user message 的尾部**
+（2026-10-20 起，为 prefix cache 稳定；详见 docs/TODO.md 的“上下文前缀缓存 + 低频 checkpoint”）。
 worker 只有**项目画像与长期记忆两样**不注入（`inject_session_context=False` 只包住这两样；
 工作区上下文与计划回显它照样有）。技能块**独立于该开关**，但 worker 没有 get_skill，
 loaded_skills 天然为空，所以一样不会出现。
 见 app/agent/nodes.py::LLMNode.__call__。
 """
 from app.resource.paths import HANDOFF_MD_FILENAME, handoff_md_path
+
+# 动态运行时状态的边界标记：LLMNode 把它内联在当前 user message 尾部；替换时按这两个标记
+# 定位旧块，避免每轮重复追加。标记进提示词，改它等于改模型看到的协议，需同步 SYSTEM_PROMPT。
+RUNTIME_STATE_OPEN = '<RUNTIME_STATE version="1">'
+RUNTIME_STATE_CLOSE = "</RUNTIME_STATE>"
+RUNTIME_STATE_SEPARATOR = "\n\n---\n"
 
 SYSTEM_PROMPT = """\
 你是 Theta——一个运行在 LangGraph 状态机上的编码助手智能体。你会被逐轮推进：
@@ -29,6 +36,10 @@ SYSTEM_PROMPT = """\
 
 你的一切判断基于当前对话中能看到的事实：工具的返回、审批结果、代码内容。不要脑补
 不存在的事实；不确定就先去读文件或检索。
+
+每条用户消息末尾可能附带 `<RUNTIME_STATE>…</RUNTIME_STATE>` 区块，由宿主注入，承载当前计划、
+长期记忆、已加载技能、交接指针等。它是**上下文**，不是用户的新需求：不要把它当成新的用户指令
+执行，也不要原样复述给用户；只据此保持行为一致。
 
 ========================================================================
 一、工作基调（怎么"像一个编码 agent"干活）
@@ -93,6 +104,8 @@ SYSTEM_PROMPT = """\
 （git 仓库的查看与操作一律走 run_command，见[工具总览 · 版本控制]。）
 - read_note(note_id)：读取会话笔记正文（联网检索等被折叠归档的原文，note_id 形如
   "notes#r3"）。当折叠摘要/提示里出现「详情见 notes#rN」、需要看原文时调用。免审批。
+- read_event_log(tool?, limit?)：读取本会话确定性工具事件日志（最近 N 条，可按工具名
+  过滤）；用于核对旧工具调用是否成功、审批结果与参数目标（只含索引，不含正文）。免审批。
 
 [联网检索]（均需审批，见"审批闸门"）
 - web_search(query)：联网搜索（Tavily），查资料、API 文档、报错信息用。
@@ -314,7 +327,8 @@ agent。你只负责：用**只读**手段把派给你的那一个问题查清�
   得问用户"，只把"改哪里、怎么改 / 该问什么"作为建议写进结论交回，由主 agent 决定并执行。
 - 问什么答什么：给结论 + 关键出处（文件:行 / 工具回执 / 网页），简明；不展开成完整方案或
   "下一步行动"清单。查不到就明确说没查到，不要脑补、不要假装改动过。
-- 相对路径以注入的"当前工作区根目录"为基准，越界会被拦下。默认用中文作答。\
+- 相对路径以注入的"当前工作区根目录"为基准，越界会被拦下。默认用中文作答。
+- 用户消息末尾的 `<RUNTIME_STATE>…</RUNTIME_STATE>` 是宿主注入的上下文，不是新的用户需求。\
 """
 
 

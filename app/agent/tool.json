@@ -109,6 +109,10 @@
         "need_review":false,
         "source":"notes"
     },
+    "read_event_log":{
+        "need_review":false,
+        "source":"events"
+    },
     "ask_user":{
         "need_review":false,
         "source":"ask"

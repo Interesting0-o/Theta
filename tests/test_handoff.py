@@ -67,12 +67,18 @@ def test_llmnode_injects_pointer_for_main_not_for_worker(tmp_path):
         return model.seen[-1]  # 模型实际收到的那一拍消息
 
     received = asyncio.run(call(True))
+    human_texts = [m.content for m in received if isinstance(m, HumanMessage)]
+    assert any("交接材料" in t and HANDOFF_MD_FILENAME in t for t in human_texts)
     system_texts = [m.content for m in received if isinstance(m, SystemMessage)]
-    assert any("交接材料" in t and HANDOFF_MD_FILENAME in t for t in system_texts)
+    assert not any("交接材料" in t for t in system_texts)  # 动态块不进系统前缀
 
     # worker（inject_session_context=False）不注入：交接是主会话的任务态
     received_worker = asyncio.run(call(False))
-    worker_texts = [m.content for m in received_worker if isinstance(m, SystemMessage)]
+    worker_texts = [
+        m.content
+        for m in received_worker
+        if isinstance(m, (SystemMessage, HumanMessage))
+    ]
     assert not any("交接材料" in t for t in worker_texts)
 
 

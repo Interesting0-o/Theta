@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage
 from app.agent.state import AgentState
 from app.agent.nodes import (
     CompactNode,
+    CompressNode,
     LLMNode,
     OrchestrateNode,
     QueueNode,
@@ -23,6 +24,7 @@ from app.agent.tools import (
     note_tools,
     ask_tool,
     memory_tool,
+    event_tool,
     skill_tools_for,
 )
 
@@ -98,7 +100,9 @@ async def get_main_agent_graph(
     # 技能目录在**构图期**烤进 get_skill 的 docstring（§3.2）——装技能是低频事件，
     # "扫一次、重开会话生效"够用（同 AGENT.md 的实例内 memo）。
     skill_tools = skill_tools_for()
-    static_tools = orchestrate_tool + note_tools + ask_tool + memory_tool + skill_tools
+    static_tools = (
+        orchestrate_tool + note_tools + ask_tool + memory_tool + event_tool + skill_tools
+    )
 
     # 动态工具集（§13.4）：技能加载/卸载会改工具表，三个节点共用这一份接线——技能对账
     # （state 说加载了、运行体没有 → 重建）也在它里面。
@@ -126,6 +130,8 @@ async def get_main_agent_graph(
     graph.add_node("tool_node", ToolNode(toolset=toolset))  # type: ignore
     compact_node = CompactNode()
     graph.add_node("compact_node", compact_node)
+    # 轮内字段压缩：工具结果已写入、下一次模型调用之前，只截断当前轮的终端 ToolMessage。
+    graph.add_node("compress_node", CompressNode())
 
     # llm 收尾路由：还有 tool_calls → 审批；已给最终答复 → 轮末压缩（**无条件**，2026-10-20
     # 起不再看字符预算；没有可折块时节点自己返回 {}）→ END。
@@ -154,13 +160,15 @@ async def get_main_agent_graph(
             END: END,
         },
     )
-    # orchestrate 先跑；有剩余普通调用则回落 tool_node，否则回模型
+    # orchestrate 先跑；有剩余普通调用则回落 tool_node，否则经轮内压缩回模型
     graph.add_conditional_edges(
         "orchestrate_node",
         should_continue_after_orchestrate,
-        {"tool_node": "tool_node", "llm_node": "llm_node"},
+        {"tool_node": "tool_node", "llm_node": "compress_node"},
     )
-    graph.add_edge("tool_node", "llm_node")
+    # 工具结果 → 轮内压缩 → 下一次模型调用
+    graph.add_edge("tool_node", "compress_node")
+    graph.add_edge("compress_node", "llm_node")
 
     return graph
 

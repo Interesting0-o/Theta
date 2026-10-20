@@ -125,6 +125,11 @@ def session_db_path(workspace_path: str, session_id: str) -> Path:
     return workspace_dir(workspace_path) / "sessions" / session_id / "agent.db"
 
 
+def session_event_log_path(workspace_path: str, session_id: str) -> Path:
+    """某 (工作区, 会话) 的确定性 event log：同会话目录下的 event_log.jsonl。"""
+    return workspace_dir(workspace_path) / "sessions" / session_id / "event_log.jsonl"
+
+
 def memory_root(workspace_path: str) -> Path:
     """某工作区的长期记忆目录（其下 memory.md=正文；建会话时在此播种模板）。"""
     return workspace_dir(workspace_path) / "memory"

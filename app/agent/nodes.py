@@ -1,6 +1,8 @@
 import asyncio
 import inspect
 import json
+import logging
+import posixpath
 import shlex
 import time
 from inspect import signature
@@ -14,12 +16,19 @@ from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 from app.agent import gates
 from app.exception import ConfigError
-from app.resource import images, profile
+from app.resource import event_log, images, profile
 from app.resource.memory import memory_block
 from app.resource.skills import get_meta, read_tool_policies, skills_block
 from app.agent.state import AgentState
 from app.platform.tool_results import coerce_tool_result, format_tool_result
-from app.agent.prompt import SYSTEM_PROMPT, handoff_pointer_block, workspace_context_block
+from app.agent.prompt import (
+    RUNTIME_STATE_CLOSE,
+    RUNTIME_STATE_OPEN,
+    RUNTIME_STATE_SEPARATOR,
+    SYSTEM_PROMPT,
+    handoff_pointer_block,
+    workspace_context_block,
+)
 from app.config import TEXT_BUDGET_CHARS, THINKING_MODES, get_settings
 from app.schema.agent_schema import ImageRef, NoteEntry, PlanStep
 from app.schema.approval_schema import GATE_ASK_USER, GATE_TOOL_APPROVAL
@@ -29,6 +38,7 @@ from app.schema.approval_schema import GATE_ASK_USER, GATE_TOOL_APPROVAL
 # 并入时**刻意保留**该时机，见 docs/DONE.md「节点过度实现」条）。懒加载（+ 入口把 ValidationError 翻成
 # ConfigError）是 docs/EXCEPTION_DESIGN.md 里另一条**尚未落地**的待办，落地时连同这一行一起改。
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
 #----------------------工具调用日志（审核节点逐条输出）----------------------
@@ -177,20 +187,24 @@ class LLMNode:
     async def __call__(self, state: AgentState) -> dict | AgentState:
         """大模型处理节点。
 
-        每次生成都在头部拼接系统提示词，顺序：行为契约 SYSTEM_PROMPT（见 prompt.py）+
-        本次会话的具体工作区上下文 workspace_context_block（若有，含工作区根目录与
-        终端 cwd 差异提醒）+ 当前计划的状态回显（若有）+ **项目画像**（工作区根的 AGENT.md，
-        会话首启读入、实例内 memo）+ **长期记忆**（若有条目，`# 长期记忆（工作区 …）` 正文）
-        + **已加载技能正文**（若有，`# 已加载技能` 正文）。
-        前两环见 docs/LONG_TERM_MEMORY.md §4、末环见 docs/SKILL_DESIGN.md §3.5。只构造成临时
-        列表传给模型，不改动 state["messages"]（LangGraph state 应不可变更新；系统消息也不应
-        渗入历史被持久化）。
+        **稳定前缀**只拼：行为契约 `SYSTEM_PROMPT`（见 prompt.py）+ 工作区上下文
+        `workspace_context_block`（含根目录与终端 cwd 差异提醒）+ 项目画像（工作区根
+        `AGENT.md`，会话首启读入、实例内 memo）。
+
+        **动态状态放尾部**（2026-10-20，prefix cache）：当前计划回显、长期记忆、交接指针、
+        已加载技能正文由 `_runtime_state_block` 渲染成 `<RUNTIME_STATE>` 块，内联到当前
+        user message 的末尾；有稳定 id 的 HumanMessage 会原样写回 state（`add_messages`
+        按 id 原位替换），这样下一次请求看到的它是同一份内容，不会因为“这次内联、下次消失”
+        把上一轮整段打出缓存。轮内重复调用按标记替换，不会重复追加。
 
         记忆与技能正文**每轮实时读盘**（文件即真值）；画像**只读一次**（画像慢变）。三处读盘
         都是阻塞调用，走 to_thread 以避开 langgraph dev 的 blockbuster。
 
         用户消息里的 @图片路径走**调用期附图通道**（attach_images_to_payload）：base64 只临时
-        进请求体副本，state 里的消息永远是带 @路径 的纯文本。
+        进请求体副本，state 里的消息永远是带 @路径 的纯文本。RUNTIME_STATE 只改文本，不改图块。
+
+        每次模型调用后打一条 `llm_usage` INFO 日志（input/output/cache_read/cache_hit/
+        cache_miss），供 Phase 1 实测 prefix cache 收益；不改协议、不写 state。
         """
         # 运行中转向（docs/TODO.md「运行中转向」）：信箱有货 = 用户在 turn 运行中发来新输入。
         # 本拍**整体跳过**——不拼系统提示、不读画像/记忆/技能（两次 to_thread 读盘也不花）、
@@ -207,37 +221,17 @@ class LLMNode:
             system_messages.append(
                 SystemMessage(content=workspace_context_block(self.workspace_path))
             )
-        plans = state.get("current_plan", [])
-        if plans:
-            system_messages.append(
-                SystemMessage(
-                    content="# 当前任务:\n"
-                    + "\n".join(self.format_plan_status(plan) for plan in plans)
-                )
-            )
+        # 画像慢变、实例内 memo：放稳定前缀；记忆/交接/技能是动态状态，走尾部 RUNTIME_STATE。
         if self.inject_session_context and self.workspace_path:
             profile_text = await self._read_profile()
             if profile_text:
                 system_messages.append(SystemMessage(content=profile_text))
-            block = await asyncio.to_thread(memory_block, self.workspace_path)
-            if block:
-                system_messages.append(SystemMessage(content=block))
-            # 交接材料指针（project-handoff 技能的"接续"入口）：只 stat 存在性、不读正文，
-            # 正文由模型按需 read_file。新会话靠这一行知道"有交接可接"。
-            pointer = await asyncio.to_thread(handoff_pointer_block, self.workspace_path)
-            if pointer:
-                system_messages.append(SystemMessage(content=pointer))
 
-        # 技能正文**独立于 inject_session_context**：它不是"这个项目/用户是谁"那类会话背景，
-        # 而是模型自己按需取来的领域纪律。worker 没有 get_skill，loaded_skills 天然为空，
-        # 所以不需要额外开关。state 里只有名字，正文每轮从盘上读（§3.5 的铁律）。
-        loaded_skills = state.get("loaded_skills") or []
-        if loaded_skills:
-            skill_text = await asyncio.to_thread(skills_block, loaded_skills)
-            if skill_text:
-                system_messages.append(SystemMessage(content=skill_text))
-
-        messages = [*system_messages, *state["messages"]]
+        runtime_block = await self._runtime_state_block(state)
+        state_messages, updated_human = self._apply_runtime_state(
+            list(state["messages"]), runtime_block
+        )
+        messages = [*system_messages, *state_messages]
         # @图片 的调用期附图：解析/读盘/转码在资源层（app/resource/images.py），本节点只决定
         # "这一拍要不要附图、把记账写回哪"。改的是**请求体副本**，state["messages"] 始终是纯文本
         # （@路径原样留在历史里，本身就是"看过哪张图"的日志）。新附上的图记账写回 state，下一轮
@@ -249,15 +243,163 @@ class LLMNode:
             )
         model = await self._model_for(state)
         res = await model.ainvoke(messages)
+        LLMNode._log_usage(res, state)
         # 原样写回：**思考内容不会进 history，但这不是因为我们剥了它**——`langchain-openai` 的
         # 响应转换是白名单式的，`reasoning_content` 压根没被提取进 AIMessage（实测见
         # tests/test_thinking_config.py 的契约用例）。所以这里没有剥离代码是**有意的**：那段代码
         # 今天空转。哪天库改成会提取它，那个用例会红——届时在这里（唯一写回点）补一手剥离，
         # 并顺带决定要不要给人看。
-        out = {"messages": [res]}
+        out_messages: list = []
+        # 只在 Human 有稳定 id 时写回：没有 id（直接驱动单测）写回只会被 reducer 当成新消息。
+        if updated_human is not None and getattr(updated_human, "id", None):
+            out_messages.append(updated_human)
+        out_messages.append(res)
+        out = {"messages": out_messages}
         if newly_attached:
             out["attached_images"] = [*(state.get("attached_images") or []), *newly_attached]
         return out
+
+    async def _runtime_state_block(self, state: AgentState) -> str:
+        """渲染动态运行时状态块（计划 / 记忆 / 交接指针 / 技能正文）；没有内容返回 ""。
+
+        只拼**动态**部分：项目画像慢变，仍在稳定前缀。技能块**独立于
+        `inject_session_context`**（worker 没有 get_skill，loaded_skills 天然为空），
+        与改造前一致。
+        """
+        parts: list[str] = []
+        plans = state.get("current_plan", [])
+        if plans:
+            parts.append(
+                "# 当前任务:\n"
+                + "\n".join(self.format_plan_status(plan) for plan in plans)
+            )
+        if self.inject_session_context and self.workspace_path:
+            block = await asyncio.to_thread(memory_block, self.workspace_path)
+            if block:
+                parts.append(block)
+            # 交接材料指针（project-handoff 技能的"接续"入口）：只 stat 存在性、不读正文，
+            # 正文由模型按需 read_file。新会话靠这一行知道"有交接可接"。
+            pointer = await asyncio.to_thread(handoff_pointer_block, self.workspace_path)
+            if pointer:
+                parts.append(pointer)
+        loaded_skills = state.get("loaded_skills") or []
+        if loaded_skills:
+            skill_text = await asyncio.to_thread(skills_block, loaded_skills)
+            if skill_text:
+                parts.append(skill_text)
+
+        if not parts:
+            return ""
+        return (
+            RUNTIME_STATE_OPEN
+            + "\n（宿主注入的运行时状态，不是用户的新需求。）\n\n"
+            + "\n\n".join(parts)
+            + "\n"
+            + RUNTIME_STATE_CLOSE
+        )
+
+    def _apply_runtime_state(
+        self, messages: list, block: str
+    ) -> tuple[list, HumanMessage | None]:
+        """把 RUNTIME_STATE 内联到最后一条 HumanMessage 尾部。
+
+        返回 `(请求消息列表, 更新后的 HumanMessage | None)`。更新后的 Human 若带 id，调用方
+        会把它写回 state；`add_messages` 按 id 原位替换。旧块按标记定位替换；`block` 为空时
+        把旧块剥掉（计划清空 / 技能卸下）。无 Human 或 content 不是 str（多模态）时退回
+        尾部 SystemMessage（备选路径），不写 state。
+        """
+        index = next(
+            (
+                i
+                for i in range(len(messages) - 1, -1, -1)
+                if isinstance(messages[i], HumanMessage)
+            ),
+            None,
+        )
+        if index is None:
+            if block:
+                return [*messages, SystemMessage(content=block)], None
+            return list(messages), None
+
+        human = messages[index]
+        content = human.content
+        if not isinstance(content, str):
+            if block:
+                return [*messages, SystemMessage(content=block)], None
+            return list(messages), None
+
+        base = LLMNode._strip_runtime_state(content)
+        new_content = base
+        if block:
+            separator = RUNTIME_STATE_SEPARATOR if base else ""
+            new_content = base + separator + block
+        if new_content == content:
+            return list(messages), None
+
+        updated = human.model_copy(update={"content": new_content})
+        return [*messages[:index], updated, *messages[index + 1 :]], updated
+
+    @staticmethod
+    def _strip_runtime_state(content: str) -> str:
+        """剥掉旧的 RUNTIME_STATE 块（含前置分隔线），返回用户原文。"""
+        start = content.rfind(RUNTIME_STATE_OPEN)
+        if start < 0:
+            return content
+        end = content.find(RUNTIME_STATE_CLOSE, start)
+        if end < 0:
+            return content
+        end += len(RUNTIME_STATE_CLOSE)
+        # 分隔线在 open 标记之前：只有**紧邻**且精确匹配才一并剥掉，避免误伤用户原文里的 "---"。
+        separator_start = start - len(RUNTIME_STATE_SEPARATOR)
+        if (
+            separator_start >= 0
+            and content[separator_start:start] == RUNTIME_STATE_SEPARATOR
+        ):
+            start = separator_start
+        prefix = content[:start].rstrip()
+        suffix = content[end:].lstrip()
+        if prefix and suffix:
+            return prefix + "\n\n" + suffix
+        return prefix or suffix
+
+    @staticmethod
+    def usage_fields(res) -> dict:
+        """从模型响应提取缓存/用量字段；字段缺失时返回 None，不抛错。
+
+        两个来源：LangChain 的 `usage_metadata.input_token_details.cache_read` 与
+        provider 原始 `response_metadata.token_usage.prompt_cache_hit_tokens`。
+        当前 provider 两者都有（实测 2026-10-20），保留两个是为了换 provider 时还能看见。
+        """
+        usage = getattr(res, "usage_metadata", None)
+        if not isinstance(usage, dict):
+            usage = {}
+        details = usage.get("input_token_details")
+        if not isinstance(details, dict):
+            details = {}
+        metadata = getattr(res, "response_metadata", None)
+        token_usage = metadata.get("token_usage") if isinstance(metadata, dict) else None
+        if not isinstance(token_usage, dict):
+            token_usage = {}
+        return {
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "cache_read": details.get("cache_read"),
+            "cache_hit": token_usage.get("prompt_cache_hit_tokens"),
+            "cache_miss": token_usage.get("prompt_cache_miss_tokens"),
+        }
+
+    @staticmethod
+    def _log_usage(res, state: AgentState) -> None:
+        fields = LLMNode.usage_fields(res)
+        logger.info(
+            "llm_usage input=%s output=%s cache_read=%s cache_hit=%s cache_miss=%s session=%s",
+            fields["input_tokens"],
+            fields["output_tokens"],
+            fields["cache_read"],
+            fields["cache_hit"],
+            fields["cache_miss"],
+            state.get("session_id"),
+        )
 
     async def _model_for(self, state: AgentState) -> Runnable:
         """取本次要用的模型：按工具集版本决定要不要重新 `bind_tools`（§3.4——不必每轮 bind）。
@@ -338,6 +480,25 @@ class ToolNode:
             return self.tools_map
         return await self.toolset.tools_map(state)
 
+    async def _log_event(self, state, tool_call, *, status, error_type, content_chars):
+        """写一行确定性 event log；工作区/会话缺失或写盘失败都不影响工具执行。"""
+        workspace = getattr(self.toolset, "workspace", None)
+        session = state.get("session_id")
+        if not workspace or not session:
+            return
+        await asyncio.to_thread(
+            event_log.append_event,
+            workspace,
+            session,
+            tool=tool_call.get("name") or "",
+            tool_call_id=tool_call.get("id") or "",
+            args=tool_call.get("args") or {},
+            status=status,
+            error_type=error_type,
+            approval=tool_call.get("_approval") or "approved",
+            content_chars=content_chars,
+        )
+
     async def __call__(self, state: AgentState) -> dict | AgentState:
         tool_calls = list(state.get("approved_tool_calls", []))
         tools_map = await self._current_map(state)
@@ -351,18 +512,26 @@ class ToolNode:
 
             extra: dict = {}
             if not tool_name or tool_name not in tools_map:
+                result_content = (
+                    f"工具不存在或未注册: {tool_name}"
+                    f"（不在本会话当前可用的工具表里——可能所属技能刚被卸载、"
+                    f"或它的运行体已断开）。若仍需要它，请先用 get_skill 重新加载对应技能，"
+                    f"不要原样重试。"
+                )
                 results.append(
                     ToolMessage(
-                        content=(
-                            f"工具不存在或未注册: {tool_name}"
-                            f"（不在本会话当前可用的工具表里——可能所属技能刚被卸载、"
-                            f"或它的运行体已断开）。若仍需要它，请先用 get_skill 重新加载对应技能，"
-                            f"不要原样重试。"
-                        ),
+                        content=result_content,
                         tool_call_id=tool_call_id,
                         name=tool_name,
                         additional_kwargs=_tool_stamp(error_type="unknown_tool"),
                     )
+                )
+                await self._log_event(
+                    state,
+                    tool_call,
+                    status="failed",
+                    error_type="unknown_tool",
+                    content_chars=len(result_content),
                 )
                 continue
 
@@ -390,6 +559,15 @@ class ToolNode:
                 msg_kwargs["additional_kwargs"] = extra
             results.append(ToolMessage(**msg_kwargs))
 
+            error_type = extra.get("error_type") if extra else None
+            await self._log_event(
+                state,
+                tool_call,
+                status="failed" if error_type else "ok",
+                error_type=error_type,
+                content_chars=len(result_content),
+            )
+
         return {"messages": results, "approved_tool_calls": []}
 
 
@@ -416,13 +594,14 @@ class ReviewNode:
     # 交 OrchestrateNode（通用编排执行器）处理。plan=编排；notes=笔记读回；
     # ask=向用户提问（见下 ASK_SOURCE 的说明）；
     # memory=长期记忆读写（app/agent/tools.py 的 write_memory/read_memory，靠注入的 workspace
-    # 定位记忆文件）；skill=技能加载/卸载（同文件 get_skill/drop_skill）。
+    # 定位记忆文件）；skill=技能加载/卸载（同文件 get_skill/drop_skill）；
+    # events=确定性 event log 的只读查询（read_event_log，同样靠注入的 workspace 定位会话日志）。
     # 注意两处**不在**这里的：① 技能**带来**的工具——它们的 source 取 `skills/<name>`，不命中本
     # 集合 → 进普通工具队列（get_skill 是编排动作，它带来的工具不是）；② `dispatch_subtasks`
     # ——2026-09-21 起它是 `mcp_service/dispatch` 这个 server 的工具（派生 worker = 独立进程
     # 与独立 Agent runtime，四问的第四问），走 ToolNode，**不再进编排队列**。
     ORCHESTRATE_SOURCES: frozenset[str] = frozenset(
-        {"plan", "notes", "ask", "memory", "skill"}
+        {"plan", "notes", "ask", "memory", "events", "skill"}
     )
 
     # 人机闸门的第二种载荷（docs/MULTI_AGENT.md §6）：source=ask 的工具（当前只有 ask_user）
@@ -542,6 +721,37 @@ class ReviewNode:
             "unknown_tool",
         )
 
+    async def _log_event(
+        self,
+        state: AgentState,
+        tool_call: dict,
+        *,
+        status: str,
+        error_type: str | None,
+        approval: str,
+        content_chars: int = 0,
+    ) -> None:
+        """写一行确定性 event log（只记未被执行 / 被拒的闸门结果）。
+
+        已放行的执行结果由 ToolNode / OrchestrateNode 写——同一 tool_call 只落一行，不重复。
+        """
+        workspace = getattr(self.toolset, "workspace", None)
+        session = state.get("session_id")
+        if not workspace or not session:
+            return
+        await asyncio.to_thread(
+            event_log.append_event,
+            workspace,
+            session,
+            tool=tool_call.get("name") or "",
+            tool_call_id=tool_call.get("id") or "",
+            args=tool_call.get("args") or {},
+            status=status,
+            error_type=error_type,
+            approval=approval,
+            content_chars=content_chars,
+        )
+
     async def __call__(self, state: AgentState) -> dict | AgentState:
         pending = list(state.get("pending_tool_calls", []))
         if not pending:
@@ -559,7 +769,17 @@ class ReviewNode:
         action = self._decide(tool_name, tool_cfg, state, current_tool.get("args", {}))
         if action == "unknown":
             # 模型编出来的名字（本会话根本没绑定过它）：回执而不弹面板，见 _decide 的说明
-            return self._unknown_result(state, current_tool)
+            result = self._unknown_result(state, current_tool)
+            content = result["messages"][0].content
+            await self._log_event(
+                state,
+                current_tool,
+                status="failed",
+                error_type="unknown_tool",
+                approval="not_required",
+                content_chars=len(content),
+            )
+            return result
 
         ask_answers: dict | None = None
         if action == "review":
@@ -590,6 +810,14 @@ class ReviewNode:
                         additional_kwargs=_tool_stamp(decision="denied"),
                     )
                 )
+                await self._log_event(
+                    state,
+                    current_tool,
+                    status="denied",
+                    error_type=None,
+                    approval="denied",
+                    content_chars=len(denied_messages[-1].content),
+                )
 
         elif tool_cfg.get("source") == self.ASK_SOURCE and not self.allow_ask:
             # worker：提问载荷在这张图里不成立（worker 是只读资料收集器、不该问用户）。它**结构性**
@@ -608,7 +836,18 @@ class ReviewNode:
             # 参数先在弹面板**之前**校验——空问题 / 超限选项摆到人面前是最糟的形态。
             request, problem = gates.ask_request(current_tool.get("args") or {})
             if problem is not None:
-                return self._receipt_result(state, current_tool, problem, "invalid_ask")
+                result = self._receipt_result(
+                    state, current_tool, problem, "invalid_ask"
+                )
+                await self._log_event(
+                    state,
+                    current_tool,
+                    status="failed",
+                    error_type="invalid_ask",
+                    approval="not_required",
+                    content_chars=len(problem),
+                )
+                return result
             # 不带 current_step：那是审批面板的遗留样式（恒为 "1/1"），提问面板不需要。
             decision = interrupt(
                 {
@@ -635,7 +874,11 @@ class ReviewNode:
         approved_orchestrate = list(state.get("approved_orchestrate_calls", []))
         approved_calls = list(state.get("approved_tool_calls", []))
         if approved:
-            (approved_orchestrate if is_orchestrate else approved_calls).append(current_tool)
+            # 带审批结果下放：event log 用它区分 approved / not_required，不必在 ToolNode
+            # 再猜一次策略。普通工具执行、编排工具执行都读这把字段。
+            routed = dict(current_tool)
+            routed["_approval"] = "approved" if action == "review" else "not_required"
+            (approved_orchestrate if is_orchestrate else approved_calls).append(routed)
 
         remaining = pending[1:]
 
@@ -750,6 +993,26 @@ class OrchestrateNode:
         # 返回可能为 coroutine（async 编排工具），由调用方 await
         return fn(**kwargs)
 
+    async def _log_event(
+        self, state, tool_call, *, status, error_type, content_chars
+    ) -> None:
+        """写一行确定性 event log；工作区/会话缺失或写盘失败都不影响编排执行。"""
+        session = state.get("session_id")
+        if not self.workspace_path or not session:
+            return
+        await asyncio.to_thread(
+            event_log.append_event,
+            self.workspace_path,
+            session,
+            tool=tool_call.get("name") or "",
+            tool_call_id=tool_call.get("id") or "",
+            args=tool_call.get("args") or {},
+            status=status,
+            error_type=error_type,
+            approval=tool_call.get("_approval") or "not_required",
+            content_chars=content_chars,
+        )
+
     async def __call__(self, state: AgentState) -> dict | AgentState:
         tool_calls = list(state.get("approved_orchestrate_calls", []))
         if not tool_calls:
@@ -771,12 +1034,20 @@ class OrchestrateNode:
 
             tool_obj = self.tools_map.get(tool_name) if tool_name else None
             if tool_obj is None:
+                content = f"工具不存在或未注册: {tool_name}"
                 messages.append(
                     ToolMessage(
-                        content=f"工具不存在或未注册: {tool_name}",
+                        content=content,
                         tool_call_id=tool_call_id,
                         name=tool_name,
                     )
+                )
+                await self._log_event(
+                    state,
+                    tool_call,
+                    status="failed",
+                    error_type="unknown_tool",
+                    content_chars=len(content),
                 )
                 continue
 
@@ -787,26 +1058,43 @@ class OrchestrateNode:
                 if inspect.isawaitable(result):
                     result = await result
             except Exception as exc:
+                content = f"工具执行失败: {exc}"
                 messages.append(
                     ToolMessage(
-                        content=f"工具执行失败: {exc}",
+                        content=content,
                         tool_call_id=tool_call_id,
                         name=tool_name,
                     )
+                )
+                await self._log_event(
+                    state,
+                    tool_call,
+                    status="failed",
+                    error_type="tool_error",
+                    content_chars=len(content),
                 )
                 continue
 
             if not isinstance(result, dict):
+                content = f"工具返回格式非法: {type(result).__name__}"
                 messages.append(
                     ToolMessage(
-                        content=f"工具返回格式非法: {type(result).__name__}",
+                        content=content,
                         tool_call_id=tool_call_id,
                         name=tool_name,
                     )
                 )
+                await self._log_event(
+                    state,
+                    tool_call,
+                    status="failed",
+                    error_type="invalid_tool_result",
+                    content_chars=len(content),
+                )
                 continue
 
             # 工具返回切片：链式更新进 working（同回合后续调用看得到），messages 回执原样收集
+            before = len(messages)
             if "current_plan" in result:
                 working["current_plan"] = result["current_plan"]
             for key in _EXTRA_SLICE_KEYS:
@@ -820,6 +1108,15 @@ class OrchestrateNode:
                     messages.append(
                         ToolMessage(content=str(block), tool_call_id=tool_call_id, name=tool_name)
                     )
+            await self._log_event(
+                state,
+                tool_call,
+                status="ok",
+                error_type=None,
+                content_chars=sum(
+                    len(str(message.content)) for message in messages[before:]
+                ),
+            )
 
         # current_plan 恒带回（既有行为不变，链式默认值已在上面 setdefault）；
         # 额外切片只在本回合真的被写过时才带回。
@@ -877,9 +1174,14 @@ class CompactNode:
     - 折叠区 = 最后一条 HumanMessage 之前（含更早轮次）；当前轮（Human 及其后）原样保留；
     - 只折"完整且已消费"的工具块（AIMessage(tool_calls) + 兑现它的全部 ToolMessages；
       块之后、下一条 Human 之前必须已经出现过 AIMessage），状态据 ToolMessage 判定；
-      联网四工具的成功正文归档进 notes；
+    - **编排工具不折**：`tool.json` 中 source ∈ {plan, notes, ask, memory, skill} 的工具
+      只操作会话 state（计划快照、提问回答、记忆/技能回执），不是可重取的外部结果——折掉
+      就是误伤。整块都是编排工具 → 整块保留；混合块（编排 + 普通）→ 只折普通调用，保留
+      编排调用及其 ToolMessage，并原位改写 AIMessage 的 tool_calls 子集；
+    - 联网四工具的成功正文归档进 notes；
     - 返回：`SystemMessage(摘要, id=折叠区最早被删消息的 id)` 原位替换 + `RemoveMessage`
-      删除其余被折块——不尾追加，messages 尾部仍是本轮最终答复（main.py 打印不受影响）。
+      删除其余被折块（混合块另加一条 AIMessage 改写）——不尾追加，messages 尾部仍是本轮
+      最终答复（main.py 打印不受影响）。
 
     纯确定性逻辑，不调 LLM。压缩的内部纯函数只被本节点使用，故收成静态方法，不外泄。
     """
@@ -898,19 +1200,28 @@ class CompactNode:
         {"web_search", "extract_urls", "crawl_website", "deep_research"}
         )
 
+    def __init__(self) -> None:
+        """编排工具集合从 tool.json 的 source 派生（策略单点：gates.tool_config）。"""
+        self.orchestrate_tools = frozenset(
+            name
+            for name, conf in gates.tool_config().items()
+            if conf.get("source") in ReviewNode.ORCHESTRATE_SOURCES
+        )
+
     async def __call__(self, state: AgentState) -> dict | AgentState:
         messages = list(state.get("messages") or [])
         if not messages:
             return {}
 
         notes = dict(state.get("notes") or {})
-        removed, lines, additions = self._plan(messages, notes)
+        removed, lines, additions, replaced = self._plan(messages, notes)
         if not removed or not lines:
             return {}
 
         summary = CompactNode._FOLD_HEADER + "\n" + "\n".join(lines)
         anchor = removed[0]
         updates: list = [SystemMessage(content=summary, id=anchor.id)]
+        updates += replaced
         updates += [RemoveMessage(id=m.id) for m in removed[1:] if getattr(m, "id", None)]
 
         result: dict = {"messages": updates}
@@ -1011,21 +1322,23 @@ class CompactNode:
                     pass
         return f"notes#r{max_n + 1}", max_n + 1
 
-    @staticmethod
     def _plan(
-        messages: list, notes: dict
-    ) -> tuple[list, list[str], dict[str, NoteEntry]]:
+        self, messages: list, notes: dict
+    ) -> tuple[list, list[str], dict[str, NoteEntry], list[AIMessage]]:
         """扫描消息，决定折叠哪些"更早轮次、已消费的完整工具块"，并生成摘要行与新增 notes。
 
-        返回 (removed, summary_lines, archived)：
-        - removed：可整体删除的块内消息（AIMessage(tool_calls) + 兑现它的 ToolMessages），
-          按消息顺序排列，removed[0] 即折叠区最早被删消息（将作为 SystemMessage 原位替换锚点）；
-        - summary_lines：每个被折 tool_call 一行（reason · 工具 · 状态 · 指向）；
-        - archived：本次新增的 notes（key=notes#r<n>，仅联网四工具的成功正文）。
+        返回 (removed, summary_lines, archived, replaced)：
+        - removed：可删除的消息，按消息顺序排列，removed[0] 即折叠区最早被删消息
+          （将作为 SystemMessage 原位替换锚点）。整块折叠时含 AIMessage(tool_calls) +
+          兑现它的 ToolMessages；混合块只含被折的普通 ToolMessages；
+        - summary_lines：每个**被折** tool_call 一行（reason · 工具 · 状态 · 指向）；
+        - archived：本次新增的 notes（key=notes#r<n>，仅联网四工具的成功正文）；
+        - replaced：混合块里保留编排调用后的 AIMessage 副本（tool_calls 只留编排调用），
+          由调用方原位写回；整块折叠 / 整块保留时为空。
 
         不折叠：无 tool_calls 的 AIMessage（答复）、Human、SystemMessage、块不完整（有悬空
         call）、块内消息缺稳定 id、块未被消费（块后、下一条 Human 前没有 AIMessage）、
-        以及折叠区为空（单轮会话）。
+        整块都是编排工具、以及折叠区为空（单轮会话）。
         """
         # 锚点 = 最后一条 HumanMessage；它及其后（当前轮）原样保留，只折更早轮次
         anchor = -1
@@ -1033,12 +1346,13 @@ class CompactNode:
             if isinstance(m, HumanMessage):
                 anchor = i
         if anchor <= 0:
-            return [], [], {}
+            return [], [], {}, []
         region = messages[:anchor]
 
         removed: list = []
         lines: list[str] = []
         archived: dict[str, NoteEntry] = {}
+        replaced: list[AIMessage] = []
         ref_num: int | None = None  # 首次归档时初始化为现有最大号 +1
 
         i = 0
@@ -1068,7 +1382,11 @@ class CompactNode:
                     break
             i = j  # 游标越过本块 ToolMessage 段
 
-            complete = len(claimed) == len(call_ids) and all(cid is not None for cid in call_ids)
+            complete = (
+                len(claimed) == len(call_ids)
+                and all(cid is not None for cid in call_ids)
+                and all(isinstance(tc, dict) for tc in m.tool_calls)
+            )
             # 原位替换要求每条待删消息都有稳定 id（生产 add_messages 自动赋 uuid）；
             # 块还必须已被模型消费——折掉模型还没看过的工具结果，等于从历史里抽走它。
             if not (
@@ -1078,8 +1396,49 @@ class CompactNode:
             ):
                 continue
 
+            # 编排工具只动 state（计划/提问/记忆/技能回执），不是可重取的外部结果：
+            # 整块都是编排工具 → 原样保留；混合块 → 只折普通调用，保留编排调用与回执。
+            kept_calls = [
+                tc
+                for tc in m.tool_calls
+                if (tc.get("name") or "").strip() in self.orchestrate_tools
+            ]
+            folded_calls = [
+                tc
+                for tc in m.tool_calls
+                if (tc.get("name") or "").strip() not in self.orchestrate_tools
+            ]
+            if not folded_calls:
+                continue
+
+            # 混合块里摘要 SystemMessage 会顶替第一条被折的普通 ToolMessage。为保持
+            # AIMessage(tool_calls) → ToolMessage 的邻接关系，要求编排回执全部排在
+            # 普通回执之前（生产路径恒成立：OrchestrateNode 先跑、ToolNode 后跑）；
+            # 顺序不满足就整块不折，宁可少压也不产生非法消息序列。
+            kept_ids = {tc.get("id") for tc in kept_calls}
+            folded_ids = {tc.get("id") for tc in folded_calls}
+            if kept_calls:
+                last_kept = max(
+                    (
+                        index
+                        for index, item in enumerate(block)
+                        if isinstance(item, ToolMessage) and item.tool_call_id in kept_ids
+                    ),
+                    default=-1,
+                )
+                first_folded = min(
+                    (
+                        index
+                        for index, item in enumerate(block)
+                        if isinstance(item, ToolMessage) and item.tool_call_id in folded_ids
+                    ),
+                    default=len(block),
+                )
+                if first_folded < last_kept:
+                    continue
+
             reason = CompactNode._reason_of(m)
-            for tc in m.tool_calls:
+            for tc in folded_calls:
                 name = (tc.get("name") or "").strip()
                 tm = claimed.get(tc.get("id"))  # type: ignore
                 status, detail = CompactNode._tm_status(tm) if tm is not None else ("ok", "")
@@ -1104,9 +1463,20 @@ class CompactNode:
                         ref_num += 1
 
                 lines.append(CompactNode._render_line(reason, name, status, detail, note_ref))
-            removed.extend(block)
 
-        return removed, lines, archived
+            block_removed = [
+                b
+                for b in block
+                if isinstance(b, ToolMessage) and b.tool_call_id in folded_ids
+            ]
+            if not kept_calls:
+                block_removed.insert(0, m)
+            removed.extend(block_removed)
+            if kept_calls:
+                # 原位改写 AIMessage：只留编排调用的 tool_calls，普通调用的回执被删。
+                replaced.append(m.model_copy(update={"tool_calls": kept_calls}))
+
+        return removed, lines, archived, replaced
 
 
 #----------------------轮内压缩（compress_node）----------------------
@@ -1114,8 +1484,17 @@ class CompactNode:
 #   CompactNode  : messages[:last_human_index]        旧轮，轮末无条件执行
 #   CompressNode : messages[last_human_index + 1:]    当前轮，工具循环中执行
 # 轮内**不删消息**：图路由中间删掉结果会破坏 tool_call / ToolMessage 配对与调用方状态，
-# 因此只对终端 ToolMessage 的 content 做**中间截断**（头 + 尾 + 省略标记）。旧轮的整块
-# 折叠仍归 CompactNode。
+# 因此只改 ToolMessage.content。两条规则：
+#   1) 终端返回**中间截断**（头 + 尾 + 省略标记）；
+#   2) 同一轮内对同一文件的重复 read_file：**最后一次成功读取为准**，其余换成指向它的
+#      指针（不看正文是否相同——文件随时可能被编辑，旧结果已经过期）。
+# 工具按结果时效性分两类：terminal / file_io 读取属"随时会变"的一类，压缩从严；web /
+# github / memory 等相对稳定，仍走轮末折叠。目前"最新一次替代"只覆盖 read_file。
+# 旧轮的整块折叠仍归 CompactNode。
+
+# read_file 去重的最小正文长度：被替换的旧正文太短时，指针和正文差不多，不值得换。
+_READ_DEDUP_MIN_CHARS = 1000
+
 
 class CompressNode:
     """轮内字段压缩节点（`tool_node` / `orchestrate_node` → `llm_node` 的边上执行）。
@@ -1123,16 +1502,23 @@ class CompressNode:
     职责边界（与 `CompactNode` 分工）：
 
     - **只看当前轮**：最后一条 HumanMessage 之后；`last_human` 之前一律不动；
-    - **只压缩终端工具返回**：`run_command` / `start_process` / `process_wait` /
-      `process_read` / `process_kill` / `process_list`；
+    - **终端返回中间截断**：`run_command` / `start_process` / `process_wait` /
+      `process_read` / `process_kill` / `process_list` 的 content 超过
+      `threshold_chars` 时，保留开头和末尾，中间换成
+      `…[终端输出中间已截断 N 字符]…`；默认阈值 `TEXT_BUDGET_CHARS`，头尾各取阈值的 1/4；
+    - **read_file 同文件只留最新**：同一轮内、同一路径的多次成功读取，**最后一次成功
+      读取**保留正文，其余（正文不短于 `read_dedup_min_chars` 的）换成
+      `…[重复读取] 同一文件以 tool_call_id=<最后一次成功读取> 为准…`。
+      判据是 tool_call 的 `path`，**不再要求正文相同**：文件在两次读取之间被编辑或外部
+      修改时，旧正文已经过期，留着反而误导。带行区间的读取只有在"最后一次覆盖旧读取的
+      范围"时才替换（全文请求只与全文请求互替），避免把没读到的行当成已省略；
     - **只改 `ToolMessage.content`**：消息本身（id / tool_call_id / name /
       additional_kwargs / artifact）原样保留，因此不会拆断 tool_call 配对，也不增删消息；
-    - **中间截断**：content 超过 `threshold_chars` 时，保留开头和末尾，中间换成
-      `…[终端输出中间已截断 N 字符]…`；默认阈值 `TEXT_BUDGET_CHARS`，头尾各取阈值的 1/4；
-    - **幂等**：已带截断标记的消息不再处理；
+    - **幂等**：已带截断/去重标记的消息不再处理；
     - **不调 LLM**，纯确定性；没有需要压缩的消息时返回 `{}`。
 
-    状态（2026-10-20）：已实现，尚未接进图（不改变现有行为）。
+    状态（2026-10-20）：已接进主图（`tool_node` / `orchestrate_node` → `compress_node`
+    → `llm_node`）；worker 子图不带本节点。
     """
 
     TERMINAL_TOOLS: frozenset[str] = frozenset(
@@ -1148,14 +1534,27 @@ class CompressNode:
     # 截断标记：既给模型看"中间没了"，也用于幂等判断。
     MARKER_PREFIX = "…[终端输出中间已截断 "
     MARKER_TEMPLATE = "\n" + MARKER_PREFIX + "{omitted} 字符]…\n"
+    # read_file 去重：只处理这一种工具；指针里用最后一次的 tool_call_id 定位正文。
+    READ_DEDUP_TOOL = "read_file"
+    DEDUP_MARKER_PREFIX = "…[重复读取]"
 
-    def __init__(self, threshold_chars: int = TEXT_BUDGET_CHARS) -> None:
-        """`threshold_chars`：content 超过它才截断；头尾各保留 `threshold_chars // 4`。"""
+    def __init__(
+        self,
+        threshold_chars: int = TEXT_BUDGET_CHARS,
+        read_dedup_min_chars: int = _READ_DEDUP_MIN_CHARS,
+    ) -> None:
+        """`threshold_chars`：终端 content 超过它才截断；头尾各保留 `threshold_chars // 4`。
+
+        `read_dedup_min_chars`：被替换的旧 read_file 正文不短于它才指针化。
+        """
         if threshold_chars < 4:
             raise ValueError("threshold_chars 至少为 4（头尾各需 1 个字符）")
+        if read_dedup_min_chars < 1:
+            raise ValueError("read_dedup_min_chars 至少为 1")
         self.threshold_chars = threshold_chars
         self.head_chars = threshold_chars // 4
         self.tail_chars = threshold_chars // 4
+        self.read_dedup_min_chars = read_dedup_min_chars
 
     async def __call__(self, state: AgentState) -> dict | AgentState:
         messages = list(state.get("messages") or [])
@@ -1166,7 +1565,13 @@ class CompressNode:
         if anchor < 0:
             return {}
 
-        replacements = self._compress_region(messages, anchor + 1)
+        region_start = anchor + 1
+        replacements = self._compress_region(messages, region_start)
+        replacements.extend(
+            self._dedupe_reads(
+                messages, region_start, self._read_args_by_call(messages, region_start)
+            )
+        )
         if not replacements:
             return {}
         return {"messages": replacements}
@@ -1210,3 +1615,155 @@ class CompressNode:
         tail = content[-self.tail_chars :]
         omitted = len(content) - len(head) - len(tail)
         return head + self.MARKER_TEMPLATE.format(omitted=omitted) + tail
+
+    # ---------- read_file 重复读取：最后一次留正文，其余变指针 ----------
+
+    @staticmethod
+    def _read_args_by_call(messages: list, region_start: int) -> dict[str, dict]:
+        """当前轮 tool_call_id → 调用参数（read_file 的 path 用来确认"同一个文件"）。"""
+        args_by_call: dict[str, dict] = {}
+        for message in messages[region_start:]:
+            if not isinstance(message, AIMessage):
+                continue
+            for call in getattr(message, "tool_calls", None) or []:
+                if isinstance(call, dict) and call.get("id"):
+                    args = call.get("args")
+                    args_by_call[call["id"]] = args if isinstance(args, dict) else {}
+        return args_by_call
+
+    def _dedupe_reads(
+        self,
+        messages: list,
+        region_start: int,
+        args_by_call: dict[str, dict],
+    ) -> list[ToolMessage]:
+        """同一轮内同一文件的多次 read_file：最后一次成功读取留正文，其余换成指针。
+
+        与旧实现的区别：**不再比较正文**。文件是随时可能变的资源，内容相同只是巧合；
+        真正可信的是时间上最后一次读取。失败/被拒的读取不参与替换（既不当目标，也不被替换），
+        避免把一个错误回执当成"最新内容"。
+
+        带行区间时加一道覆盖检查：最后一次必须覆盖旧读取的行范围，否则保留旧正文——
+        例如"全文读 → 编辑 → 只复查第 10 行"时，不能把全文读换成第 10 行的指针。
+        """
+        entries: list[dict] = []
+        for message in messages[region_start:]:
+            if not isinstance(message, ToolMessage):
+                continue
+            name = (getattr(message, "name", "") or "").strip()
+            if name != self.READ_DEDUP_TOOL:
+                continue
+            content = message.content
+            if not isinstance(content, str):
+                continue
+
+            call_id = message.tool_call_id
+            args = args_by_call.get(call_id) if call_id else None
+            if not isinstance(args, dict):
+                continue
+            path = args.get("path")
+            if not isinstance(path, str) or not path.strip():
+                continue
+
+            extra = message.additional_kwargs or {}
+            ok = not extra.get("error_type") and extra.get("decision") != "denied"
+            entries.append(
+                {
+                    "message": message,
+                    "call_id": call_id,
+                    "path": self._norm_path(path),
+                    "display_path": path.strip(),
+                    "content": content,
+                    "range": self._read_range(args),
+                    "ok": ok,
+                }
+            )
+
+        # 每个路径取时间上最后一次成功读取（倒序扫描；指针消息不能当目标）
+        latest_by_path: dict[str, dict] = {}
+        for entry in reversed(entries):
+            if not entry["ok"] or self.DEDUP_MARKER_PREFIX in entry["content"]:
+                continue
+            latest_by_path.setdefault(entry["path"], entry)
+
+        replacements: list[ToolMessage] = []
+        for entry in entries:
+            latest = latest_by_path.get(entry["path"])
+            if latest is None or latest is entry:
+                continue
+            if not entry["ok"]:
+                continue
+            if self.DEDUP_MARKER_PREFIX in entry["content"]:  # 幂等：已指针化
+                continue
+            if len(entry["content"]) < self.read_dedup_min_chars:
+                continue
+            if not entry["call_id"] or not latest["call_id"]:
+                continue
+            if not self._covers(latest["range"], entry["range"]):
+                continue
+
+            replacements.append(
+                entry["message"].model_copy(
+                    update={
+                        "content": self._dedup_pointer(
+                            latest["call_id"],
+                            latest["display_path"],
+                            len(latest["content"]),
+                        )
+                    }
+                )
+            )
+        return replacements
+
+    @staticmethod
+    def _read_range(args: dict) -> tuple[int, int | None] | None:
+        """把 read_file 参数折成请求范围；None = 无行区间的全文请求。
+
+        `end_line=None` 表示"从 start_line 往后"（大文件最多 200 行、小文件到文件尾），
+        这里保留 None，交给覆盖检查按"到文件尾/单次上限"处理。
+        """
+        start = args.get("start_line")
+        end = args.get("end_line")
+        start = start if isinstance(start, int) and start >= 1 else None
+        end = end if isinstance(end, int) and end >= 1 else None
+        if start is None and end is None:
+            return None
+        return (start or 1, end)
+
+    @staticmethod
+    def _covers(
+        latest: tuple[int, int | None] | None,
+        earlier: tuple[int, int | None] | None,
+    ) -> bool:
+        """最后一次读取是否覆盖旧读取请求的范围。
+
+        - 全文请求只与全文请求互替：大文件的"全文"实际是前 200 行预览，不能声称覆盖区间；
+        - 区间读取要求 latest 起点不晚于 earlier，且终点不早于 earlier；
+        - `end=None`（到文件尾/单次 200 行上限）只与同为 `end=None` 的请求互认。
+        """
+        if latest is None:
+            return earlier is None
+        if earlier is None:
+            return False
+
+        latest_start, latest_end = latest
+        earlier_start, earlier_end = earlier
+        if latest_start > earlier_start:
+            return False
+        if latest_end is None:
+            return earlier_end is None
+        if earlier_end is None:
+            return False
+        return latest_end >= earlier_end
+
+    @staticmethod
+    def _norm_path(path: str) -> str:
+        """路径归一（只用于判等）：统一分隔符、消掉 `./` 与冗余 `..`。"""
+        return posixpath.normpath(path.strip().replace("\\", "/"))
+
+    def _dedup_pointer(self, latest_call_id: str, path: str, length: int) -> str:
+        """指针正文：指向最后一次成功读取，不复制原文。"""
+        return (
+            f"{self.DEDUP_MARKER_PREFIX} 同一文件以 tool_call_id={latest_call_id} 的"
+            f"最后一次成功读取为准（{path}，{length} 字符）；此处旧结果不再展开。"
+        )

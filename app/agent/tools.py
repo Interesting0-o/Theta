@@ -44,7 +44,7 @@ from langgraph.prebuilt import InjectedState
 from app.agent import gates
 from app.resource.paths import PROJECT_ROOT
 from app.platform import mcp
-from app.resource import memory, skills
+from app.resource import event_log, memory, skills
 from app.agent.state import AgentState
 from app.config import skill_env
 from app.exception import ConfigError
@@ -561,6 +561,80 @@ memory_tool: List[BaseTool] = [
     write_memory,
     read_memory,
 ]
+
+
+# ------------------------- 事件日志读取（source="events"）-------------------------
+# 确定性 event log 的审计索引：每个 tool_call 一行（状态 / 审批 / 目标 / 参数哈希），
+# 无上限落在 resource/<ws_key>/sessions/<sid>/event_log.jsonl。模型只在需要查"之前那次
+# 调用到底成没成、参数是什么"时按需读取；上下文里只放 digest 的指针。
+@tool
+async def read_event_log(
+    state: Annotated[AgentState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    workspace: Annotated[str, InjectedWorkspace],
+    tool: str = "",
+    limit: int = 50,
+) -> dict:
+    """读取本会话的确定性工具事件日志（最近 N 条，可按工具名过滤）。
+
+    何时用：需要核对"之前某个工具调用是否执行成功、审批结果如何、参数目标是什么"，
+    但消息历史里的原文已被折叠/移除时。它是**索引**，不含工具正文；正文仍在 notes /
+    文件 / 工具自己的落盘点里。
+
+    Args:
+        tool: 可选，按工具名过滤（如 "run_command"、"web_search"）；留空 = 全部。
+        limit: 最多返回多少条，默认 50，硬上限 200。
+        state: （系统自动注入，无需传入）取当前会话 id。
+        tool_call_id: （系统自动注入，无需传入）本次调用 id。
+        workspace: （系统自动注入，无需传入）本会话工作区。
+
+    Returns:
+        每行一条事件：event_id / 时间 / 工具 / 状态 / error_type / 审批结果 / 目标 /
+        正文字符数 / 参数哈希。没有记录时说明情况。
+    """
+    try:
+        capped = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        return _tool_receipt(
+            "read_event_log", tool_call_id, f"limit 要是整数，收到 {limit!r}。"
+        )
+
+    session = state.get("session_id")
+    if not session:
+        return _tool_receipt(
+            "read_event_log", tool_call_id, "当前会话没有 session_id，事件日志不可用。"
+        )
+
+    name = (tool or "").strip() or None
+    events = await asyncio.to_thread(
+        event_log.read_events, workspace, session, limit=capped, tool=name
+    )
+    if not events:
+        suffix = f"（tool={name}）" if name else ""
+        return _tool_receipt(
+            "read_event_log", tool_call_id, f"本会话还没有工具事件记录{suffix}。"
+        )
+
+    lines = [f"最近 {len(events)} 条工具事件（按时间正序）："]
+    for event in events:
+        parts = [
+            f"[{event.get('event_id')}]",
+            str(event.get("ts") or ""),
+            f"tool={event.get('tool')}",
+            f"status={event.get('status')}",
+        ]
+        if event.get("error_type"):
+            parts.append(f"error={event.get('error_type')}")
+        parts.append(f"approval={event.get('approval')}")
+        if event.get("target"):
+            parts.append(f"target={event.get('target')}")
+        parts.append(f"chars={event.get('content_chars')}")
+        parts.append(f"hash={event.get('args_hash')}")
+        lines.append(" ".join(parts))
+    return _tool_receipt("read_event_log", tool_call_id, "\n".join(lines))
+
+
+event_tool: List[BaseTool] = [read_event_log]
 
 # ------------------------- 技能（skill） -------------------------
 # 按需加载的"领域包"（docs/SKILL_DESIGN.md）：**目录**（name + description）在构图期由

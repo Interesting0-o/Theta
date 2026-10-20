@@ -7,6 +7,8 @@ reducer 合并，断言"原位替换 + 折叠区/保留区"与摘要文本。轮
 """
 import asyncio
 
+import pytest
+
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -35,6 +37,10 @@ def _run(messages, notes=None):
 def _merged(messages, node_out):
     """把节点返回的 messages 更新经 add_messages 合并，模拟真实 reducer。"""
     return add_messages(list(messages), node_out["messages"])
+
+
+def _by_id(messages, message_id):
+    return next(m for m in messages if m.id == message_id)
 
 
 def _pad(n, text="x"):
@@ -274,3 +280,188 @@ def test_needs_compact_budget_boundary():
     assert needs_compact({"messages": exactly}, budget=40) is False
     assert needs_compact({"messages": under}, budget=40) is False
     assert needs_compact({"messages": []}, budget=40) is False
+
+
+#------------------ 编排工具：不折（避免误伤） ------------------
+
+ORCHESTRATE_TOOL_NAMES = [
+    "create_plan",
+    "update_plan_step",
+    "clear_plan",
+    "read_note",
+    "ask_user",
+    "write_memory",
+    "read_memory",
+    "get_skill",
+    "drop_skill",
+]
+
+
+def _orchestration_block(name):
+    return [
+        HumanMessage(content=_pad(50), id="h1"),
+        AIMessage(content="执行编排", tool_calls=[_tc(name, "c1")], id="a1"),
+        ToolMessage(content="编排回执正文", tool_call_id="c1", name=name, id="t1"),
+        AIMessage(content="处理完了", id="ans1"),
+        HumanMessage(content="继续", id="h2"),
+        AIMessage(content="好", id="ans2"),
+    ]
+
+
+def test_orchestrate_tool_set_comes_from_tool_json():
+    """编排集合由 tool.json 的 source 派生，不是手写名单。"""
+    node = CompactNode()
+    assert set(ORCHESTRATE_TOOL_NAMES) <= node.orchestrate_tools
+    assert "run_command" not in node.orchestrate_tools
+    assert "read_file" not in node.orchestrate_tools
+    assert "dispatch_subtasks" not in node.orchestrate_tools
+
+
+@pytest.mark.parametrize("name", ORCHESTRATE_TOOL_NAMES)
+def test_orchestration_only_block_is_never_folded(name):
+    """整块都是编排工具：计划/回答/记忆/技能回执一律原样保留。"""
+    assert _run(_orchestration_block(name)) == {}
+
+
+def test_ask_user_answer_survives_turn_end():
+    """提问回答是单轮 state，折掉就永久丢失——必须保留。"""
+    messages = [
+        HumanMessage(content="选方案", id="h1"),
+        AIMessage(content="需要你拍板", tool_calls=[_tc("ask_user", "c1")], id="a1"),
+        ToolMessage(
+            content="[user_answer] 用户选择了：1. 方案 A\n用户补充：别动旧兼容层",
+            tool_call_id="c1",
+            name="ask_user",
+            id="t1",
+        ),
+        AIMessage(content="按方案 A 做", id="ans1"),
+        HumanMessage(content="继续", id="h2"),
+        AIMessage(content="好", id="ans2"),
+    ]
+    assert _run(messages) == {}
+
+
+def test_mixed_block_folds_only_non_orchestration_calls():
+    """混合块：编排调用与回执留下，普通调用折叠，AIMessage 的 tool_calls 原位缩减。"""
+    messages = [
+        HumanMessage(content="推进并验证", id="h1"),
+        AIMessage(
+            content="先更新计划再跑测试",
+            tool_calls=[
+                _tc("update_plan_step", "c1"),
+                _tc("run_command", "c2"),
+            ],
+            id="a1",
+        ),
+        ToolMessage(
+            content="步骤 1 已标记为 done\n- [x] 1. 改代码",
+            tool_call_id="c1",
+            name="update_plan_step",
+            id="t1",
+        ),
+        ToolMessage(content="exit=0 · 12 passed", tool_call_id="c2", name="run_command", id="t2"),
+        AIMessage(content="已完成并验证。", id="ans1"),
+        HumanMessage(content="继续", id="h2"),
+        AIMessage(content="好", id="ans2"),
+    ]
+    out = _run(messages)
+
+    sys_msgs = [m for m in out["messages"] if isinstance(m, SystemMessage)]
+    assert len(sys_msgs) == 1
+    assert sys_msgs[0].id == "t2"                    # 摘要原位替换被折的普通结果
+    assert "工具调用: run_command" in sys_msgs[0].content
+    assert "update_plan_step" not in sys_msgs[0].content
+
+    # 保留编排回执：它不在 removed 里；t2 的位置被摘要 SystemMessage 原位顶替
+    merged = _merged(messages, out)
+    assert "步骤 1 已标记为 done" in _by_id(merged, "t1").content
+    assert isinstance(_by_id(merged, "t2"), SystemMessage)
+
+    # AIMessage 原位改写：只留编排调用
+    a1 = _by_id(merged, "a1")
+    assert isinstance(a1, AIMessage)
+    assert [tc["id"] for tc in a1.tool_calls] == ["c1"]
+    assert a1.content == "先更新计划再跑测试"
+
+
+def test_mixed_block_archives_only_folded_web_result():
+    """混合块里的 web 调用仍归档 notes，编排回执不归档、摘要行也不提它。"""
+    messages = [
+        HumanMessage(content="规划并调研", id="h1"),
+        AIMessage(
+            content="建计划 + 查资料",
+            tool_calls=[_tc("create_plan", "c1"), _tc("web_search", "c2")],
+            id="a1",
+        ),
+        ToolMessage(
+            content="已生成计划（1 步）\n- [ ] 1. 调研",
+            tool_call_id="c1",
+            name="create_plan",
+            id="t1",
+        ),
+        ToolMessage(
+            content="# 光伏市场\n2026 年装机…" + _pad(300),
+            tool_call_id="c2",
+            name="web_search",
+            id="t2",
+        ),
+        AIMessage(content="资料已拿到", id="ans1"),
+        HumanMessage(content="继续", id="h2"),
+        AIMessage(content="好", id="ans2"),
+    ]
+    out = _run(messages)
+
+    assert "notes#r1" in out["notes"]
+    assert "光伏" in out["notes"]["notes#r1"]["content"]
+    summary = next(m.content for m in out["messages"] if isinstance(m, SystemMessage))
+    assert "工具调用: web_search" in summary
+    assert "create_plan" not in summary
+
+    merged = _merged(messages, out)
+    assert _by_id(merged, "t1").content.startswith("已生成计划")
+    assert [tc["id"] for tc in _by_id(merged, "a1").tool_calls] == ["c1"]
+
+
+def test_orchestration_block_does_not_block_other_blocks():
+    """编排块保留，不影响同一折叠区里另一个普通块被折。"""
+    messages = [
+        HumanMessage(content="建计划", id="h1"),
+        AIMessage(content="建计划", tool_calls=[_tc("create_plan", "c1")], id="a1"),
+        ToolMessage(content="已生成计划（1 步）", tool_call_id="c1", name="create_plan", id="t1"),
+        AIMessage(content="读文件", tool_calls=[_tc("read_file", "c2")], id="a2"),
+        ToolMessage(content="x" * 400, tool_call_id="c2", name="read_file", id="t2"),
+        AIMessage(content="读完了", id="ans1"),
+        HumanMessage(content="继续", id="h2"),
+        AIMessage(content="好", id="ans2"),
+    ]
+    out = _run(messages)
+
+    sys_msgs = [m for m in out["messages"] if isinstance(m, SystemMessage)]
+    assert len(sys_msgs) == 1 and sys_msgs[0].id == "a2"
+    merged = _merged(messages, out)
+    assert "已生成计划" in _by_id(merged, "t1").content      # 编排块原样保留
+    assert "t2" not in {m.id for m in merged}               # 普通块被折
+    assert "create_plan" not in sys_msgs[0].content
+
+
+def test_mixed_block_with_ordinary_before_orchestration_is_kept():
+    """普通回执排在编排回执之前：不折整块。
+
+    混合块会把 AIMessage 改写成只留编排调用；若摘要插在编排 ToolMessage 之前，
+    就会出现 AIMessage(tool_calls) → SystemMessage → ToolMessage 的非法邻接。
+    生产路径 OrchestrateNode 先跑、ToolNode 后跑，不会出现该顺序；这里是防御性用例。
+    """
+    messages = [
+        HumanMessage(content="先跑再更新计划", id="h1"),
+        AIMessage(
+            content="顺序反了",
+            tool_calls=[_tc("run_command", "c1"), _tc("update_plan_step", "c2")],
+            id="a1",
+        ),
+        ToolMessage(content="exit=0", tool_call_id="c1", name="run_command", id="t1"),
+        ToolMessage(content="步骤 1 已标记为 done", tool_call_id="c2", name="update_plan_step", id="t2"),
+        AIMessage(content="完成", id="ans1"),
+        HumanMessage(content="继续", id="h2"),
+        AIMessage(content="好", id="ans2"),
+    ]
+    assert _run(messages) == {}
