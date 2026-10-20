@@ -1,3 +1,6 @@
+import re
+
+import mcp_service.file_io as file_io_module
 from mcp_service.file_io import (
     copy_path,
     create_file,
@@ -161,6 +164,25 @@ def test_list_dir(tmp_path):
     assert result.content.index("[dir] sub") < result.content.index("[file] alpha.txt")
 
 
+def test_directory_listings_show_file_sizes(tmp_path):
+    """list_dir / get_directory_tree 给文件带人类可读大小，目录不带。"""
+    (tmp_path / "small.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "big.bin").write_bytes(b"x" * 2048)
+    (tmp_path / "sub").mkdir()
+
+    listed = list_dir(str(tmp_path))
+    assert listed.success is True
+    assert "[file] small.txt  (1 B)" in listed.content
+    assert "[file] big.bin  (2.0 KB)" in listed.content
+    assert "[dir] sub" in listed.content
+    assert "[dir] sub  (" not in listed.content
+
+    tree = get_directory_tree(str(tmp_path), max_depth=3)
+    assert tree.success is True
+    assert "small.txt  (1 B)" in tree.content
+    assert "big.bin  (2.0 KB)" in tree.content
+
+
 def test_get_directory_tree(tmp_path):
     (tmp_path / "alpha.txt").write_text("a", encoding="utf-8")
     (tmp_path / "sub").mkdir()
@@ -176,6 +198,136 @@ def test_get_directory_tree(tmp_path):
 def test_get_directory_tree_invalid_path(tmp_path):
     result = get_directory_tree(str(tmp_path / "not_exists"), max_depth=3)
     assert result.success is False
+
+
+def test_list_dir_caps_at_150_and_dumps_full_listing(tmp_path):
+    for i in range(160):
+        (tmp_path / f"f{i:03d}.txt").write_text("x", encoding="utf-8")
+
+    result = list_dir(str(tmp_path))
+    assert result.success is True
+    assert result.content.count("[file]") == 150
+    assert "还有 10 项" in result.content
+    assert "完整清单见 .theta/tmp/list_" in result.content
+
+    match = re.search(r"完整清单见 (\S+\.txt)", result.content)
+    assert match is not None
+    dump = file_io_module.WORKSPACE_PATH / match.group(1)
+    try:
+        text = dump.read_text(encoding="utf-8")
+        assert text.count("[file]") == 160
+    finally:
+        dump.unlink(missing_ok=True)
+
+
+def test_get_directory_tree_caps_each_dir_and_dumps_full_tree(tmp_path):
+    big = tmp_path / "big"
+    big.mkdir()
+    for i in range(160):
+        (big / f"f{i:03d}.txt").write_text("x", encoding="utf-8")
+    small = tmp_path / "small"
+    small.mkdir()
+    (small / "keep.txt").write_text("x", encoding="utf-8")
+
+    result = get_directory_tree(str(tmp_path), max_depth=3)
+    assert result.success is True
+    assert result.content.count("还有 10 项") == 1
+    assert "完整清单见 .theta/tmp/tree_" in result.content
+    assert "keep.txt" in result.content
+    assert len(re.findall(r"f\d{3}\.txt", result.content)) == 150
+
+    match = re.search(r"完整清单见 (\S+\.txt)", result.content)
+    assert match is not None
+    dump = file_io_module.WORKSPACE_PATH / match.group(1)
+    try:
+        text = dump.read_text(encoding="utf-8")
+        assert len(re.findall(r"f\d{3}\.txt", text)) == 160
+        assert "keep.txt" in text
+    finally:
+        dump.unlink(missing_ok=True)
+
+
+def test_get_directory_tree_skips_ignored_dirs_by_default(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("x", encoding="utf-8")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("x", encoding="utf-8")
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "pyvenv.cfg").write_text("x", encoding="utf-8")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "index.js").write_text("x", encoding="utf-8")
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "mod.pyc").write_text("x", encoding="utf-8")
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "bundle.js").write_text("x", encoding="utf-8")
+    (tmp_path / ".env").write_text("x", encoding="utf-8")
+
+    result = get_directory_tree(str(tmp_path), max_depth=3)
+    assert result.success is True
+
+    # 隐藏目录与黑名单目录都只列名字，不展开内容
+    for name in (".git/", ".venv/", "node_modules/", "__pycache__/", "dist/"):
+        assert name in result.content
+    assert result.content.count("已跳过递归") == 5
+    assert result.content.count("隐藏目录，已跳过递归") == 2   # .git / .venv
+    assert result.content.count("黑名单目录，已跳过递归") == 3  # node_modules / __pycache__ / dist
+    for inner in ("config", "pyvenv.cfg", "index.js", "mod.pyc", "bundle.js"):
+        assert inner not in result.content
+
+    # 隐藏文件仍会列出；普通目录照常递归
+    assert ".env" in result.content
+    assert "main.py" in result.content
+
+
+def test_get_directory_tree_can_include_ignored_dirs(tmp_path):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("x", encoding="utf-8")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "index.js").write_text("x", encoding="utf-8")
+
+    result = get_directory_tree(str(tmp_path), max_depth=3, skip_hidden_dirs=False)
+    assert result.success is True
+    assert ".git/" in result.content
+    assert "config" in result.content
+    assert "node_modules/" in result.content
+    assert "index.js" in result.content
+    assert "已跳过递归" not in result.content
+
+
+def test_get_directory_tree_can_include_ignored_dirs_only(tmp_path):
+    """include_ignored_dirs=True：只放开黑名单目录，其他隐藏目录仍跳过。"""
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "index.js").write_text("x", encoding="utf-8")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("x", encoding="utf-8")
+    (tmp_path / ".mystery").mkdir()
+    (tmp_path / ".mystery" / "secret.txt").write_text("x", encoding="utf-8")
+
+    result = get_directory_tree(str(tmp_path), include_ignored_dirs=True)
+    assert result.success is True
+
+    # 黑名单目录展开（包括同时在黑名单里的隐藏目录 .git）
+    assert "node_modules/" in result.content
+    assert "index.js" in result.content
+    assert ".git/" in result.content
+    assert "config" in result.content
+
+    # 未列入黑名单的隐藏目录仍跳过
+    assert ".mystery/" in result.content
+    assert "secret.txt" not in result.content
+    assert result.content.count("已跳过递归") == 1
+
+
+def test_get_directory_tree_root_is_not_skipped(tmp_path):
+    """显式把黑名单目录当根时仍展开（选项只作用于子目录）。"""
+    node_modules = tmp_path / "node_modules"
+    node_modules.mkdir()
+    (node_modules / "index.js").write_text("x", encoding="utf-8")
+
+    result = get_directory_tree(str(node_modules), max_depth=3)
+    assert result.success is True
+    assert "index.js" in result.content
+    assert "已跳过递归" not in result.content
 
 
 def test_create_file_success_has_no_error_type(tmp_path):
@@ -237,6 +389,63 @@ def test_search_content_skips_binary(tmp_path):
     assert "未" in result.content
 
 
+def test_glob_max_results_is_capped(tmp_path, monkeypatch):
+    for i in range(5):
+        (tmp_path / f"a{i}.py").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(file_io_module, "MAX_GLOB_RESULTS", 3)
+
+    result = glob("*.py", path=str(tmp_path), max_results=100)
+    assert result.success is True
+    assert "已限制为 3" in result.content
+    assert len(re.findall(r"a\d\.py", result.content)) == 3
+
+
+def test_search_content_caps_params(tmp_path, monkeypatch):
+    for i in range(5):
+        (tmp_path / f"f{i}.txt").write_text("needle\nline\nline\n", encoding="utf-8")
+    monkeypatch.setattr(file_io_module, "MAX_SEARCH_RESULTS", 2)
+    monkeypatch.setattr(file_io_module, "MAX_SEARCH_CONTEXT_LINES", 1)
+
+    result = search_content(
+        "needle", path=str(tmp_path), max_results=100, context_lines=50
+    )
+    assert result.success is True
+    assert "max_results 已限制为 2" in result.content
+    assert "context_lines 已限制为 1" in result.content
+
+
+def test_search_content_clips_long_line(tmp_path, monkeypatch):
+    (tmp_path / "long.txt").write_text("needle " + "x" * 2000 + "\n", encoding="utf-8")
+    monkeypatch.setattr(file_io_module, "MAX_SEARCH_LINE_CHARS", 20)
+
+    result = search_content("needle", path=str(tmp_path))
+    assert result.success is True
+    assert "本行原长" in result.content
+    assert "…" in result.content
+
+
+def test_search_content_total_output_capped(tmp_path, monkeypatch):
+    for i in range(10):
+        (tmp_path / f"f{i}.txt").write_text("needle " + "x" * 100 + "\n", encoding="utf-8")
+    monkeypatch.setattr(file_io_module, "MAX_SEARCH_OUTPUT_CHARS", 200)
+
+    result = search_content("needle", path=str(tmp_path), max_results=100)
+    assert result.success is True
+    assert "输出已截断" in result.content
+
+
+def test_search_content_skips_large_files(tmp_path, monkeypatch):
+    (tmp_path / "big.txt").write_text("needle\n" + "x" * 100, encoding="utf-8")
+    (tmp_path / "small.txt").write_text("needle\n", encoding="utf-8")
+    monkeypatch.setattr(file_io_module, "MAX_SEARCH_FILE_BYTES", 20)
+
+    result = search_content("needle", path=str(tmp_path))
+    assert result.success is True
+    assert "已跳过 1 个" in result.content
+    assert "small.txt" in result.content
+    assert "big.txt" not in result.content
+
+
 # ---------------- read_file 行号分段读取 ----------------
 
 def _write_5_lines(path):
@@ -277,6 +486,112 @@ def test_read_file_range_out_of_bounds_reports_empty(tmp_path):
     result = read_file(str(target), start_line=10)
     assert result.success is True
     assert "共 5 行" in result.content
+
+
+def _write_large_file(path, total=5000):
+    """~250 KB 的文本文件（远超 64 KB 门限）。"""
+    path.write_text(
+        "".join(f"row{i:05d} " + "x" * 40 + "\n" for i in range(1, total + 1)),
+        encoding="utf-8",
+    )
+
+
+def test_read_file_large_no_range_returns_preview(tmp_path):
+    """大文件无区间：只回预览 + 大小 + 续读提示，不整文件返回。"""
+    target = tmp_path / "large.txt"
+    _write_large_file(target)
+
+    result = read_file(str(target))
+    assert result.success is True
+    assert "已显示前" in result.content
+    assert "后续请用 start_line/end_line 读取" in result.content
+    assert "文件大小" not in result.content  # 无区间预览用"大小"，不是"文件大小"
+    assert "KB" in result.content
+    assert "row00001" in result.content
+    assert "row00500" not in result.content       # 预览之外
+    assert len(result.content) < 20_000           # 远小于原文件
+
+
+def test_read_file_large_range_streams_only_requested(tmp_path):
+    """大文件带区间：只返回请求行，不整读；头部不带总行数。"""
+    target = tmp_path / "large_range.txt"
+    _write_large_file(target)
+
+    result = read_file(str(target), start_line=1000, end_line=1002)
+    assert result.success is True
+    assert "第 1000-1002 行" in result.content
+    assert "文件大小" in result.content
+    assert "共 5000 行" not in result.content
+    assert "row01000" in result.content
+    assert "row01002" in result.content
+    assert "row00001" not in result.content
+    assert "row01003" not in result.content
+
+
+def test_read_file_large_start_only_is_capped(tmp_path):
+    """大文件只给 start_line：单次最多 200 行，不隐式读到 EOF。"""
+    target = tmp_path / "large_tail.txt"
+    _write_large_file(target, total=5000)
+
+    result = read_file(str(target), start_line=1000)
+    assert result.success is True
+    assert "第 1000-1199 行" in result.content
+    assert "继续请设 start_line=1200" in result.content
+    assert "row01000" in result.content
+    assert "row01199" in result.content
+    assert "row01200" not in result.content
+    assert "共 5000 行" not in result.content
+
+
+def test_read_file_large_start_only_near_eof(tmp_path):
+    """靠近文件尾时不足 200 行，读到 EOF 后给出总行数。"""
+    target = tmp_path / "large_near_eof.txt"
+    _write_large_file(target, total=3000)
+
+    result = read_file(str(target), start_line=2900)
+    assert result.success is True
+    assert "第 2900-3000 行" in result.content
+    assert "共 3000 行" in result.content
+    assert "继续请设" not in result.content
+    assert "row02900" in result.content
+    assert "row03000" in result.content
+
+
+def test_read_file_range_truncates_huge_line(tmp_path):
+    """单行超长：区间读取按行上限截断，不把整行读进内存。"""
+    target = tmp_path / "huge_line.txt"
+    target.write_text("before\n" + "A" * 100_000 + "\n" + "after\n", encoding="utf-8")
+
+    result = read_file(str(target), start_line=1, end_line=3)
+    assert result.success is True
+    assert "部分超长行已截断" in result.content
+    assert "该行过长，已截断" in result.content
+    assert "原长 100000 字符" in result.content
+    assert "before" in result.content
+    assert "after" in result.content
+    assert result.content.count("A") < 20_000
+
+
+def test_read_file_large_range_out_of_bounds(tmp_path):
+    target = tmp_path / "large_short.txt"
+    _write_large_file(target, total=3000)
+
+    result = read_file(str(target), start_line=99999)
+    assert result.success is True
+    assert "落在文件之外" in result.content
+    assert "文件共 3000 行" in result.content
+
+
+def test_read_file_preview_truncates_overlong_line(tmp_path):
+    """单行超长（minified）也受字符上限约束，不会把整行读进预览。"""
+    target = tmp_path / "one_line.txt"
+    target.write_text("A" * 100_000, encoding="utf-8")
+
+    result = read_file(str(target))
+    assert result.success is True
+    assert "最后一行过长，已截断" in result.content
+    assert "…" in result.content
+    assert result.content.count("A") < 20_000
 
 
 # ---------------- read_file 二进制 / 非 UTF-8 的可预期回执 ----------------

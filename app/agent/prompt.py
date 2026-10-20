@@ -69,16 +69,27 @@ SYSTEM_PROMPT = """\
 [查询 / 检索]（本地文件检索免审批）
 - read_file(path, start_line?, end_line?)：读取文件内容。大文件务必用 start_line/end_line
   只读需要的行区间（1 起始、含端点），别把整段大文件塞满上下文；改完按区间复查也用它。
-- list_dir(path)：列出目录下的文件与子目录。
-- get_directory_tree(path, max_depth=3)：递归打印目录树，摸清项目/目录布局首选。
-- glob(pattern, path=".", include_dirs?)：按文件名/通配模式在工作区定位路径
+  无区间读取超过 64 KB 的文件只返回前 200 行 / 16 KB 的预览（头部会说明），不会整文件灌入；
+  带行区间时工具流式读到 end_line，不会先整读整个文件；只给 start_line 时大文件单次最多
+  200 行（继续请把下一行作为 start_line），单行过长会截断并标注。
+- list_dir(path)：列出目录下的文件与子目录；**文件带大小**（B/KB/MB），可据此判断是否
+  整文件读取。单目录最多显示 150 项；超出时完整清单落盘到 `.theta/tmp/`，回执里给出
+  可直接用 read_file 读取的相对路径。
+- get_directory_tree(path, max_depth=3, skip_hidden_dirs?, include_ignored_dirs?)：递归打印
+  目录树，摸清项目/目录布局首选。默认跳过 .git/.venv/.idea 等隐藏目录与
+  node_modules/__pycache__/venv/dist 等黑名单目录（只列出目录本身、不递归进去）；
+  `skip_hidden_dirs=False` 全部展开，`include_ignored_dirs=True` 只放开黑名单目录
+  （其他隐藏目录仍跳过）。**文件带大小**，大文件应改用 read_file 的 start_line/end_line
+  分段读。**每个目录最多显示 150 项**；超出时完整树落盘到 `.theta/tmp/`，回执里给出路径。
+- glob(pattern, path=".", include_dirs?, max_results?)：按文件名/通配模式在工作区定位路径
   （"*.py"、"src/**/*.ts"、"tests/**/test_*.py"）。知道"名字长什么样"找文件用它，
-  只列名字不读内容；与 search_content（按内容）互补。
+  只列名字不读内容；与 search_content（按内容）互补。max_results 默认 200、硬上限 500。
 - search_content(query, path=".", max_results, extensions, use_regex?, case_sensitive?,
   context_lines?)：在工作区文件里按内容检索，返回 相对路径:行号:行 的命中清单。
   默认"大小写不敏感子串"；use_regex=True 走正则、case_sensitive=True 区分大小写、
   context_lines=N 附带上下文行。用于定位某段逻辑/报错/标识符在哪，找到后再
-  read_file 取更完整上下文。
+  read_file 取更完整上下文。max_results 硬上限 200、context_lines 硬上限 10；
+  单行 500 字符、总输出 32 KB、单文件 4 MB，超出会截断/跳过并提示。
 （git 仓库的查看与操作一律走 run_command，见[工具总览 · 版本控制]。）
 - read_note(note_id)：读取会话笔记正文（联网检索等被折叠归档的原文，note_id 形如
   "notes#r3"）。当折叠摘要/提示里出现「详情见 notes#rN」、需要看原文时调用。免审批。

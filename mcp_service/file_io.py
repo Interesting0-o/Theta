@@ -20,6 +20,7 @@
 import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
@@ -73,6 +74,18 @@ def _is_binary(data: bytes) -> bool:
     两处口径必须一致，改一处漏一处就会出现"搜索跳过、read_file 炸掉"的分裂行为。
     """
     return b"\x00" in data[:4096]
+
+
+def _format_size(size: int) -> str:
+    """文件大小的人类可读形式（B / KB / MB / GB / TB，非 B 保留一位小数）。"""
+    if size < 1024:
+        return f"{size} B"
+    value = size / 1024
+    for unit in ("KB", "MB", "GB"):
+        if value < 1024:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
 
 
 # 注：这里曾有一张 _MAGIC_PREFIXES 魔数表（按文件头猜"PNG 图片/PDF 文档"这类标签）。2026-09-15
@@ -318,6 +331,166 @@ def edit_file(
     times = count if replace_all else 1
     return ToolResult(success=True, content=f"文件 {file_path} 已编辑（替换 {times} 处）")
 
+
+# ---------------- read_file：大文件门限 / 预览 / 流式区间 ----------------
+# 文件超过 GATE 且无行区间：只回预览，不整读；带行区间：流式读到 end_line。
+READ_FILE_GATE_BYTES = 64 * 1024
+READ_FILE_PREVIEW_LINES = 200
+READ_FILE_PREVIEW_CHARS = 16 * 1024
+# 单行上限：区间读取时超长行截断到这么多字符，并跳过该行其余部分（内存有界）。
+READ_FILE_LINE_MAX_CHARS = 16 * 1024
+
+
+def _binary_receipt(path: str, size: int) -> ToolResult:
+    return ToolResult(
+        success=True,
+        content=f"{path} 是二进制文件，大小 {size} 字节，无法作为文本读取",
+    )
+
+
+def _non_utf8_receipt(path: str, size: int) -> ToolResult:
+    return ToolResult(
+        success=True,
+        content=(
+            f"{path} 不是 UTF-8 编码的文本（可能是 GBK/latin-1 等编码），"
+            f"大小 {size} 字节，无法按文本读取；如需内容可用终端命令转码"
+        ),
+    )
+
+
+def _preview_large_file(file_path: Path, path: str, size: int) -> ToolResult:
+    """大文件无行区间：只读前 N 行 / 前 M 字符，绝不整读。"""
+    lines: list[str] = []
+    used = 0
+    hit_eof = False
+    truncated = False
+    try:
+        with open(file_path, "r", encoding="utf-8", newline=None) as f:
+            for _ in range(READ_FILE_PREVIEW_LINES):
+                remaining = READ_FILE_PREVIEW_CHARS - used
+                if remaining <= 0:
+                    break
+                line = f.readline(remaining + 1)
+                if not line:
+                    hit_eof = True
+                    break
+                if len(line) > remaining:
+                    lines.append(line[:remaining] + "…\n")
+                    truncated = True
+                    break
+                lines.append(line)
+                used += len(line)
+    except OSError as e:
+        return ToolResult(success=False, error_type="io_error", content=f"读取文件失败: {e}")
+    except UnicodeDecodeError:
+        return _non_utf8_receipt(path, size)
+
+    if truncated:
+        state = f"已显示前 {len(lines)} 行（最后一行过长，已截断）；后续请用 start_line/end_line 读取"
+    elif hit_eof:
+        state = f"已显示全文（{len(lines)} 行）"
+    else:
+        state = f"已显示前 {len(lines)} 行；后续请用 start_line/end_line 读取"
+    header = f"[{path} 大小 {_format_size(size)}；{state}]"
+    return ToolResult(success=True, content=header + "\n" + "".join(lines))
+
+
+def _iter_capped_lines(f, cap: int):
+    """逐逻辑行读取；单行超过 cap 字符时截断并跳过其余部分（内存有界）。
+
+    产出 (line_no, text, truncated)。跳过的部分也要读完才能找到下一个换行，但只按
+    `cap + 1` 字符一块地读，不会把整行一次性放进内存。
+    """
+    no = 0
+    while True:
+        first = f.readline(cap + 1)
+        if not first:
+            return
+        no += 1
+        if first.endswith("\n") or len(first) <= cap:
+            yield no, first, False
+            continue
+
+        head = first[:cap]
+        total = len(first)
+        chunk = first
+        while not chunk.endswith("\n"):
+            chunk = f.readline(cap + 1)
+            if not chunk:
+                break
+            total += len(chunk)
+        content_len = total - 1 if chunk.endswith("\n") else total
+        yield (
+            no,
+            head + f"…[该行过长，已截断，原长 {content_len} 字符]…\n",
+            True,
+        )
+
+
+def _read_range_large(
+    file_path: Path,
+    path: str,
+    size: int,
+    start_line: int | None,
+    end_line: int | None,
+) -> ToolResult:
+    """大文件行区间：流式读到 end_line，不整文件读入。
+
+    - 显式给 end_line：按请求读；
+    - 只给 start_line（end_line=None）：单次最多 READ_FILE_PREVIEW_LINES 行，避免隐式读到 EOF；
+    - 单行超过 READ_FILE_LINE_MAX_CHARS：截断该行并在头部标注。
+    """
+    lo = start_line if start_line is not None else 1
+    capped = end_line is None
+    hard_end = end_line if end_line is not None else lo + READ_FILE_PREVIEW_LINES - 1
+
+    kept: list[str] = []
+    last_no = 0
+    hit_eof = True
+    truncated_any = False
+    try:
+        with open(file_path, "r", encoding="utf-8", newline=None) as f:
+            for no, text, truncated in _iter_capped_lines(f, READ_FILE_LINE_MAX_CHARS):
+                last_no = no
+                if no < lo:
+                    continue
+                if no > hard_end:
+                    hit_eof = False
+                    break
+                kept.append(text.rstrip("\n"))
+                truncated_any = truncated_any or truncated
+    except OSError as e:
+        return ToolResult(success=False, error_type="io_error", content=f"读取文件失败: {e}")
+    except UnicodeDecodeError:
+        return _non_utf8_receipt(path, size)
+
+    if not kept:
+        wanted = f"{lo}-{end_line}" if end_line is not None else f"{lo}-文件尾"
+        return ToolResult(
+            success=True,
+            content=(
+                f"（{path} 大小 {_format_size(size)}；请求的行区间 {wanted} "
+                f"落在文件之外，无内容；文件共 {last_no} 行）"
+            ),
+        )
+
+    hi = lo + len(kept) - 1
+    header = f"{path} 第 {lo}-{hi} 行"
+    if hit_eof:
+        header += f" / 共 {last_no} 行"
+    header += f"；文件大小 {_format_size(size)}"
+    if capped and not hit_eof:
+        header += (
+            f"；只给 start_line 时大文件单次最多 {READ_FILE_PREVIEW_LINES} 行，"
+            f"继续请设 start_line={hi + 1}"
+        )
+    if truncated_any:
+        header += "；部分超长行已截断"
+
+    body = "\n".join(kept)
+    return ToolResult(success=True, content=f"[{header}]\n{body}")
+
+
 @mcp.tool()
 @guard
 def read_file(
@@ -327,10 +500,19 @@ def read_file(
 ) -> ToolResult:
     """
     读取指定路径的文件，可选只读某段行区间，避免大文件整段塞满上下文。
+
+    大文件处理：
+    - 无行区间且文件超过 READ_FILE_GATE_BYTES（64 KB）：只返回预览（前 N 行 / 前 M 字符），
+      头部带文件大小与续读提示，**不整读**；
+    - 带行区间：流式读到 end_line，不整文件读入；大文件头部不带总行数；
+    - 只给 start_line 时，大文件单次最多 READ_FILE_PREVIEW_LINES 行（继续请把下一行作为
+      start_line）；单行超过 READ_FILE_LINE_MAX_CHARS 会截断并在头部标注。
+
     二进制文件（图片/压缩包等）与非 UTF-8 文本不会报错，返回说明性回执（类型 + 大小）。
+
     Args:
         path: 需要读取文件的路径。
-        start_line: 可选，起始行号（从 1 计、含）；只传它则从该行读到文件尾。
+        start_line: 可选，起始行号（从 1 计、含）；只传它则从该行往后读（大文件单次最多 200 行）。
         end_line: 可选，结束行号（含）；须不小于 start_line。留空默认读到文件尾。
     """
     # 行号参数非法在文件 IO 前拦下，抛 InvalidArgumentError（guard 归成 invalid_argument）
@@ -346,40 +528,44 @@ def read_file(
     file_path = _resolve_path(path)  # 解析路径
     _is_in_workspace(file_path)  # 读取同样受工作区沙箱约束
 
-    # 先以字节探测，不再直接按文本打开：UnicodeDecodeError 不是 OSError 子类，旧实现里它会
-    # 冒到 guard 被误判成 internal_error（回执还是"无需重试"），模型读一张 PNG 会得出误导结论。
-    # 二进制只读头部 + stat 拿大小，不整读（几 GB 的文件也不怕）；NUL 探测放行的再整读解码。
+    # 先以字节探测：二进制/编码错误要在整读之前识别；stat 拿大小决定走整读还是预览/流式。
     try:
         with open(file_path, "rb") as f:
             head = f.read(4096)
-        if _is_binary(head):
-            size = file_path.stat().st_size
-            return ToolResult(
-                success=True,
-                content=f"{path} 是二进制文件，大小 {size} 字节，无法作为文本读取",
-            )
+        size = file_path.stat().st_size
+    except OSError as e:
+        return ToolResult(success=False, error_type="io_error", content=f"读取文件失败: {e}")
+
+    if _is_binary(head):
+        return _binary_receipt(path, size)
+
+    # 无行区间：小文件保持"原样返回、无头部"；大文件只回预览，不整读。
+    if start_line is None and end_line is None:
+        if size > READ_FILE_GATE_BYTES:
+            return _preview_large_file(file_path, path, size)
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read()
+            # 与旧实现一致：universal newlines 会把 \r\n / \r 翻成 \n，编辑锚定依赖这一点。
+            content = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        except OSError as e:
+            return ToolResult(success=False, error_type="io_error", content=f"读取文件失败: {e}")
+        except UnicodeDecodeError:
+            return _non_utf8_receipt(path, size)
+        return ToolResult(success=True, content=content)
+
+    # 带行区间：大文件流式读到 end_line；小文件保留整读以给出"共 N 行"。
+    if size > READ_FILE_GATE_BYTES:
+        return _read_range_large(file_path, path, size, start_line, end_line)
+
+    try:
         with open(file_path, "rb") as f:
             data = f.read()
-        # 旧实现按文本模式打开，universal newlines 会把 \r\n / \r 翻成 \n——编辑锚定与既有的
-        # 行号逻辑都建立在它上面，这里显式保持同一行为，别让字节读悄悄改掉行尾。
         content = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     except OSError as e:
         return ToolResult(success=False, error_type="io_error", content=f"读取文件失败: {e}")
     except UnicodeDecodeError:
-        # 没过 NUL 探测但解不开 UTF-8：多半是 GBK 等本地编码的文本。同样给可预期回执
-        # （要内容可走终端命令转码），不装作读到了、也不当内部错误。
-        size = file_path.stat().st_size
-        return ToolResult(
-            success=True,
-            content=(
-                f"{path} 不是 UTF-8 编码的文本（可能是 GBK/latin-1 等编码），"
-                f"大小 {size} 字节，无法按文本读取；如需内容可用终端命令转码"
-            ),
-        )
-
-    # 未指定行区间：整文件原样返回（保持原有行为，不附加行号标题，避免污染编辑锚定）
-    if start_line is None and end_line is None:
-        return ToolResult(success=True, content=content)
+        return _non_utf8_receipt(path, size)
 
     lines = content.splitlines()
     total = len(lines)
@@ -401,11 +587,53 @@ def read_file(
     )
 
 
+# ---------------- 目录列表/树：单目录条目上限与完整清单落盘 ----------------
+MAX_DIR_ENTRIES = 150
+DUMP_DIR_REL = Path(".theta") / "tmp"
+
+
+def _create_dump_file(prefix: str):
+    """在工作区 .theta/tmp 下创建 UTF-8 转储文件；失败返回 (None, None)。"""
+    try:
+        dump_dir = WORKSPACE_PATH / DUMP_DIR_REL
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=f"{prefix}_", suffix=".txt", dir=dump_dir)
+        os.close(fd)
+        try:
+            file = open(name, "w", encoding="utf-8")
+        except OSError:
+            Path(name).unlink(missing_ok=True)
+            raise
+        rel = Path(name).relative_to(WORKSPACE_PATH).as_posix()
+        return file, rel
+    except OSError:
+        return None, None
+
+
+def _discard_dump(dump_file, dump_rel) -> None:
+    """关闭并删除转储文件（写失败或最终不需要时）。"""
+    if dump_file is not None:
+        try:
+            dump_file.close()
+        except OSError:
+            pass
+    if dump_rel:
+        try:
+            (WORKSPACE_PATH / dump_rel).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 @mcp.tool()
 @guard
 def list_dir(path: str) -> ToolResult:
     """
     列出指定目录下的文件与子目录(按名称排序，目录在前)。
+
+    文件会附带大小（B/KB/MB），用于判断是否值得整文件读入；目录不带大小。
+    单个目录最多显示 MAX_DIR_ENTRIES（150）项；超出时完整清单写入工作区
+    `.theta/tmp/`，回执里给出可直接用于 read_file 的相对路径。
+
     Args:
         path: 要列出的目录路径
     """
@@ -417,36 +645,137 @@ def list_dir(path: str) -> ToolResult:
             return ToolResult(success=False, content=f"路径不是目录或不存在: {dir_path}")
         entries = []
         for entry in sorted(dir_path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
-            kind = "dir" if entry.is_dir() else "file"
-            entries.append(f"[{kind}] {entry.name}")
-        content = "\n".join(entries) if entries else "(空目录)"
-        return ToolResult(success=True, content=f"目录: {dir_path}\n{content}")
+            if entry.is_dir():
+                entries.append(f"[dir] {entry.name}")
+                continue
+            try:
+                size = _format_size(entry.stat().st_size)
+            except OSError:
+                size = "?"
+            entries.append(f"[file] {entry.name}  ({size})")
+
+        if not entries:
+            return ToolResult(success=True, content=f"目录: {dir_path}\n(空目录)")
+        if len(entries) <= MAX_DIR_ENTRIES:
+            return ToolResult(success=True, content=f"目录: {dir_path}\n" + "\n".join(entries))
+
+        dump_file, dump_rel = _create_dump_file("list")
+        if dump_file is not None:
+            try:
+                dump_file.write(f"目录: {dir_path}\n" + "\n".join(entries) + "\n")
+                dump_file.close()
+            except OSError:
+                _discard_dump(dump_file, dump_rel)
+                dump_rel = None
+
+        shown = entries[:MAX_DIR_ENTRIES]
+        remaining = len(entries) - MAX_DIR_ENTRIES
+        note = f"完整清单见 {dump_rel}" if dump_rel else "完整清单落盘失败"
+        content = (
+            f"目录: {dir_path}\n"
+            + "\n".join(shown)
+            + f"\n... 还有 {remaining} 项（已省略；{note}）"
+        )
+        return ToolResult(success=True, content=content)
     except PermissionError:
         return ToolResult(success=False, content=f"无权限访问目录: {path}")
     except OSError as e:
         return ToolResult(success=False, error_type="io_error", content=f"列目录失败: {e}")
 
 
+# get_directory_tree 默认不展开的目录名（大小写不敏感）。与"隐藏目录"规则叠加：
+# skip_hidden_dirs=True 时，这些目录与 '.' 开头的目录都只列一行、不递归。
+# 这是一份保守的"依赖 / VCS / IDE / 构建产物"清单；项目特殊目录按需增删。
+IGNORED_DIR_NAMES: frozenset[str] = frozenset(
+    {
+        ".git", ".hg", ".svn",
+        ".venv", "venv",
+        "node_modules",
+        ".idea", ".vscode", ".vs",
+        "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+        ".tox", ".nox", ".cache",
+        "dist", "build", "target", ".next", ".nuxt",
+    }
+)
+
+
 @mcp.tool()
 @guard
-def get_directory_tree(path: str, max_depth: int = 3) -> ToolResult:
+def get_directory_tree(
+    path: str,
+    max_depth: int = 3,
+    skip_hidden_dirs: bool = True,
+    include_ignored_dirs: bool = False,
+) -> ToolResult:
     """
     递归获取目录结构树，可用于了解项目/文件夹的整体布局。
+
+    默认跳过不展开的目录：以 '.' 开头的子目录（.git / .venv / .idea 等）以及
+    `IGNORED_DIR_NAMES` 黑名单（node_modules / __pycache__ / venv / dist 等）。它们只在
+    树里列出目录本身、不递归进去；隐藏**文件**（如 .env）仍会列出。根目录不受此选项
+    影响——显式传入 '.git' 作为根时仍会展开。
+
+    两个开关的关系：
+    - `skip_hidden_dirs=False`：隐藏目录与黑名单目录**全部**照常递归；
+    - `include_ignored_dirs=True`：在 `skip_hidden_dirs=True` 时额外允许展开**黑名单目录**
+      （包括 .git / .venv 这类同时在黑名单里的隐藏目录）；其他未列入黑名单的隐藏目录
+      仍会跳过。
+
+    文件会附带大小（B/KB/MB），用于判断是否值得整文件读入；目录不带大小。
+
+    **单个目录最多显示 MAX_DIR_ENTRIES（150）个条目**；超出时该目录显示前 150 项 + 省略
+    计数，并把完整树写入工作区 `.theta/tmp/`，回执里给出可直接用 read_file 读取的相对路径。
+
     Args:
         path: 根目录路径
         max_depth: 最大递归深度(默认 3，最小 1)
+        skip_hidden_dirs: 是否跳过隐藏目录/黑名单（默认 True；False 时全部展开）
+        include_ignored_dirs: 是否允许展开黑名单目录（默认 False；True 时黑名单不再跳过）
     """
+    dump_file = None
+    dump_rel = None
     try:
         root = _resolve_path(path)
         _is_in_workspace(root)  # 目录结构读取同样受工作区沙箱约束；越界抛给 guard，不被下方 OSError 吞掉
         if not root.is_dir():
             return ToolResult(success=False, content=f"路径不是目录或不存在: {root}")
         max_depth = max(1, int(max_depth))
-        lines: list[str] = [f"{root}/"]
+        lines: list[str] = []
+        omitted_any = False
 
-        def walk(current: Path, depth: int, prefix: str, seen: set) -> None:
+        dump_file, dump_rel = _create_dump_file("tree")
+        if dump_file is not None:
+            try:
+                dump_file.write(
+                    f"# get_directory_tree: {path} (max_depth={max_depth}, "
+                    f"skip_hidden_dirs={skip_hidden_dirs}, "
+                    f"include_ignored_dirs={include_ignored_dirs})\n"
+                )
+            except OSError:
+                _discard_dump(dump_file, dump_rel)
+                dump_file, dump_rel = None, None
+
+        def dump_write(text: str) -> None:
+            nonlocal dump_file, dump_rel
+            if dump_file is None:
+                return
+            try:
+                dump_file.write(text)
+            except OSError:
+                _discard_dump(dump_file, dump_rel)
+                dump_file, dump_rel = None, None
+
+        root_line = f"{root}/"
+        lines.append(root_line)
+        dump_write(root_line + "\n")
+
+        def walk(current: Path, depth: int, prefix: str, seen: set, render: bool) -> None:
+            nonlocal omitted_any
             if depth > max_depth:
-                lines.append(f"{prefix}  ... (超出深度 {max_depth})")
+                marker = f"{prefix}  ... (超出深度 {max_depth})"
+                if render:
+                    lines.append(marker)
+                dump_write(marker + "\n")
                 return
             try:
                 entries = sorted(
@@ -454,14 +783,51 @@ def get_directory_tree(path: str, max_depth: int = 3) -> ToolResult:
                     key=lambda p: (not p.is_dir(), p.name.lower()),
                 )
             except PermissionError:
-                lines.append(f"{prefix}  (无权限访问)")
+                marker = f"{prefix}  (无权限访问)"
+                if render:
+                    lines.append(marker)
+                dump_write(marker + "\n")
                 return
+
+            shown_here = 0
+            omitted_here = 0
             for i, entry in enumerate(entries):
                 last = i == len(entries) - 1
                 branch = "└── " if last else "├── "
                 is_dir = entry.is_dir()
-                lines.append(f"{prefix}{branch}{entry.name}{'/' if is_dir else ''}")
+                hidden = entry.name.startswith(".")
+                ignored = entry.name.lower() in IGNORED_DIR_NAMES
+                skip_expand = (
+                    is_dir
+                    and skip_hidden_dirs
+                    and (hidden or ignored)
+                    and not (ignored and include_ignored_dirs)
+                )
+                if skip_expand:
+                    reason = "隐藏目录" if hidden else "黑名单目录"
+                    suffix = f"  ({reason}，已跳过递归)"
+                elif is_dir:
+                    suffix = ""
+                else:
+                    try:
+                        suffix = f"  ({_format_size(entry.stat().st_size)})"
+                    except OSError:
+                        suffix = "  (?)"
+                line = f"{prefix}{branch}{entry.name}{'/' if is_dir else ''}{suffix}"
+                dump_write(line + "\n")
+
+                if render and shown_here < MAX_DIR_ENTRIES:
+                    lines.append(line)
+                    shown_here += 1
+                    child_render = True
+                else:
+                    if render:
+                        omitted_here += 1
+                    child_render = False
+
                 if is_dir:
+                    if skip_expand:
+                        continue
                     try:
                         real = entry.resolve()
                     except OSError:
@@ -470,18 +836,43 @@ def get_directory_tree(path: str, max_depth: int = 3) -> ToolResult:
                     # 递归进去就会把工作区外的目录/文件名列进树里（内容读不到，但不该列）。
                     # 与 search_content 对候选路径的口径一致：resolve 后校验，越界即跳过。
                     if not real.is_relative_to(WORKSPACE_PATH):
-                        lines.append(f"{prefix}    └── (指向工作区外，已跳过)")
+                        marker = f"{prefix}    └── (指向工作区外，已跳过)"
+                        if child_render:
+                            lines.append(marker)
+                        dump_write(marker + "\n")
                         continue
                     if real in seen:
-                        lines.append(f"{prefix}    └── (循环引用，已跳过)")
+                        marker = f"{prefix}    └── (循环引用，已跳过)"
+                        if child_render:
+                            lines.append(marker)
+                        dump_write(marker + "\n")
                         continue
                     seen = seen | {real}
                     child_prefix = prefix + ("    " if last else "│   ")
-                    walk(entry, depth + 1, child_prefix, seen)
+                    walk(entry, depth + 1, child_prefix, seen, child_render)
 
-        walk(root, 1, "", set())
+            if render and omitted_here:
+                omitted_any = True
+                note = f"完整清单见 {dump_rel}" if dump_rel else "完整清单落盘失败"
+                lines.append(f"{prefix}  ... 还有 {omitted_here} 项（已省略；{note}）")
+
+        walk(root, 1, "", set(), True)
+
+        if dump_file is not None:
+            try:
+                dump_file.close()
+            except OSError:
+                _discard_dump(dump_file, dump_rel)
+                dump_rel = None
+            else:
+                if not omitted_any:
+                    _discard_dump(None, dump_rel)
+                    dump_rel = None
+        if omitted_any and dump_rel is None:
+            lines.append("... [完整清单落盘失败]")
         return ToolResult(success=True, content="\n".join(lines))
     except OSError as e:
+        _discard_dump(dump_file, dump_rel)
         return ToolResult(success=False, error_type="io_error", content=f"获取目录结构失败: {e}")
 
 
@@ -534,6 +925,15 @@ def _compile_glob(pattern: str) -> re.Pattern:
     return re.compile("^" + "".join(regex_parts) + "$")
 
 
+# glob / search_content 的输出上限：防止模型传超大参数把上下文打爆。
+MAX_GLOB_RESULTS = 500
+MAX_SEARCH_RESULTS = 200
+MAX_SEARCH_CONTEXT_LINES = 10
+MAX_SEARCH_LINE_CHARS = 500
+MAX_SEARCH_OUTPUT_CHARS = 32 * 1024
+MAX_SEARCH_FILE_BYTES = 4 * 1024 * 1024
+
+
 @mcp.tool()
 @guard
 def glob(
@@ -563,7 +963,7 @@ def glob(
         pattern: shell 通配模式，如 "*.py"、"test_*.py"、"src/**/*.ts"。
         path: 起始目录，默认整个工作区；须在工作区内。
         include_dirs: 是否也列出目录（目录会带尾 '/'），默认 False（只列文件）。
-        max_results: 最多返回多少条命中，超出即截断并提示（默认 200）。
+        max_results: 最多返回多少条命中（默认 200；硬上限 500，超出会被夹住）。
     """
     if not pattern or not pattern.strip():
         raise InvalidArgumentError("pattern 不能为空，给出要找的文件名/通配模式")
@@ -573,7 +973,9 @@ def glob(
     if not root.is_dir():
         return ToolResult(success=False, content=f"路径不是目录或不存在: {root}")
 
-    max_results = max(1, int(max_results))
+    requested = max(1, int(max_results))
+    max_results = min(requested, MAX_GLOB_RESULTS)
+    clamped = requested > MAX_GLOB_RESULTS
     stripped = pattern.strip()
     has_dir = "/" in stripped
     try:
@@ -617,13 +1019,18 @@ def glob(
             break
 
     if not hits:
-        return ToolResult(success=True, content=f"未在 {root} 中找到匹配 {pattern!r} 的路径")
+        msg = f"未在 {root} 中找到匹配 {pattern!r} 的路径"
+        if clamped:
+            msg += f"（max_results 已限制为 {MAX_GLOB_RESULTS}）"
+        return ToolResult(success=True, content=msg)
 
     body = (
         f"命中过多，仅显示前 {max_results} 条（可加长 pattern 或收窄 path）：\n"
         if capped
         else f"共命中 {len(hits)} 条：\n"
     )
+    if clamped:
+        body += f"（max_results={requested} 已限制为 {MAX_GLOB_RESULTS}）\n"
     return ToolResult(success=True, content=body + "\n".join(hits))
 
 
@@ -652,16 +1059,16 @@ def search_content(
       此时 case_sensitive=True 会去掉 IGNORECASE；
     - context_lines=N：每个命中附带前后 N 行（N=0 只返回命中行本身，默认）。
     检索本身：自动跳过隐藏目录(. 开头)、二进制文件与指向工作区外的符号链接；
-    path/extensions/max_results 与原来一致。
+    单文件超过 4 MB 会跳过并计数；单行超过 500 字符会截断；总输出超过 32 KB 会截断。
 
     Args:
         query: 检索词：纯文本子串（默认）或正则（use_regex=True）。
         path: 检索的起始目录，默认整个工作区；相对/绝对路径均可，须在工作区内。
-        max_results: 最多返回多少条命中，超出即截断并提示。
+        max_results: 最多返回多少条命中（默认 50；硬上限 200，超出会被夹住）。
         extensions: 只在这些后缀里检索（如 [".py", ".md"]，不带点也接受）；默认不限定。
         use_regex: query 是否按正则匹配，默认 False（纯子串）。
         case_sensitive: 是否区分大小写，默认 False（忽略）。
-        context_lines: 每个命中附带的前后行数，默认 0（只返回命中行本身）。
+        context_lines: 每个命中附带的前后行数（默认 0；硬上限 10）。
     """
     root = _resolve_path(path)
     _is_in_workspace(root)
@@ -671,8 +1078,13 @@ def search_content(
     if not query or not query.strip():
         return ToolResult(success=False, content="query 不能为空")
 
-    max_results = max(1, max_results)
-    context_lines = max(0, int(context_lines or 0))
+    requested_results = max(1, int(max_results))
+    max_results = min(requested_results, MAX_SEARCH_RESULTS)
+    clamped_results = requested_results > MAX_SEARCH_RESULTS
+
+    requested_ctx = int(context_lines or 0)
+    context_lines = min(max(0, requested_ctx), MAX_SEARCH_CONTEXT_LINES)
+    clamped_context = requested_ctx > MAX_SEARCH_CONTEXT_LINES
 
     # 匹配器：正则 / 子串，按 case_sensitive 决定是否忽略大小写
     if use_regex:
@@ -702,6 +1114,14 @@ def search_content(
     lines_out: list[str] = []
     total_hits = 0
     capped = False
+    output_chars = 0
+    output_capped = False
+    skipped_large = 0
+
+    def _clip_line(line: str) -> str:
+        if len(line) <= MAX_SEARCH_LINE_CHARS:
+            return line
+        return line[:MAX_SEARCH_LINE_CHARS] + f"…[本行原长 {len(line)} 字符]…"
 
     for dirpath, dirnames, filenames in os.walk(root):
         # 跳过隐藏目录（.git / .venv / node_modules 等以点开头的）
@@ -722,6 +1142,9 @@ def search_content(
             if ext_set is not None and real.suffix.lower() not in ext_set:
                 continue
             try:
+                if real.stat().st_size > MAX_SEARCH_FILE_BYTES:
+                    skipped_large += 1
+                    continue
                 data = real.read_bytes()
             except OSError:
                 continue
@@ -753,25 +1176,58 @@ def search_content(
                             min(len(text_lines), no + context_lines) + 1,
                         )
                     )
-                lines_out.extend(f"{rel}:{no}: {text_lines[no - 1]}" for no in sorted(shown))
+                new_lines = [
+                    f"{rel}:{no}: {_clip_line(text_lines[no - 1])}" for no in sorted(shown)
+                ]
             else:
-                lines_out.extend(f"{rel}:{no}: {text_lines[no - 1]}" for no in matched)
+                new_lines = [
+                    f"{rel}:{no}: {_clip_line(text_lines[no - 1])}" for no in matched
+                ]
+
+            for line in new_lines:
+                if output_chars + len(line) + 1 > MAX_SEARCH_OUTPUT_CHARS:
+                    output_capped = True
+                    break
+                lines_out.append(line)
+                output_chars += len(line) + 1
+            if output_capped:
+                break
 
             if capped:
                 break
-        if capped:
+        if capped or output_capped:
             break
 
-    if total_hits == 0:
-        return ToolResult(success=True, content=f"未在 {root} 中找到包含 {query!r} 的文本")
+    notes: list[str] = []
+    if clamped_results:
+        notes.append(f"max_results 已限制为 {MAX_SEARCH_RESULTS}")
+    if clamped_context:
+        notes.append(f"context_lines 已限制为 {MAX_SEARCH_CONTEXT_LINES}")
+    if skipped_large:
+        notes.append(
+            f"已跳过 {skipped_large} 个大于 {_format_size(MAX_SEARCH_FILE_BYTES)} 的文件"
+        )
 
+    if total_hits == 0:
+        msg = f"未在 {root} 中找到包含 {query!r} 的文本"
+        if notes:
+            msg += "（" + "；".join(notes) + "）"
+        return ToolResult(success=True, content=msg)
+
+    if output_capped:
+        notes.append("输出已截断，后续命中未显示；请收窄 query/path/extensions")
     ctx = f"（含每处前后 {context_lines} 行）" if context_lines else ""
-    body = (
-        f"命中过多，仅显示前 {max_results} 条命中{ctx}：\n"
-        if capped
-        else f"共命中 {total_hits} 条{ctx}：\n"
-    )
-    return ToolResult(success=True, content=body + "\n".join(lines_out))
+    if output_capped:
+        head = f"输出已截断，以下为已显示的部分命中{ctx}："
+    elif capped:
+        head = f"命中过多，仅显示前 {max_results} 条命中{ctx}："
+    else:
+        head = f"共命中 {total_hits} 条{ctx}："
+    body = head
+    if notes:
+        body += "\n" + "；".join(notes)
+    body += "\n" + "\n".join(lines_out)
+    return ToolResult(success=True, content=body)
 
 
 if __name__ == "__main__":
