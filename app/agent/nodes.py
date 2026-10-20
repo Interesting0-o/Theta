@@ -1484,12 +1484,14 @@ class CompactNode:
 #   CompactNode  : messages[:last_human_index]        旧轮，轮末无条件执行
 #   CompressNode : messages[last_human_index + 1:]    当前轮，工具循环中执行
 # 轮内**不删消息**：图路由中间删掉结果会破坏 tool_call / ToolMessage 配对与调用方状态，
-# 因此只改 ToolMessage.content。两条规则：
-#   1) 终端返回**中间截断**（头 + 尾 + 省略标记）；
-#   2) 同一轮内对同一文件的重复 read_file：**最后一次成功读取为准**，其余换成指向它的
-#      指针（不看正文是否相同——文件随时可能被编辑，旧结果已经过期）。
+# 因此只改 ToolMessage.content。当前规则只有一条：
+#   同一轮内对同一文件的重复 read_file：**最后一次成功读取为准**，其余换成指向它的指针
+#   （不看正文是否相同——文件随时可能被编辑，旧结果已经过期）。
 # 工具按结果时效性分两类：terminal / file_io 读取属"随时会变"的一类，压缩从严；web /
-# github / memory 等相对稳定，仍走轮末折叠。目前"最新一次替代"只覆盖 read_file。
+# github / memory 等相对稳定，仍走轮末折叠。
+# **终端输出的中间截断已下沉到 terminal MCP 自己**（mcp_service/terminal.py::
+# _compress_output）：写在消息落地之前，消息从第一次进入 state 就是最终形态，节点不再
+# 事后改写它（对 prefix cache 更友好）。
 # 旧轮的整块折叠仍归 CompactNode。
 
 # read_file 去重的最小正文长度：被替换的旧正文太短时，指针和正文差不多，不值得换。
@@ -1502,58 +1504,31 @@ class CompressNode:
     职责边界（与 `CompactNode` 分工）：
 
     - **只看当前轮**：最后一条 HumanMessage 之后；`last_human` 之前一律不动；
-    - **终端返回中间截断**：`run_command` / `start_process` / `process_wait` /
-      `process_read` / `process_kill` / `process_list` 的 content 超过
-      `threshold_chars` 时，保留开头和末尾，中间换成
-      `…[终端输出中间已截断 N 字符]…`；默认阈值 `TEXT_BUDGET_CHARS`，头尾各取阈值的 1/4；
     - **read_file 同文件只留最新**：同一轮内、同一路径的多次成功读取，**最后一次成功
       读取**保留正文，其余（正文不短于 `read_dedup_min_chars` 的）换成
       `…[重复读取] 同一文件以 tool_call_id=<最后一次成功读取> 为准…`。
       判据是 tool_call 的 `path`，**不再要求正文相同**：文件在两次读取之间被编辑或外部
       修改时，旧正文已经过期，留着反而误导。带行区间的读取只有在"最后一次覆盖旧读取的
       范围"时才替换（全文请求只与全文请求互替），避免把没读到的行当成已省略；
+    - **终端输出不在这里处理**（2026-10-20 起）：`mcp_service/terminal.py` 在返回前用
+      `_compress_output()` 做中间截断，消息从写入 state 的第一刻就是截断版；
     - **只改 `ToolMessage.content`**：消息本身（id / tool_call_id / name /
       additional_kwargs / artifact）原样保留，因此不会拆断 tool_call 配对，也不增删消息；
-    - **幂等**：已带截断/去重标记的消息不再处理；
+    - **幂等**：已带去重标记的消息不再处理；
     - **不调 LLM**，纯确定性；没有需要压缩的消息时返回 `{}`。
 
     状态（2026-10-20）：已接进主图（`tool_node` / `orchestrate_node` → `compress_node`
     → `llm_node`）；worker 子图不带本节点。
     """
 
-    TERMINAL_TOOLS: frozenset[str] = frozenset(
-        {
-            "run_command",
-            "start_process",
-            "process_wait",
-            "process_read",
-            "process_kill",
-            "process_list",
-        }
-    )
-    # 截断标记：既给模型看"中间没了"，也用于幂等判断。
-    MARKER_PREFIX = "…[终端输出中间已截断 "
-    MARKER_TEMPLATE = "\n" + MARKER_PREFIX + "{omitted} 字符]…\n"
     # read_file 去重：只处理这一种工具；指针里用最后一次的 tool_call_id 定位正文。
     READ_DEDUP_TOOL = "read_file"
     DEDUP_MARKER_PREFIX = "…[重复读取]"
 
-    def __init__(
-        self,
-        threshold_chars: int = TEXT_BUDGET_CHARS,
-        read_dedup_min_chars: int = _READ_DEDUP_MIN_CHARS,
-    ) -> None:
-        """`threshold_chars`：终端 content 超过它才截断；头尾各保留 `threshold_chars // 4`。
-
-        `read_dedup_min_chars`：被替换的旧 read_file 正文不短于它才指针化。
-        """
-        if threshold_chars < 4:
-            raise ValueError("threshold_chars 至少为 4（头尾各需 1 个字符）")
+    def __init__(self, read_dedup_min_chars: int = _READ_DEDUP_MIN_CHARS) -> None:
+        """`read_dedup_min_chars`：被替换的旧 read_file 正文不短于它才指针化。"""
         if read_dedup_min_chars < 1:
             raise ValueError("read_dedup_min_chars 至少为 1")
-        self.threshold_chars = threshold_chars
-        self.head_chars = threshold_chars // 4
-        self.tail_chars = threshold_chars // 4
         self.read_dedup_min_chars = read_dedup_min_chars
 
     async def __call__(self, state: AgentState) -> dict | AgentState:
@@ -1566,17 +1541,14 @@ class CompressNode:
             return {}
 
         region_start = anchor + 1
-        replacements = self._compress_region(messages, region_start)
-        replacements.extend(
-            self._dedupe_reads(
-                messages, region_start, self._read_args_by_call(messages, region_start)
-            )
+        replacements = self._dedupe_reads(
+            messages, region_start, self._read_args_by_call(messages, region_start)
         )
         if not replacements:
             return {}
         return {"messages": replacements}
 
-    # ---------- 区域 / 字段截断 ----------
+    # ---------- 区域 ----------
 
     @staticmethod
     def _last_human_index(messages: list) -> int:
@@ -1585,36 +1557,6 @@ class CompressNode:
             if isinstance(messages[index], HumanMessage):
                 return index
         return -1
-
-    def _compress_region(self, messages: list, region_start: int) -> list[ToolMessage]:
-        """把当前轮内超阈值的终端 ToolMessage 换成截断后的副本（保持原顺序）。
-
-        只动 `content`：`model_copy` 保留 id / tool_call_id / name / additional_kwargs /
-        artifact，`add_messages` 按 id 原位替换，不增删消息。
-        """
-        replacements: list[ToolMessage] = []
-        for message in messages[region_start:]:
-            if not isinstance(message, ToolMessage):
-                continue
-            name = (getattr(message, "name", "") or "").strip()
-            if name not in self.TERMINAL_TOOLS:
-                continue
-            content = message.content
-            if not isinstance(content, str) or len(content) <= self.threshold_chars:
-                continue
-            if self.MARKER_PREFIX in content:  # 幂等：已截断过
-                continue
-            replacements.append(
-                message.model_copy(update={"content": self._truncate(content)})
-            )
-        return replacements
-
-    def _truncate(self, content: str) -> str:
-        """保留头尾，中间替换为省略标记；标记里的数字是**原内容被省略的字符数**。"""
-        head = content[: self.head_chars]
-        tail = content[-self.tail_chars :]
-        omitted = len(content) - len(head) - len(tail)
-        return head + self.MARKER_TEMPLATE.format(omitted=omitted) + tail
 
     # ---------- read_file 重复读取：最后一次留正文，其余变指针 ----------
 

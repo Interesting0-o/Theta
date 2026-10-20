@@ -130,7 +130,8 @@ async def get_main_agent_graph(
     graph.add_node("tool_node", ToolNode(toolset=toolset))  # type: ignore
     compact_node = CompactNode()
     graph.add_node("compact_node", compact_node)
-    # 轮内字段压缩：工具结果已写入、下一次模型调用之前，只截断当前轮的终端 ToolMessage。
+    # 轮内字段压缩：终端输出已由 terminal MCP 在返回前截断；这里只做当前轮 read_file
+    # 同文件重复读取的指针化（工具结果已写入、下一次模型调用之前）。
     graph.add_node("compress_node", CompressNode())
 
     # llm 收尾路由：还有 tool_calls → 审批；已给最终答复 → 轮末压缩（**无条件**，2026-10-20

@@ -39,6 +39,9 @@ prefix cache 按前缀匹配（实测按 64 token 块）：改前缀开头 → `
 `input=12088 cache_read=0` → `input=12147 cache_read=11904` → `input=12206 cache_read=12032`，
 h1 里只保留一个 `<RUNTIME_STATE>` 块。⚠️ `SYSTEM_PROMPT` 改了，evaluation 层 A 的
 fixtures 已陈旧，跑评估前需 `--record`（或 `--live`）重录。
+另：终端输出的中间截断已从 `CompressNode` 下沉到 terminal MCP
+（`mcp_service/terminal.py::_compress_output`），消息写入 state 时就是最终形态；
+`CompressNode` 现在只保留 `read_file` 同文件重复读取的指针化。
 
 **Phase 2（已完成 2026-10-20）**：确定性 event log 落在
 `resource/<ws_key>/sessions/<sid>/event_log.jsonl`（`app/resource/event_log.py`），每个
@@ -48,7 +51,7 @@ status / error_type / approval / content_chars / summary_version`（后者暂为
 `OrchestrateNode`（编排工具）；`_approval` 由 ReviewNode 下传（approved / not_required）。
 新增只读工具 `read_event_log(tool?, limit?)`（source=`events`，tool.json + ORCHESTRATE_SOURCES +
 静态工具表 + 提示词总览），默认最近 50 条、硬上限 200；模型按需读，上下文只放指针。
-全量 **684 passed / 7 skipped**。已知边界：worker 内部工具调用不进主会话 event log，只记
+全量 **680 passed / 7 skipped**。已知边界：worker 内部工具调用不进主会话 event log，只记
 `dispatch_subtasks` 这一条；`ask_user` 回答的用户选择仍待 Phase 4 的 user_choices；
 `read_events` 目前顺序扫描全文件（limit 用 deque 截尾），日志很大时后续改成从文件尾倒读/索引。
 

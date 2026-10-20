@@ -19,7 +19,9 @@
 - `start_process`（常驻级，如后端服务器）：spawn 后最多探 startup_wait 秒是否启动即崩，
   否则返回 running，进程跨轮存活，生命周期由 process_* 管理；
 - 进程以进程组启动（posix start_new_session / windows 新进程组），MCP 服务器退出时
-  atexit 杀光全部子进程，不留残留。
+  atexit 杀光全部子进程，不留残留；
+- **所有回执在返回前经 `_compress_output()` 中间截断**（默认 8000 字符），大输出不会
+  整段进入模型上下文；口径与旧的 agent 侧 CompressNode 一致。
 """
 from __future__ import annotations
 
@@ -34,11 +36,32 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from app.config import TEXT_BUDGET_CHARS
 from app.exception import InvalidArgumentError
 from app.schema.agent_schema import ToolResult
 from mcp_service.utils import guard
 
 mcp = FastMCP("Terminal")
+
+
+# ------------------------------ 输出预算 ------------------------------
+# 终端输出在**返回前**就做中间截断（2026-10-20 从 agent 侧 CompressNode 下沉到这里）：
+# - 消息从写入 state 的第一刻就是最终形态，节点不再事后改写，对 prefix cache 更友好；
+# - 服务端仍按增量读/排空消费缓冲；被截掉的中间段不再进入模型上下文。
+# 口径与旧 CompressNode 完全一致：超过 TEXT_BUDGET_CHARS 时保留头/尾各 1/4。
+OUTPUT_BUDGET_CHARS = TEXT_BUDGET_CHARS
+OUTPUT_HEAD_CHARS = OUTPUT_BUDGET_CHARS // 4
+OUTPUT_MARKER_PREFIX = "…[终端输出中间已截断 "
+
+
+def _compress_output(text: str) -> str:
+    """中间截断终端回执；标记里的数字是**原内容被省略的字符数**。"""
+    if len(text) <= OUTPUT_BUDGET_CHARS:
+        return text
+    head = text[:OUTPUT_HEAD_CHARS]
+    tail = text[-OUTPUT_HEAD_CHARS:]
+    omitted = len(text) - len(head) - len(tail)
+    return head + f"\n{OUTPUT_MARKER_PREFIX}{omitted} 字符]…\n" + tail
 
 
 # ------------------------------ 进程输出缓冲 ------------------------------
@@ -253,7 +276,7 @@ def _render_finished(rec: _Proc, code: int) -> ToolResult:
         lines.append(text.rstrip("\n"))
     else:
         lines.append("(无输出)")
-    return ToolResult(success=code == 0, content="\n".join(lines))
+    return ToolResult(success=code == 0, content=_compress_output("\n".join(lines)))
 
 
 def _render_running(rec: _Proc, note: str) -> ToolResult:
@@ -273,7 +296,7 @@ def _render_running(rec: _Proc, note: str) -> ToolResult:
         f"进程未被终止：可 process_wait({rec.id}) 继续等、process_read({rec.id}) 看增量、"
         f"process_kill({rec.id}) 终止"
     )
-    return ToolResult(success=True, content="\n".join(lines))
+    return ToolResult(success=True, content=_compress_output("\n".join(lines)))
 
 
 # ------------------------------ 工具：一次性执行 ------------------------------
@@ -437,7 +460,7 @@ async def process_read(process_id: str) -> ToolResult:
     else:
         lines.append("(本段无新输出)")
     lines.append(f"后续可用 process_wait({rec.id}) 继续等 / process_kill({rec.id}) 终止")
-    return ToolResult(success=True, content="\n".join(lines))
+    return ToolResult(success=True, content=_compress_output("\n".join(lines)))
 
 
 @mcp.tool()
@@ -462,7 +485,7 @@ async def process_kill(process_id: str) -> ToolResult:
     _PROCS.pop(rec.id, None)
     return ToolResult(
         success=True,
-        content=f"进程 {rec.id} 已终止（command: {rec.command[:120]}）",
+        content=_compress_output(f"进程 {rec.id} 已终止（command: {rec.command[:120]}）"),
     )
 
 
@@ -491,7 +514,7 @@ async def process_list() -> ToolResult:
                 f"- {rec.id} [{kind}] 已结束(exit={rec.exit_code}) 未收取  "
                 f"{rec.command[:100]}  ← 用 process_read 收取"
             )
-    return ToolResult(success=True, content="\n".join(lines))
+    return ToolResult(success=True, content=_compress_output("\n".join(lines)))
 
 
 # ------------------------------ 退出清理 ------------------------------

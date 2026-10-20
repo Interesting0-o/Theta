@@ -224,3 +224,52 @@ def test_spawned_commands_must_not_inherit_stdin():
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["stdout"] is subprocess.PIPE
     assert kwargs["stderr"] is subprocess.PIPE
+
+
+# ---------------------- 输出预算（2026-10-20 下沉到 terminal MCP） ----------------------
+
+
+def test_compress_output_keeps_head_tail_and_marks_omission():
+    text = "H" * 3000 + "M" * 20000 + "T" * 3000
+
+    out = terminal._compress_output(text)
+
+    assert out.startswith("H" * terminal.OUTPUT_HEAD_CHARS)
+    assert out.endswith("T" * terminal.OUTPUT_HEAD_CHARS)
+    assert terminal.OUTPUT_MARKER_PREFIX in out
+    assert "22000 字符" in out
+    assert len(out) < len(text)
+
+
+def test_compress_output_is_noop_below_budget():
+    text = "x" * terminal.OUTPUT_BUDGET_CHARS
+    assert terminal._compress_output(text) == text
+
+
+def test_render_finished_compresses_large_output():
+    class _Buffer:
+        def drain(self):
+            return "x" * 20000
+
+    class _Rec:
+        buffer = _Buffer()
+
+    res = terminal._render_finished(_Rec(), 0)
+
+    assert res.success is True
+    assert terminal.OUTPUT_MARKER_PREFIX in res.content
+    assert len(res.content) <= terminal.OUTPUT_BUDGET_CHARS + 100
+
+
+def test_run_command_large_output_is_compressed():
+    import sys
+
+    cmd = f'"{sys.executable}" -c "print(\'x\'*20000)"'
+
+    async def _run():
+        return await run_command(cmd, description="测试大输出截断")
+
+    res = asyncio.run(_run())
+    assert res.success is True
+    assert terminal.OUTPUT_MARKER_PREFIX in res.content
+    assert len(res.content) < 10000
