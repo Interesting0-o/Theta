@@ -343,6 +343,12 @@ docs/CONTEXT_ENGINEERING.md（消息流转改动前必读）、docs/ARCHITECTURE
 越大、单轮越来越慢；`compact_node` 却只在**回合末**（`llm` 不再调工具 → `route_after_llm`
 走 compact/END）才可能折叠，**工具循环中间从不触发** → 长跑无中间收口。
 
+**实测补充（2026-10-18）**：见 [SESSION_CASE_INDEX_TTS2.md](SESSION_CASE_INDEX_TTS2.md)——
+单轮 44 次工具调用、上下文 139,380 字符；累计 prompt **1,469,372 字符（终态的 10.6 倍）**，
+其中三份安装日志占 **71.3%**；`compact_node` 已被路由到，但因"最后一条 HumanMessage 之前
+没有可折块"返回空。可作落地后的回归基线：重放同一 DB/任务，应看到工具循环中途出现折叠，
+终态与累计 prompt 都不再线性增长。
+
 **目标态**：历史 content 超预算（复用 `needs_compact` / `CompactNode._plan` 口径）时，
 在工具循环中途也折叠"更早轮次、已被消费的完整工具块"，只保留当前正在进行的轮次。
 
@@ -350,11 +356,55 @@ docs/CONTEXT_ENGINEERING.md（消息流转改动前必读）、docs/ARCHITECTURE
 - 只能折**最后一个 HumanMessage 之前的旧轮完整块**（含 AIMessage(tool_calls) + 兑现它的
   ToolMessages），**正在推进的当前工具链不能折**——判据 `CompactNode._plan` 已有；
 - 折叠落点仍是 `SystemMessage(摘要, id=…)` 原位替换 + `RemoveMessage`，不尾追加；
-- 触发点候选：queue/review 之前或每 N 轮检查一次；须避免与 interrupt 审批的 checkpoint
-  交互互相干扰（折叠发生在哪一步、会不会打断挂起 run）；
+- **触发点（2026-10-18 定）**：新增 `compress_node` 放在 `tool_node` / `orchestrate_node`
+  回到 `llm_node` 的边上——工具结果已写入、下一次 LLM 调用之前，是唯一"新结果已在、旧上下文
+  尚未付费"的时点；不要放在 `review_node`/`queue_node`（那里还没执行工具），也不要塞进
+  interrupt 节点。每拍只算大小，用 delta/hysteresis 批量触发，避免每轮破坏 prompt cache；
+  轮末 `compact_node` 保留为跨回合兜底（折叠区不同，见
+  [CONTEXT_COMPRESSION_SURVEY.md](CONTEXT_COMPRESSION_SURVEY.md) §5.10）。
 - 折叠后的摘要系统消息会再注入每轮，注意别把"当前轮"误判成旧轮折掉。
+- **单轮长任务没有"之前的 HumanMessage"可折**（2026-10-18 实测）：现有 `_plan` 只折最后一条
+  HumanMessage 之前的块，而一次 44 次工具的会话只有一条 HumanMessage——即使轮内触发也一块
+  折不了。轮内压缩必须把折叠单元改为"**已完成工具块 + 移动窗口**"（保留在途块、原始请求、
+  `current_plan` 与失败信号），不能直接复用现有判据；详见
+  [CONTEXT_COMPRESSION_SURVEY.md](CONTEXT_COMPRESSION_SURVEY.md) §5.2 与
+  [SESSION_CASE_INDEX_TTS2.md](SESSION_CASE_INDEX_TTS2.md) §7.3。
+- **阈值口径（2026-10-18 用户拍板）**：**摘要**在**厂商标称窗口的 40%–50%** 触发，不是
+  80%–90%；到这个量级历史已经被压缩过很多次，再压缩收益很小。压缩（截断/遮蔽/落盘）是
+  另一层——在写入侧与轮内移动窗口持续做。当前 `_CONTEXT_BUDGET_DEFAULT = 60000` 只是压缩
+  侧的字符代理，不能当摘要阈值。详见
+  [CONTEXT_COMPRESSION_SURVEY.md](CONTEXT_COMPRESSION_SURVEY.md) §4 第 6 条 / §5.4。
 - 相关背景：[[docs/CONTEXT_ENGINEERING]]（只流结论 / notes / 折叠目标态）、
   根目录 CLAUDE.md 上下文工程一节。
+
+## [ ] 缓存友好的提示顺序：稳定前缀 → 历史 → 动态尾部
+
+**动机**（2026-10-18）：glm-5.3-flash 的价格为未命中 0.8 元/M、命中 0.23 元/M。本会话
+0.47 元反推约 **58.75 万输入 token**，与累计 prompt 146.9 万字符 / 2.5 的量级吻合——
+提示**缓存命中接近 0**。可疑点：`current_plan` 注入在 messages **之前**，本会话
+`update_plan_step` 改了 12 次，每次都会让整段 messages 的前缀缓存失效。
+
+**目标态**（越靠后越易变）：
+
+```text
+稳定前缀：SYSTEM_PROMPT → 工具定义（toolset 稳定）
+        → 工作区上下文 → profile → 交接指针
+历史：   对话消息（append-only）
+动态尾部：current_plan（→ 可选记忆/技能提醒）
+当前输入：最后（或动态尾部放在全部消息之后）
+```
+
+**要点（实现前须钉死）**：
+- 动态 SystemMessage **不能**插在 `AIMessage(tool_calls)` 与它的 `ToolMessage` 之间；
+  安全点是"全部消息之后"（推荐给 plan）或"最后一条 HumanMessage 之前"。
+- `profile` 是 memo 的、`memory`/`skills` 低频变化，可留在稳定前缀；`current_plan` 必须
+  移尾部。
+- 工具定义只在 toolset 版本变化时重绑（技能 load/drop）；保持稳定。
+- provider 支持时在稳定前缀末尾/历史末尾打 `cache_control`；智谱的自动前缀缓存奖励同样
+  顺序，先用 `extra_body` 确认是否支持。
+- 在 `LLMNode` 记录每次调用的 `prompt_tokens` / `cached_tokens`，先测命中率再调排序；
+  改完跑 `--live` 评估 + 本会话重放，确认模型仍遵循计划/记忆提示。
+- 详见 [CONTEXT_COMPRESSION_SURVEY.md](CONTEXT_COMPRESSION_SURVEY.md) §5.11。
 
 ## [ ] Reflect 节点：模型拟动手前，先让另一个（或同一个）模型审一遍
 
@@ -462,6 +512,12 @@ ToolMessage 进 history（token，由 compact 折叠兜底）。实测里还有*
 `run_command` 占 55 次调用中 30 次的一部分：真实会话里出现过"**一条复合命令
 （`uv --version; python --version; git --version`）批准执行之后，模型又把三条分别重跑了一遍**
 ——4 次审批换一份信息"，以及用户侧的体感"克隆下来项目、**补环境老是补不全**"。
+
+**实测补充（2026-10-18）**：见 [SESSION_CASE_INDEX_TTS2.md](SESSION_CASE_INDEX_TTS2.md)
+§5.4 / F7——一次单轮任务里 7 次安装前探测全是慢变机器事实（git / conda / GPU / 系统
+ffmpeg），对应 7 次审批、约 28 s 执行与 29.4 s 人工等待；若 ① 在开场就注入，这些探测可
+大部分消失。同一会话还给出了分层边界：`indextts2` 环境与 torch cu128 属 ③（工作区特有），
+OS / conda / GPU / 系统 ffmpeg 属 ①；磁盘余量、`conda env list` 等易变事实不应进层。
 
 而这些事实的特点是：**慢变**（几个月不动）、**跨工作区通用**（同一台机器上每个工作区都成立）、
 **体积极小**（十几行）。今天的长期记忆却只有**一层**——`resource/<ws_key>/memory/memory.md`，
@@ -726,6 +782,20 @@ env，时机分别是 import 期 / 构图期 / 调用期），所以不能一刀
   路径之后模型怎么办、`ask_user` 提问闸门、长期记忆写入、技能加载、`dispatch_subtasks`、compact
   触发。**策略侧已经能表达了**（`deny_all()` 测拒绝、"`allow_except(answers=[…])`" 答提问），
   缺的只是任务与断言本身。
+  - **[~] 2026-10-18 升级**：新增典型场景 `log_analysis`（1200 行日志 + 终端只读命令 +
+    Unix 工具缺失→PowerShell 的失败恢复），任务集 4 个；`EvalResult.trace` 记录结构化轨迹，
+    新增 `tool_called` / `tool_call_count_between` / `failed_tool_seen` / `file_contains` /
+    `file_matches` 断言，`--trace` 可打印轨迹。该场景层 A 回放 10/10、全量 18/18（3.5s）。
+    仍缺：拒绝路径、`ask_user`、记忆、技能、dispatch、compact 的任务与断言；token 聚合；
+    基线对比；CI；真图回放的自动测试。
+  - **[~] 2026-10-18 多文件轨迹**：新增 `wishlist_trace`（ViBench `simple_wish_list`
+    改编的 zero-to-one 多文件任务）、`allow_dev_terminal()`、`files_exist` /
+    `pytest_passes` 断言；场景说明见 `evaluation/scenarios/wishlist_trace.md`，
+    轨迹录在 `evaluation/fixtures/wishlist_trace.json`（回放加 `--trace` 查看）。
+    **首条轨迹结果**：16 轮 / 15 审批 / 828.8 s；层 A 回放 3.2 s；3/4 检查
+    （模型自测 14 passed / 2 failed）。它暴露了一个待定行为：**审批被拒后
+    `review_node` 直接 END，模型没有机会在同一回合内改用现有 pytest 修测试**——
+    这正是本条"拒绝路径之后模型怎么办"的一个真实样本。
 - **量化与闸门**：`EvalResult` 只记次数与耗时，**不记 token**（要从 `AIMessage.response_metadata`
   聚合）。~~`__main__` 没有退出码，进不了 CI~~ **[已落地 2026-09-17]**：退出码三档
   （`0` 通过 / `1` 不通过 / `2` 用法错误），判据与理由记在独立条目

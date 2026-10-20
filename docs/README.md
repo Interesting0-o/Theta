@@ -1,12 +1,13 @@
 # Theta $\theta$ 设计文档
 
-本目录收录 $\theta$ 的设计文档。每份是**目标态设计 + 已落地标注**：文档与代码不一致时以代码为准，文档可作为演进方向（与根目录 `CLAUDE.md` 的约定一致）。
+本目录收录 $\theta$ 的设计文档、会话样例与外部调研。设计文档每份是**目标态设计 + 已落地标注**：文档与代码不一致时以代码为准，文档可作为演进方向（与根目录 `CLAUDE.md` 的约定一致）；会话样例是对真实运行数据的量化复盘，只作证据与回归基线；外部调研只作选型参考，引用前核对原始来源。
 
 ## 索引
 
 | 文档 | 主题 | 一句话 |
 | --- | --- | --- |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 总设计 / 架构原则 | 主程序 = 事件基座，LangGraph 图只是基座上的执行单元；各分设计的上层 |
+| [TECHNICAL_ROADMAP.md](TECHNICAL_ROADMAP.md) | 技术路线与实现概览 | 汇总当前架构、技术栈、关键实现约束与未完成方向 |
 | [EXCEPTION_DESIGN.md](EXCEPTION_DESIGN.md) | 异常体系 | 异常的边界是语义过滤器——决定什么信息能进大模型的推理 |
 | [CONTEXT_ENGINEERING.md](CONTEXT_ENGINEERING.md) | 上下文工程 | work_log（意图+事实双半行）、notes 笔记区（会话级 + promote 进 repo）、滚动块折叠 |
 | [MULTI_AGENT.md](MULTI_AGENT.md) | 多 Agent 编排（草稿） | 拉起形态 / 审批回流 / 并行分发 vs DAG / 状态隔离 |
@@ -14,6 +15,8 @@
 | [SKILL_DESIGN.md](SKILL_DESIGN.md) | 技能（一期 §11 / 二期 §13 已落地，三期见 §13.10） | skill = 按需加载的领域包；差异化在"约束三分法"——软约束走 `SKILL.md` 正文（host 读取、注入系统提示）/ 硬闸门走 tool.json / 结构性拒绝写死在工具里。落地清单见 §11 |
 | [TODO.md](TODO.md) | **待办 / 收口清单（未完成与进行中）** | 运行中 compact、reflect 节点、长期记忆分层化等条目的动机与现状 |
 | [DONE.md](DONE.md) | **已完成条目归档** | `TODO.md` 里已勾掉的条目原文（动机 / 决策 / 落地记录 / 验证），只作追溯用 |
+| [SESSION_CASE_INDEX_TTS2.md](SESSION_CASE_INDEX_TTS2.md) | **会话样例（2026-10-18）** | 单轮长任务实录：44 次工具调用 / 19 次中断 / 上下文 139k 字符的量化复盘，为「运行中 compact」「工具输出无上限」提供证据与回归基线 |
+| [CONTEXT_COMPRESSION_SURVEY.md](CONTEXT_COMPRESSION_SURVEY.md) | **外部实践调研（2026-10-18）** | 业界 agent 的分级上下文压缩：写入侧整形 / 观察遮蔽 / 文件卸载 / 摘要 / 子 agent；含对 Theta 轮内压缩判据的提醒 |
 
 ## 写作约定
 
