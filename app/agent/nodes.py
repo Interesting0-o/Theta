@@ -851,8 +851,9 @@ class QueueNode:
 
 
 #----------------------轮末压缩（compact_node）----------------------
-# 折叠预算默认值：messages content 总字符数超过它才触发折叠。
-# 由 CompactNode(content_budget_chars=…) 构造参数覆盖（默认取此值），实例化时可调。
+# 轮内压缩（CompressNode，下一步）的预算默认值。**轮末 CompactNode 不再使用它**——
+# 2026-10-20 起轮末压缩无条件启用，没有字符预算门；保留本值是为了轮内节点仍有同一个
+# "字符数代理"口径可用（届时按"当前轮"而不是全历史计量）。
 _CONTEXT_BUDGET_DEFAULT = 60000
 
 # 归档正文截断上限（字符；值归 app/config.py::TEXT_BUDGET_CHARS，与记忆/画像/技能同族一处出处）
@@ -860,9 +861,10 @@ _NOTE_MAX = TEXT_BUDGET_CHARS
 
 
 def needs_compact(state, budget: int) -> bool:
-    """预算门：历史 content 字符总数超过 budget 才需要触发压缩。
+    """预算门（**轮内压缩预留**）：历史 content 字符总数超过 budget 才需要触发压缩。
 
-    graph 的 llm 收尾路由与 CompactNode.__call__ 共用同一计量口径。
+    轮末 `CompactNode` 已改为无条件启用，不再调用本函数；保留给轮内 `CompressNode` 的
+    触发判据（到时计量范围可能要收窄到"当前轮"，不要直接照搬全历史口径）。
     """
     total = sum(len(str(getattr(m, "content", "") or "")) for m in (state.get("messages") or []))
     return total > budget
@@ -871,10 +873,11 @@ def needs_compact(state, budget: int) -> bool:
 class CompactNode:
     """轮末压缩节点（END 前执行）：把更早轮次已消费的旧工具块折叠成一条 SystemMessage。
 
-    - 预算未超 → 直通不动（幂等、零成本）；
+    - **无条件启用**（2026-10-20）：每回合末都运行，没有字符预算门；没有可折块时返回 {}；
     - 折叠区 = 最后一条 HumanMessage 之前（含更早轮次）；当前轮（Human 及其后）原样保留；
-    - 只折"完整工具块"（AIMessage(tool_calls) + 兑现它的全部 ToolMessages），状态据
-      ToolMessage 判定；联网四工具的成功正文归档进 notes；
+    - 只折"完整且已消费"的工具块（AIMessage(tool_calls) + 兑现它的全部 ToolMessages；
+      块之后、下一条 Human 之前必须已经出现过 AIMessage），状态据 ToolMessage 判定；
+      联网四工具的成功正文归档进 notes；
     - 返回：`SystemMessage(摘要, id=折叠区最早被删消息的 id)` 原位替换 + `RemoveMessage`
       删除其余被折块——不尾追加，messages 尾部仍是本轮最终答复（main.py 打印不受影响）。
 
@@ -895,16 +898,9 @@ class CompactNode:
         {"web_search", "extract_urls", "crawl_website", "deep_research"}
         )
 
-    def __init__(self, content_budget_chars: int = _CONTEXT_BUDGET_DEFAULT) -> None:
-        """构造参数：messages content 总字符数超过它才触发折叠（默认 60000）。"""
-        self.content_budget_chars = content_budget_chars
-
     async def __call__(self, state: AgentState) -> dict | AgentState:
         messages = list(state.get("messages") or [])
         if not messages:
-            return {}
-
-        if not needs_compact(state, self.content_budget_chars):
             return {}
 
         notes = dict(state.get("notes") or {})
@@ -980,6 +976,22 @@ class CompactNode:
         return content.strip() if isinstance(content, str) else ""
 
     @staticmethod
+    def _is_consumed(region: list, start: int) -> bool:
+        """块之后、下一条 HumanMessage 之前是否已出现 AIMessage。
+
+        "已消费"= 模型已经对这批工具结果作出过反应（CONTEXT_ENGINEERING §3 不变量 2）。
+        只扫到折叠区末尾（最后一条 Human 之前）：
+        - 更早的轮次会先撞到下一条 Human → False（该轮以 ToolMessage 收尾，模型没反应过）；
+        - 当前轮（最后一条 Human 及其后）本就不在 region 里。
+        """
+        for message in region[start:]:
+            if isinstance(message, HumanMessage):
+                return False
+            if isinstance(message, AIMessage):
+                return True
+        return False
+
+    @staticmethod
     def _first_line(text: str, limit: int) -> str:
         """取首个非空行并截断——摘要行 detail 与 notes 标题共用（2026-09-21 前是两份逐字相同的
         拷贝，只有默认 limit 不同：60 / 80）。`limit` 由调用点显式给，不再各带一个默认值。
@@ -1012,7 +1024,8 @@ class CompactNode:
         - archived：本次新增的 notes（key=notes#r<n>，仅联网四工具的成功正文）。
 
         不折叠：无 tool_calls 的 AIMessage（答复）、Human、SystemMessage、块不完整（有悬空
-        call）、块内消息缺稳定 id、以及折叠区为空（单轮会话）。
+        call）、块内消息缺稳定 id、块未被消费（块后、下一条 Human 前没有 AIMessage）、
+        以及折叠区为空（单轮会话）。
         """
         # 锚点 = 最后一条 HumanMessage；它及其后（当前轮）原样保留，只折更早轮次
         anchor = -1
@@ -1056,8 +1069,13 @@ class CompactNode:
             i = j  # 游标越过本块 ToolMessage 段
 
             complete = len(claimed) == len(call_ids) and all(cid is not None for cid in call_ids)
-            # 原位替换要求每条待删消息都有稳定 id（生产 add_messages 自动赋 uuid）
-            if not (complete and all(getattr(b, "id", None) for b in block)):
+            # 原位替换要求每条待删消息都有稳定 id（生产 add_messages 自动赋 uuid）；
+            # 块还必须已被模型消费——折掉模型还没看过的工具结果，等于从历史里抽走它。
+            if not (
+                complete
+                and all(getattr(b, "id", None) for b in block)
+                and CompactNode._is_consumed(region, j)
+            ):
                 continue
 
             reason = CompactNode._reason_of(m)
@@ -1089,3 +1107,106 @@ class CompactNode:
             removed.extend(block)
 
         return removed, lines, archived
+
+
+#----------------------轮内压缩（compress_node）----------------------
+# 区域边界（2026-10-20 定，与 CompactNode 互不相交）：
+#   CompactNode  : messages[:last_human_index]        旧轮，轮末无条件执行
+#   CompressNode : messages[last_human_index + 1:]    当前轮，工具循环中执行
+# 轮内**不删消息**：图路由中间删掉结果会破坏 tool_call / ToolMessage 配对与调用方状态，
+# 因此只对终端 ToolMessage 的 content 做**中间截断**（头 + 尾 + 省略标记）。旧轮的整块
+# 折叠仍归 CompactNode。
+
+class CompressNode:
+    """轮内字段压缩节点（`tool_node` / `orchestrate_node` → `llm_node` 的边上执行）。
+
+    职责边界（与 `CompactNode` 分工）：
+
+    - **只看当前轮**：最后一条 HumanMessage 之后；`last_human` 之前一律不动；
+    - **只压缩终端工具返回**：`run_command` / `start_process` / `process_wait` /
+      `process_read` / `process_kill` / `process_list`；
+    - **只改 `ToolMessage.content`**：消息本身（id / tool_call_id / name /
+      additional_kwargs / artifact）原样保留，因此不会拆断 tool_call 配对，也不增删消息；
+    - **中间截断**：content 超过 `threshold_chars` 时，保留开头和末尾，中间换成
+      `…[终端输出中间已截断 N 字符]…`；默认阈值 `TEXT_BUDGET_CHARS`，头尾各取阈值的 1/4；
+    - **幂等**：已带截断标记的消息不再处理；
+    - **不调 LLM**，纯确定性；没有需要压缩的消息时返回 `{}`。
+
+    状态（2026-10-20）：已实现，尚未接进图（不改变现有行为）。
+    """
+
+    TERMINAL_TOOLS: frozenset[str] = frozenset(
+        {
+            "run_command",
+            "start_process",
+            "process_wait",
+            "process_read",
+            "process_kill",
+            "process_list",
+        }
+    )
+    # 截断标记：既给模型看"中间没了"，也用于幂等判断。
+    MARKER_PREFIX = "…[终端输出中间已截断 "
+    MARKER_TEMPLATE = "\n" + MARKER_PREFIX + "{omitted} 字符]…\n"
+
+    def __init__(self, threshold_chars: int = TEXT_BUDGET_CHARS) -> None:
+        """`threshold_chars`：content 超过它才截断；头尾各保留 `threshold_chars // 4`。"""
+        if threshold_chars < 4:
+            raise ValueError("threshold_chars 至少为 4（头尾各需 1 个字符）")
+        self.threshold_chars = threshold_chars
+        self.head_chars = threshold_chars // 4
+        self.tail_chars = threshold_chars // 4
+
+    async def __call__(self, state: AgentState) -> dict | AgentState:
+        messages = list(state.get("messages") or [])
+        if not messages:
+            return {}
+
+        anchor = self._last_human_index(messages)
+        if anchor < 0:
+            return {}
+
+        replacements = self._compress_region(messages, anchor + 1)
+        if not replacements:
+            return {}
+        return {"messages": replacements}
+
+    # ---------- 区域 / 字段截断 ----------
+
+    @staticmethod
+    def _last_human_index(messages: list) -> int:
+        """当前轮起点：最后一条 HumanMessage 的下标；没有则 -1。"""
+        for index in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[index], HumanMessage):
+                return index
+        return -1
+
+    def _compress_region(self, messages: list, region_start: int) -> list[ToolMessage]:
+        """把当前轮内超阈值的终端 ToolMessage 换成截断后的副本（保持原顺序）。
+
+        只动 `content`：`model_copy` 保留 id / tool_call_id / name / additional_kwargs /
+        artifact，`add_messages` 按 id 原位替换，不增删消息。
+        """
+        replacements: list[ToolMessage] = []
+        for message in messages[region_start:]:
+            if not isinstance(message, ToolMessage):
+                continue
+            name = (getattr(message, "name", "") or "").strip()
+            if name not in self.TERMINAL_TOOLS:
+                continue
+            content = message.content
+            if not isinstance(content, str) or len(content) <= self.threshold_chars:
+                continue
+            if self.MARKER_PREFIX in content:  # 幂等：已截断过
+                continue
+            replacements.append(
+                message.model_copy(update={"content": self._truncate(content)})
+            )
+        return replacements
+
+    def _truncate(self, content: str) -> str:
+        """保留头尾，中间替换为省略标记；标记里的数字是**原内容被省略的字符数**。"""
+        head = content[: self.head_chars]
+        tail = content[-self.tail_chars :]
+        omitted = len(content) - len(head) - len(tail)
+        return head + self.MARKER_TEMPLATE.format(omitted=omitted) + tail

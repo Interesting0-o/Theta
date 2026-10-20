@@ -13,7 +13,6 @@ from app.agent.nodes import (
     QueueNode,
     ReviewNode,
     ToolNode,
-    needs_compact,
 )
 from app.agent.prompt import WORKER_SYSTEM_PROMPT
 from app.platform.mcp import load_mcp_tool
@@ -128,13 +127,13 @@ async def get_main_agent_graph(
     compact_node = CompactNode()
     graph.add_node("compact_node", compact_node)
 
-    # llm 收尾路由：还有 tool_calls → 审批；已给最终答复 → 历史超预算才进 compact_node，
-    # 否则直接 END（省掉欠费轮次的节点执行与 checkpoint）。预算口径与 CompactNode 一致。
+    # llm 收尾路由：还有 tool_calls → 审批；已给最终答复 → 轮末压缩（**无条件**，2026-10-20
+    # 起不再看字符预算；没有可折块时节点自己返回 {}）→ END。
     def route_after_llm(state: AgentState):
         last_message = state["messages"][-1]
         if isinstance(last_message, AIMessage) and last_message.tool_calls:
             return "queue_node"
-        return "compact_node" if needs_compact(state, compact_node.content_budget_chars) else END
+        return "compact_node"
 
     graph.add_edge(START, "llm_node")
     graph.add_conditional_edges(
