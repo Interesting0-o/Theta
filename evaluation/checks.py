@@ -13,6 +13,9 @@
 """
 from __future__ import annotations
 
+import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List
@@ -64,6 +67,145 @@ def file_exists(rel_path: str) -> Check:
         return False, f"文件不存在: {rel_path}"
 
     return Check(f"file_exists({rel_path})", check)
+
+
+def files_exist(*rel_paths: str) -> Check:
+    """工作区里存在全部给定文件（用于多文件交付物）。"""
+
+    def check(result, workspace: Path) -> tuple[bool, str]:
+        missing = [p for p in rel_paths if not (workspace / p).is_file()]
+        if not missing:
+            return True, f"存在 {len(rel_paths)} 个文件"
+        return False, f"缺少文件: {missing[:6]}"
+
+    return Check(f"files_exist({', '.join(rel_paths)})", check)
+
+
+def pytest_passes(test_path: str = "tests", timeout: int = 120) -> Check:
+    """在任务工作区跑 `python -m pytest <test_path>`，要求退出码 0。
+
+    这是"多文件功能开发"的回归闸门：模型必须交付能跑的测试，且功能确实通过。
+    用评估器自己的解释器（`sys.executable`），不依赖模型在终端里是否找对了 python。
+    """
+
+    def check(result, workspace: Path) -> tuple[bool, str]:
+        target = workspace / test_path
+        if not target.exists():
+            return False, f"测试路径不存在: {test_path}"
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "pytest", str(target), "-q"],
+                cwd=str(workspace),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"pytest 超时（>{timeout}s）"
+        if proc.returncode == 0:
+            return True, "pytest 通过"
+        output = (proc.stdout + "\n" + proc.stderr).strip().splitlines()
+        tail = "\n".join(output[-8:])
+        return False, f"pytest 退出码 {proc.returncode}: {tail[-500:]}"
+
+    return Check(f"pytest_passes({test_path})", check)
+
+
+def file_contains(rel_path: str, *needles: str) -> Check:
+    """文件内容包含全部给定子串（顺序无关）。用于"交付物必须写到某些事实"。"""
+
+    def check(result, workspace: Path) -> tuple[bool, str]:
+        target = workspace / rel_path
+        if not target.is_file():
+            return False, f"文件不存在: {rel_path}"
+        text = target.read_text(encoding="utf-8")
+        missing = [n for n in needles if n not in text]
+        if not missing:
+            return True, f"包含 {len(needles)} 个片段"
+        return False, f"缺少片段: {missing[:5]}"
+
+    return Check(f"file_contains({rel_path})", check)
+
+
+def file_matches(rel_path: str, pattern: str) -> Check:
+    """文件内容匹配正则（`re.search`，多行）。用于计数等格式宽松的断言。"""
+
+    def check(result, workspace: Path) -> tuple[bool, str]:
+        target = workspace / rel_path
+        if not target.is_file():
+            return False, f"文件不存在: {rel_path}"
+        text = target.read_text(encoding="utf-8")
+        if re.search(pattern, text, flags=re.MULTILINE):
+            return True, f"匹配 /{pattern}/"
+        return False, f"未匹配 /{pattern}/"
+
+    return Check(f"file_matches({rel_path}, {pattern})", check)
+
+
+# ---------------- 轨迹：工具调用序列 ----------------
+
+def _tool_call_events(result) -> list:
+    return [
+        event
+        for event in getattr(result, "trace", []) or []
+        if event.get("kind") == "ai_tool_calls"
+    ]
+
+
+def tool_called(name: str, min_times: int = 1) -> Check:
+    """轨迹里至少调用了 name 工具 min_times 次。"""
+
+    def check(result, workspace: Path) -> tuple[bool, str]:
+        count = sum(
+            1
+            for event in _tool_call_events(result)
+            for call in event.get("tool_calls", [])
+            if call.get("name") == name
+        )
+        if count >= min_times:
+            return True, f"{name} 调用 {count} 次"
+        return False, f"{name} 调用 {count} 次，期望 ≥ {min_times}"
+
+    return Check(f"tool_called({name})", check)
+
+
+def tool_call_count_between(name: str, lo: int, hi: int) -> Check:
+    """轨迹里 name 工具调用次数落在 [lo, hi]。"""
+
+    def check(result, workspace: Path) -> tuple[bool, str]:
+        count = sum(
+            1
+            for event in _tool_call_events(result)
+            for call in event.get("tool_calls", [])
+            if call.get("name") == name
+        )
+        if lo <= count <= hi:
+            return True, f"{name} 调用 {count} 次"
+        return False, f"{name} 调用 {count} 次，期望 [{lo}, {hi}]"
+
+    return Check(f"tool_call_count_between({name})", check)
+
+
+def failed_tool_seen(name: str | None = None) -> Check:
+    """轨迹里出现过失败的工具结果（可选限定工具名）。
+
+    失败判定来自 `ToolNode` 的结构化戳（`additional_kwargs.error_type`）或审批拒绝；
+    不是解析模型正文。
+    """
+
+    def check(result, workspace: Path) -> tuple[bool, str]:
+        hits = [
+            event
+            for event in getattr(result, "trace", []) or []
+            if event.get("kind") == "tool_result"
+            and event.get("status") in {"failed", "denied"}
+            and (name is None or event.get("name") == name)
+        ]
+        if hits:
+            return True, f"失败 {len(hits)} 次（如 {hits[0].get('name')}）"
+        return False, "未观察到失败的工具结果"
+
+    return Check(f"failed_tool_seen({name or 'any'})", check)
 
 
 # ---------------- 审批闸门效率 ----------------

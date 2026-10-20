@@ -15,7 +15,7 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from .report import print_report
+from .report import print_report, print_traces
 from .runner import (
     MODE_LIVE,
     MODE_RECORD,
@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", help="只跑指定任务名（默认全跑 EXAMPLE_TASKS）")
     parser.add_argument("--workspace-root", type=Path, help="临时工作区根目录（默认系统 temp）")
     parser.add_argument("--keep-workspace", action="store_true", help="保留工作区供人工复查失败现场")
+    parser.add_argument("--trace", action="store_true", help="报告后打印每个任务的结构化轨迹")
     return parser.parse_args()
 
 
@@ -61,6 +62,8 @@ async def main() -> int:
     try:
         # 报告里的检查项要读工作区里的终态文件，所以清理必须在这之后（见 cleanup_workspaces）
         ok = print_report(runs, mode=mode)
+        if args.trace:
+            print_traces(runs)
     finally:
         if not args.keep_workspace:
             cleanup_workspaces(runs)

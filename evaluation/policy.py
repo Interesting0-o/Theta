@@ -13,12 +13,14 @@
 | `allow_except(deny, answers)` | 按工具名名单 | 按 `answers` 顺序 | 常规任务（默认）；给了 answers 才能测提问 |
 | `deny_all()` | 一律拒绝 | 一律不回答 | **拒绝路径**（`[approval_denied]` 之后模型怎么办） |
 | `scripted(...)` | 按序脚本 | 按序脚本 | **逐次不同**的决定（第 1 次批、第 2 次拒） |
+| `allow_readonly_terminal(...)` | 只批允许的只读命令 | 一律不答 | **终端场景**（grep/wc/tail 等；重定向与写命令拒绝） |
 
 `allow_except(answers=…)` 与 `scripted` 都能给提问作答，区别在**审批那一侧**：前者按名单规则、
 后者逐次回放。要"审批按规则 + 提问按脚本"用前者；要"每次审批都不一样"用后者。
 """
 from __future__ import annotations
 
+import re
 from typing import Callable, Sequence
 
 from app.schema.approval_schema import GATE_ASK_USER, Decision
@@ -59,6 +61,170 @@ def allow_except(deny: tuple[str, ...] = DEFAULT_DENY_TOOLS, answers: Sequence[s
                 return Decision(kind="answer", supplement=pending.pop(0))
             return Decision(kind="answer")
         return Decision(kind="approval", approved=payload.get("tool_name") not in deny)
+
+    return policy
+
+
+# 终端只读策略允许的命令族（按每段首个词判断；含管道/&& 时逐段检查）。
+_READONLY_COMMANDS: tuple[str, ...] = (
+    "grep", "findstr", "wc", "tail", "head", "cat", "type",
+    "sed", "awk", "find", "dir", "ls", "stat",
+    # 统计/格式化用的只读工具，以及常见的无副作用控制流：
+    "echo", "printf", "true", "false", "sort", "uniq", "cut", "tr", "nl", "column", "pwd",
+)
+
+# 出现这些片段一律拒绝：输出重定向会写文件，命令替换/进程替换可能绕过首词检查。
+# 输入重定向 `<` 是只读的，放行；`2>/dev/null` 在检查前先剥掉。
+_DENY_FRAGMENTS: tuple[str, ...] = (">", "`", "$(", "<(", ">(", "sudo", "rm ", "del ", "mv ", "cp ")
+
+# 简单的 shell 变量赋值（`f=logs/app.log`）没有副作用，允许；带空格的不算。
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*$")
+
+# Windows 下 cmd 没有 grep/wc/tail，模型会自然改用 PowerShell。对 PowerShell 单独判：
+# 出现写盘/执行类 cmdlet 就拒绝，其余（ReadLines/Measure-Object/Select-String 等）放行。
+# 这是评估用的 pragmatic 白名单，不是通用沙箱。
+_POWERSHELL_DENY = (
+    "set-content", "out-file", "add-content", "remove-item", "new-item",
+    "copy-item", "move-item", "rename-item", "start-process",
+    "invoke-webrequest", "invoke-restmethod", "invoke-expression", "iex",
+    "start-job", "stop-process", "remove-item", "rmdir", "mkdir",
+)
+
+
+def allow_readonly_terminal(
+    *,
+    deny: tuple[str, ...] = DEFAULT_DENY_TOOLS,
+    commands: tuple[str, ...] = _READONLY_COMMANDS,
+) -> Policy:
+    """在 `allow_except` 的基础上，只批准**只读终端命令**。
+
+    为什么需要它：评估默认把 `run_command` 整个拒掉（terminal 没有文件沙箱）。要测
+    "终端错误识别 / 输出整形 / 长命令"又不能让模型随便执行命令，于是按命令族放行：
+    `grep / wc / tail / head / cat / find / ls / stat` 等只读命令；含重定向或
+    `sudo / rm / mv / cp` 的片段一律拒绝。`&&`、`||`、`;`、`|` 会逐段检查，防止
+    `grep ... && rm ...` 这种绕过。
+    """
+
+    allowed = tuple(c.lower() for c in commands)
+    deny_set = set(deny)
+
+    def _powershell_allowed(text: str) -> bool:
+        lowered = text.lower()
+        if any(cmd in lowered for cmd in _POWERSHELL_DENY):
+            return False
+        # PowerShell 的输出重定向/命令替换同样可能写盘或执行任意代码。
+        if any(frag in lowered for frag in (">", "`", "$(", "& ")):
+            return False
+        return True
+
+    def _command_allowed(command: str) -> bool:
+        text = (command or "").strip()
+        if not text:
+            return False
+        first = text.split()[0].strip("\"'").lower().replace("\\", "/").rsplit("/", 1)[-1]
+        if first in {"powershell", "pwsh", "powershell.exe", "pwsh.exe"}:
+            return _powershell_allowed(text)
+        lowered = text.lower()
+        # `2>/dev/null` / `2>NUL` 只是丢弃 stderr，不写工作区，先剥掉再查重定向。
+        lowered = re.sub(r"\d*>\s*(?:/dev/null|nul)\b", "", lowered)
+        if any(frag in lowered for frag in _DENY_FRAGMENTS):
+            return False
+        segments = re.split(r"&&|\|\||;|\|", text)
+        for segment in segments:
+            segment = segment.strip()
+            if not segment:
+                return False
+            if _ASSIGNMENT.match(segment):
+                continue
+            words = segment.split()
+            head = words[0].strip("\"'").lower()
+            # 允许 `C:\...\grep.exe` 这类绝对路径：取 basename 再比。
+            head = head.replace("\\", "/").rsplit("/", 1)[-1]
+            if head.endswith(".exe"):
+                head = head[:-4]
+            if head not in allowed:
+                return False
+        return True
+
+    def policy(payload: dict) -> Decision:
+        if _is_ask(payload):
+            return Decision(kind="answer")
+        name = payload.get("tool_name")
+        if name == "run_command":
+            command = (payload.get("tool_args") or {}).get("command", "")
+            return Decision(kind="approval", approved=_command_allowed(command))
+        return Decision(kind="approval", approved=name not in deny_set)
+
+    return policy
+
+
+# 开发型场景的终端白名单：只读命令 + 运行/测试脚本的 python/pytest。
+# 不装依赖、不联网、不做破坏性操作；工作区仍是每任务临时目录。
+_DEV_COMMANDS: tuple[str, ...] = ("python", "python3", "py", "pytest")
+
+_DEV_DENY_FRAGMENTS: tuple[str, ...] = _DENY_FRAGMENTS + (
+    "pip ", "pip3 ", "npm ", "npx ", "node ", "curl ", "wget ",
+    "git clone", "git push", "git reset", "os.system", "subprocess", "shutil.rmtree",
+)
+
+
+def allow_dev_terminal(
+    *,
+    deny: tuple[str, ...] = DEFAULT_DENY_TOOLS,
+    commands: tuple[str, ...] = _DEV_COMMANDS,
+) -> Policy:
+    """开发场景的终端策略：只读命令 + `python` / `pytest`。
+
+    用于"多文件功能开发"这类任务：模型需要写文件、跑自己的脚本/测试，但不需要装依赖或
+    联网。`pip/npm/curl/wget/git clone` 一律拒绝；输出重定向与破坏性命令也拒绝。
+    这不是通用沙箱——`python <script>` 本身可以执行任意代码，只应跑在临时工作区。
+    """
+
+    allowed = set(_READONLY_COMMANDS) | set(commands)
+
+    def _powershell_allowed(text: str) -> bool:
+        lowered = text.lower()
+        if any(cmd in lowered for cmd in _POWERSHELL_DENY):
+            return False
+        return not any(frag in lowered for frag in (">", "`", "$(", "& "))
+
+    def _command_allowed(command: str) -> bool:
+        text = (command or "").strip()
+        if not text:
+            return False
+        first = text.split()[0].strip("\"'").lower().replace("\\", "/").rsplit("/", 1)[-1]
+        if first in {"powershell", "pwsh", "powershell.exe", "pwsh.exe"}:
+            return _powershell_allowed(text)
+        lowered = re.sub(r"\d*>\s*(?:/dev/null|nul)\b", "", text.lower())
+        if any(frag in lowered for frag in _DEV_DENY_FRAGMENTS):
+            return False
+        if first in allowed:
+            # 运行脚本/测试时允许命令内部出现 ; 与 |（例如 python -c），
+            # 但上面的 deny 片段已经挡住了安装、联网与常见破坏性调用。
+            return True
+        segments = re.split(r"&&|\|\||;|\|", text)
+        for segment in segments:
+            segment = segment.strip()
+            if not segment:
+                return False
+            if _ASSIGNMENT.match(segment):
+                continue
+            head = segment.split()[0].strip("\"'").lower()
+            head = head.replace("\\", "/").rsplit("/", 1)[-1]
+            if head.endswith(".exe"):
+                head = head[:-4]
+            if head not in allowed:
+                return False
+        return True
+
+    def policy(payload: dict) -> Decision:
+        if _is_ask(payload):
+            return Decision(kind="answer")
+        name = payload.get("tool_name")
+        if name == "run_command":
+            command = (payload.get("tool_args") or {}).get("command", "")
+            return Decision(kind="approval", approved=_command_allowed(command))
+        return Decision(kind="approval", approved=name not in set(deny))
 
     return policy
 

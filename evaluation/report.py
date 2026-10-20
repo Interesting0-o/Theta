@@ -52,6 +52,31 @@ def render_task(
     return outcomes, details
 
 
+def print_traces(runs: List[Tuple[Task, EvalResult, Optional[Path]]]) -> None:
+    """按任务打印结构化轨迹（工具调用 → 结果 → 最终答复），供人工复盘。"""
+    for task, result, _ in runs:
+        if result.skipped:
+            continue
+        print()
+        print(f"轨迹：{task.name}（{len(result.trace)} 条事件）")
+        for event in result.trace:
+            kind = event.get("kind")
+            if kind == "ai_tool_calls":
+                for call in event.get("tool_calls") or []:
+                    args = str(call.get("args") or {})
+                    if len(args) > 160:
+                        args = args[:160] + "…"
+                    print(f"  → {call.get('name')} {args}")
+            elif kind == "tool_result":
+                content = str(event.get("content") or "").splitlines()
+                first = content[0][:120] if content else ""
+                print(f"    ← {event.get('name')} [{event.get('status')}] {first}")
+            elif kind == "ai_final":
+                content = str(event.get("content") or "").splitlines()
+                first = content[0][:120] if content else ""
+                print(f"  ✓ 最终答复: {first}")
+
+
 def print_report(
     runs: List[Tuple[Task, EvalResult, Optional[Path]]],
     mode: str = MODE_REPLAY,

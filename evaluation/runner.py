@@ -37,7 +37,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -84,6 +84,9 @@ class EvalResult:
     # 模型的锅；但也不能藏：报告里单列一行写出原因与"怎么补"。
     skipped: bool = False
     skip_reason: Optional[str] = None
+    # 轨迹：每轮新增的 AI tool_calls 与 ToolMessage（结构化、只用于断言与复盘）。
+    # 与 fixture 的分工：fixture 存"模型说了什么"供回放；trace 存"图实际跑了什么"供检查。
+    trace: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def skipped_result(task: Task, reason: str) -> EvalResult:
@@ -124,6 +127,70 @@ def _extract_payload(interrupts) -> Dict[str, Any]:
     return payload
 
 
+def _capture_trace(result: EvalResult, output: Dict[str, Any], seen: set) -> None:
+    """把本轮新增的 AI tool_calls / ToolMessage 记进 result.trace。
+
+    只记结构化信息（工具名、参数、tool_call_id、状态、正文前 500 字符），不复制整份历史。
+    状态口径与 `CompactNode._tm_status` 一致：优先读 `additional_kwargs` 的
+    `error_type` / `decision`，没有就按正文 `[error_type]` / `[approval_denied]` 回退判定。
+    """
+    messages = output.get("messages") or []
+    for message in messages:
+        msg_id = getattr(message, "id", None)
+        if msg_id and msg_id in seen:
+            continue
+        if msg_id:
+            seen.add(msg_id)
+        kind = getattr(message, "type", "")
+        if kind == "ai":
+            calls = [
+                {
+                    "name": call.get("name"),
+                    "args": call.get("args"),
+                    "id": call.get("id"),
+                }
+                for call in (getattr(message, "tool_calls", None) or [])
+            ]
+            if calls:
+                result.trace.append(
+                    {
+                        "round": result.rounds,
+                        "kind": "ai_tool_calls",
+                        "message_id": msg_id,
+                        "tool_calls": calls,
+                    }
+                )
+            else:
+                result.trace.append(
+                    {
+                        "round": result.rounds,
+                        "kind": "ai_final",
+                        "message_id": msg_id,
+                        "content": str(getattr(message, "content", "") or "")[:500],
+                    }
+                )
+        elif kind == "tool":
+            extra = getattr(message, "additional_kwargs", None) or {}
+            if extra.get("decision") == "denied":
+                status = "denied"
+            elif extra.get("error_type"):
+                status = "failed"
+            else:
+                text = str(getattr(message, "content", "") or "").strip()
+                status = "failed" if text.startswith("[") and not text.startswith("[user_answer]") else "ok"
+            result.trace.append(
+                {
+                    "round": result.rounds,
+                    "kind": "tool_result",
+                    "message_id": msg_id,
+                    "tool_call_id": getattr(message, "tool_call_id", None),
+                    "name": getattr(message, "name", None),
+                    "status": status,
+                    "content": str(getattr(message, "content", "") or "")[:500],
+                }
+            )
+
+
 async def run_task(graph, task: Task, workspace: Path, config_extra: dict | None = None) -> EvalResult:
     """在已预置的工作区里跑一个任务，返回原始 EvalResult（不做评分）。
 
@@ -144,6 +211,7 @@ async def run_task(graph, task: Task, workspace: Path, config_extra: dict | None
     config = {"configurable": {"thread_id": f"eval::{task.name}"}, **(config_extra or {})}
 
     inputs = state
+    seen: set = set()
     try:
         while True:
             result.rounds += 1
@@ -152,6 +220,7 @@ async def run_task(graph, task: Task, workspace: Path, config_extra: dict | None
                 return result
 
             output = await graph.ainvoke(inputs, config)
+            _capture_trace(result, output, seen)
 
             interrupts = output.get("__interrupt__") or []
             if interrupts:

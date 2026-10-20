@@ -27,7 +27,15 @@
 terminal / 联网工具由策略默认拒绝（policy.DEFAULT_DENY_TOOLS）。
 """
 from .tasks import Task, EXAMPLE_TASKS
-from .policy import Policy, allow_except, deny_all, scripted, DEFAULT_DENY_TOOLS
+from .policy import (
+    Policy,
+    allow_dev_terminal,
+    allow_except,
+    allow_readonly_terminal,
+    deny_all,
+    scripted,
+    DEFAULT_DENY_TOOLS,
+)
 from .models import ReplayChatModel, RecordingCallback
 from .fixtures import Fixture, FixtureError, FIXTURES_DIR
 from .runner import (
@@ -48,6 +56,8 @@ __all__ = [
     "EXAMPLE_TASKS",
     "Policy",
     "allow_except",
+    "allow_dev_terminal",
+    "allow_readonly_terminal",
     "deny_all",
     "scripted",
     "DEFAULT_DENY_TOOLS",

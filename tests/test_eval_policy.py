@@ -9,7 +9,13 @@
 import pytest
 
 from app.schema.approval_schema import GATE_ASK_USER, Decision
-from evaluation.policy import allow_except, deny_all, scripted
+from evaluation.policy import (
+    allow_dev_terminal,
+    allow_except,
+    allow_readonly_terminal,
+    deny_all,
+    scripted,
+)
 
 APPROVAL = {"tool_name": "write_file"}
 APPROVAL_TERMINAL = {"tool_name": "run_command"}
@@ -116,3 +122,79 @@ def test_scripted_error_names_the_position():
     policy(APPROVAL)
     with pytest.raises(ValueError, match="第 3 条"):
         policy(APPROVAL)
+
+
+# ------------------------- allow_readonly_terminal -------------------------
+
+
+def _terminal(command: str) -> dict:
+    return {"tool_name": "run_command", "tool_args": {"command": command}}
+
+
+def test_readonly_terminal_approves_common_read_commands():
+    policy = allow_readonly_terminal()
+
+    assert policy(_terminal("grep -c ERROR logs/app.log")).approved is True
+    assert policy(_terminal("wc -l < logs/app.log")).approved is True
+    assert policy(_terminal('f=logs/app.log; echo "== TOTAL =="; wc -l < "$f"')).approved is True
+    assert policy(_terminal("grep ERROR logs/app.log | tail -n 3")).approved is True
+    assert policy(_terminal("grep -c FATAL logs/app.log || true")).approved is True
+
+
+def test_readonly_terminal_rejects_writes_and_chaining():
+    policy = allow_readonly_terminal()
+
+    assert policy(_terminal("rm -rf logs")).approved is False
+    assert policy(_terminal("echo hi > out.txt")).approved is False
+    assert policy(_terminal("grep x && rm -rf logs")).approved is False
+    assert policy(_terminal("cat f; mv f g")).approved is False
+    assert policy(_terminal("echo $(whoami)")).approved is False
+
+
+def test_readonly_terminal_allows_powershell_readonly():
+    policy = allow_readonly_terminal()
+    read_cmd = (
+        'powershell -NoProfile -Command "$f=\'logs/app.log\'; '
+        '[System.IO.File]::ReadLines($f) | Select-String -SimpleMatch \'ERROR\' | '
+        'Select-Object -Last 3"'
+    )
+    assert policy(_terminal(read_cmd)).approved is True
+    assert policy(_terminal('powershell -Command "Set-Content out.txt hi"')).approved is False
+    assert policy(_terminal('powershell -Command "Get-Content f > out.txt"')).approved is False
+
+
+def test_readonly_terminal_keeps_file_and_web_rules():
+    policy = allow_readonly_terminal()
+
+    assert policy({"tool_name": "write_file"}).approved is True
+    assert policy({"tool_name": "web_search"}).approved is False
+    assert policy(ASK) == Decision(kind="answer")
+
+
+# ------------------------- allow_dev_terminal -------------------------
+
+
+def test_dev_terminal_allows_python_and_pytest():
+    policy = allow_dev_terminal()
+
+    assert policy(_terminal("python -m pytest -q")).approved is True
+    assert policy(_terminal("python app.py --port 8000")).approved is True
+    assert policy(_terminal("pytest tests")).approved is True
+    assert policy(_terminal('python -c "print(1)"')).approved is True
+
+
+def test_dev_terminal_rejects_installs_network_and_destructive():
+    policy = allow_dev_terminal()
+
+    assert policy(_terminal("pip install flask")).approved is False
+    assert policy(_terminal("npm install")).approved is False
+    assert policy(_terminal("curl https://example.com")).approved is False
+    assert policy(_terminal("rm -rf .")).approved is False
+    assert policy(_terminal("python -c \"import os; os.system('rm -rf /')\"")).approved is False
+
+
+def test_dev_terminal_keeps_file_and_web_rules():
+    policy = allow_dev_terminal()
+
+    assert policy({"tool_name": "write_file"}).approved is True
+    assert policy({"tool_name": "web_search"}).approved is False
