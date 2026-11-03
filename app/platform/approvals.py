@@ -218,12 +218,18 @@ def build_app(queue: ApprovalInbox) -> Starlette:
         worker_id = body.get("worker_id")
         if not isinstance(worker_id, str) or not worker_id.strip():
             return _bad_request("缺少 worker_id")
+        tool_args = body.get("tool_args")
+        if not isinstance(tool_args, dict):
+            tool_args = {}
+        description = body.get("description")
+        if not isinstance(description, str):
+            description = ""
         # 只保留已知字段，避免把意外键带进后续渲染/回包
         payload: ApprovalRequest = {
             "worker_id": worker_id,
             "tool_name": tool_name,
-            "tool_args": body.get("tool_args") if isinstance(body.get("tool_args"), dict) else {},
-            "description": body.get("description"),
+            "tool_args": tool_args,
+            "description": description,
         }
         # worker 派给自己的那条子任务原文（可选；本地中断不带）：审批面板靠它给出上下文
         if isinstance(body.get("subtask"), str) and body["subtask"].strip():
