@@ -1,4 +1,4 @@
-# 上下文压缩 / 上下文工程外部实践调研（2026-10-18）
+# 上下文压缩 / 上下文工程外部实践调研（2026-10-18，2026-10-24 代码核对修订）
 
 > **性质**：外部实践调研，不是目标态设计。目的是为 Theta 当前 P0「图内 token 压缩」提供
 > 可借鉴的机制、阈值与反直觉结论；与代码现状不一致处以代码为准。
@@ -31,11 +31,13 @@ ToolMessage（带 success / error_type / exit_code 戳）
 
 | 层 | 触发 | 手段 | 目标 | 现状 |
 | --- | --- | --- | --- | --- |
-| 写入侧压缩 | 每次工具返回 | 终端输出头尾截断、剥进度、完整日志落盘 | 冗余日志 | **未做** |
-| 轮内压缩 | 工具循环中、按移动窗口 | 旧工具块观察遮蔽（保留元数据与首尾） | 已消费的旧观测 | **未做**（现有 compact 只在轮末且只折 Human 之前，单轮长任务折不了） |
-| 摘要 | **厂商标称窗口 40%–50%** | LLM 结构化摘要 + `SystemMessage`/`RemoveMessage` 原位替换 | 已压缩多轮的语义历史 | 有形式，但仅轮末/旧轮次 |
-| 记忆 / 技能 | 会话开始 / 按需 | 分层记忆注入；技能目录 + 按需正文 | 跨轮背景 | 部分已有（工作区记忆、skill 按需加载） |
+| 写入侧压缩 | 每次工具返回 | 终端输出头尾截断、剥进度、完整日志落盘 | 冗余日志 | **部分落地**（2026-10-20）：终端中间截断已下沉 `mcp_service/terminal.py::_compress_output`（超 `TEXT_BUDGET_CHARS` 保留头尾各 1/4）；**完整日志落盘/恢复路径未做** |
+| 轮内压缩 | 工具循环中、按移动窗口 | 旧工具块观察遮蔽（保留元数据与首尾） | 已消费的旧观测 | **部分落地**（2026-10-20）：`CompressNode` 已接线（`tool/orchestrate → compress → llm`），当前只做**当前轮 read_file 同文件重复读取指针化**；**移动窗口遮蔽未做**，且是无条件必经边、无预算/delta 触发 |
+| 摘要 | **厂商标称窗口 40%–50%** | LLM 结构化摘要 + `SystemMessage`/`RemoveMessage` 原位替换 | 已压缩多轮的语义历史 | **未做**：`CompactNode` 轮末无条件折叠（已不看 60K 预算门）仍是**确定性单行摘要**（工作日志·工具·状态），只折"最后一条 HumanMessage 之前"；单轮长任务一块折不了 |
+| 记忆 / 技能 | 会话开始 / 按需 | 分层记忆注入；技能目录 + 按需正文 | 跨轮背景 | 已有（工作区记忆、skill 按需加载） |
 | 子 agent | 任务分发 | worker 独立窗口、只回结论 | 上下文隔离 | 已有 `dispatch_subtasks` |
+| 缓存友好排序 | 每次请求 | 稳定前缀 → 历史 → 动态尾部 | prefix cache 命中 | **已落地**（Phase 1，2026-10-20）：动态状态（plan/memory/handoff/skills）内联 `<RUNTIME_STATE>` 到最后一条 HumanMessage 尾部；稳定前缀只留 SYSTEM_PROMPT / 工作区 / 画像；`llm_usage` 日志记录 input/cache_read/hit/miss |
+| 确定性事件日志 | 每次 tool_call | 每调用一行 JSONL 审计（状态戳/目标/args_hash/审批） | 上下文只放指针、审计可无上限落盘 | **已落地**（Phase 2，2026-10-20）：`app/resource/event_log.py` + 只读工具 `read_event_log` |
 
 **不变量**：
 
@@ -47,14 +49,21 @@ ToolMessage（带 success / error_type / exit_code 戳）
 - 缓存：写入侧压缩纯收益；轮内遮蔽批量低频；摘要一次性摊销；动态 plan/记忆放尾部；
 - 触发：压缩连续做；摘要在**厂商标称窗口 40%–50%**。
 
-**当前缺口（按优先级）**：
+**当前缺口（按优先级；2026-10-24 按代码核对修订，~~删除线~~ = 已解决）**：
 
-1. 工具输出没有上限/落盘（本会话三份安装日志占累计 prompt 71.3%）；
+1. ~~工具输出没有上限/落盘（本会话三份安装日志占累计 prompt 71.3%）~~ → 终端截断已落地；
+   **残余**：被截正文**不落盘、无恢复路径**（§5.5 的 `full_output` 方案未做）；
 2. `CompactNode._plan` 的折叠区是"最后一条 HumanMessage 之前"，单轮长任务一块也折不了；
-3. 轮内没有遮蔽/摘要触发点；
-4. 失败块会被折成一行，完整错误丢失；
-5. `current_plan` 注入在 messages 之前，plan 更新会破坏 prompt cache；
-6. 没有 usage/缓存命中率观测，无法验证上述收益。
+3. 轮内遮蔽未做：`CompressNode` 只有 read_file 去重一条规则，无移动窗口、无预算/delta 触发
+   （无条件必经边，不触发时返回 `{}` 白跑一拍）；
+4. **失败块会被折**（2026-10-24 核对发现 `_plan` 不跳过 failed/denied 块；§5.9 MVP 只落了
+   "识别"一半——戳有、`command_failed` 细化与 exit_code 未做、折叠跳过未做）；
+5. ~~`current_plan` 注入在 messages 之前，plan 更新会破坏 prompt cache~~ → Phase 1 已改
+   `RUNTIME_STATE` 内联 Human 尾部；
+6. ~~没有 usage/缓存命中率观测~~ → `llm_usage` 日志已落地；**残余**：无聚合观测面板，
+   缓存命中率要靠翻日志；
+7. **Phase 3 未开始**：低频 checkpoint 触发 + recent K 窗口 + LLM digest + 确定性
+   fallback + `summary_version` / `covers_until_message_id`（见 §8）。
 
 **第一步（MVP）**：终端运行错误识别——大部分已存在（`ToolResult.success=False` →
 `ToolNode` 打 `error_type` 戳），只需补两处：失败戳带出退出码/区分 `command_failed`；
