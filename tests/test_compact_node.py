@@ -139,8 +139,8 @@ def test_incomplete_block_is_kept():
     assert out == {}
 
 
-def test_denied_status_rendered():
-    """生产端结构化戳 decision=denied → 摘要状态 denied（未执行）。"""
+def test_denied_block_is_kept():
+    """被拒块不折：错误正文原样留在历史里。"""
     messages = [
         HumanMessage(content=_pad(100), id="h1"),
         AIMessage(content="删除临时目录 foo", tool_calls=[_tc("delete_dir", "c1")], id="a1"),
@@ -153,15 +153,11 @@ def test_denied_status_rendered():
         AIMessage(content="好的。", id="ans2"),
     ]
     out = _run(messages)
-    merged = _merged(messages, out)
-    sys_msg = next(m for m in out["messages"] if isinstance(m, SystemMessage))
-    assert "状态: denied（未执行）" in sys_msg.content
-    assert "工作日志: 删除临时目录 foo" in sys_msg.content
-    assert merged[-1].content == "好的。"
+    assert out == {}
 
 
-def test_failed_status_rendered_from_content_prefix():
-    """无结构化戳、仅 content 前缀的历史消息 → 回退判定 failed。"""
+def test_failed_block_is_kept_from_content_prefix():
+    """content 前缀判定的失败块同样不折。"""
     messages = [
         HumanMessage(content=_pad(100), id="h1"),
         AIMessage(content="写文件到越界路径", tool_calls=[_tc("write_file", "c1")], id="a1"),
@@ -174,12 +170,11 @@ def test_failed_status_rendered_from_content_prefix():
         AIMessage(content="明白。", id="ans2"),
     ]
     out = _run(messages)
-    sys_msg = next(m for m in out["messages"] if isinstance(m, SystemMessage))
-    assert "状态: failed（workspace_violation）" in sys_msg.content
+    assert out == {}
 
 
-def test_stamped_error_type_reads_struct():
-    """生产端结构化戳(error_type)优先于 content，无需解析前缀。"""
+def test_stamped_error_block_is_kept():
+    """结构化戳(error_type)判定的失败块同样不折。"""
     messages = [
         HumanMessage(content=_pad(100), id="h1"),
         AIMessage(content="读越界文件", tool_calls=[_tc("read_file", "c1")], id="a1"),
@@ -190,8 +185,7 @@ def test_stamped_error_type_reads_struct():
         AIMessage(content="明白。", id="ans2"),
     ]
     out = _run(messages)
-    sys_msg = next(m for m in out["messages"] if isinstance(m, SystemMessage))
-    assert "状态: failed（workspace_violation）" in sys_msg.content
+    assert out == {}
 
 
 def test_web_search_result_archives_to_notes():

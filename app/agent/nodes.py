@@ -5,6 +5,7 @@ import logging
 import posixpath
 import shlex
 import time
+from dataclasses import dataclass
 from inspect import signature
 from pathlib import Path
 from typing import Callable
@@ -1158,10 +1159,10 @@ _NOTE_MAX = TEXT_BUDGET_CHARS
 
 
 def needs_compact(state, budget: int) -> bool:
-    """预算门（**轮内压缩预留**）：历史 content 字符总数超过 budget 才需要触发压缩。
+    """预算门（**仅测试/兼容保留**）：历史 content 字符总数超过 budget。
 
-    轮末 `CompactNode` 已改为无条件启用，不再调用本函数；保留给轮内 `CompressNode` 的
-    触发判据（到时计量范围可能要收窄到"当前轮"，不要直接照搬全历史口径）。
+    轮末 `CompactNode` 已改为无条件启用；轮内 `CompressNode` 已改用可压正文水位
+    （`compressible_chars`，见 §8.6），不再调用本函数。
     """
     total = sum(len(str(getattr(m, "content", "") or "")) for m in (state.get("messages") or []))
     return total > budget
@@ -1178,6 +1179,8 @@ class CompactNode:
       只操作会话 state（计划快照、提问回答、记忆/技能回执），不是可重取的外部结果——折掉
       就是误伤。整块都是编排工具 → 整块保留；混合块（编排 + 普通）→ 只折普通调用，保留
       编排调用及其 ToolMessage，并原位改写 AIMessage 的 tool_calls 子集；
+    - **失败/被拒块不折**：块内任一 `ToolMessage` 为 failed/denied 时整块保留，错误正文
+      不压缩；
     - 联网四工具的成功正文归档进 notes；
     - 返回：`SystemMessage(摘要, id=折叠区最早被删消息的 id)` 原位替换 + `RemoveMessage`
       删除其余被折块（混合块另加一条 AIMessage 改写）——不尾追加，messages 尾部仍是本轮
@@ -1411,6 +1414,15 @@ class CompactNode:
             if not folded_calls:
                 continue
 
+            # 失败/被拒块不折：错误正文必须原样留在历史里（§8.3 不变量）。
+            folded_status = [
+                CompactNode._tm_status(claimed.get(tc.get("id")))[0]
+                for tc in folded_calls
+                if claimed.get(tc.get("id")) is not None
+            ]
+            if any(status in {"failed", "denied"} for status in folded_status):
+                continue
+
             # 混合块里摘要 SystemMessage 会顶替第一条被折的普通 ToolMessage。为保持
             # AIMessage(tool_calls) → ToolMessage 的邻接关系，要求编排回执全部排在
             # 普通回执之前（生产路径恒成立：OrchestrateNode 先跑、ToolNode 后跑）；
@@ -1487,23 +1499,30 @@ class CompactNode:
 # 因此只改 ToolMessage.content。当前规则：
 #   1) 同一轮内对同一文件的重复 read_file：**最后一次成功读取为准**，其余换成指向它的指针
 #      （不看正文是否相同——文件随时可能被编辑，旧结果已经过期）；
-#   2) 当前轮内容超过**高水位**时，把已消费的旧成功结果压成一行指针，降到**低水位**；
-#      保留最近 K 条成功结果、所有失败/被拒、ask_user 回答、最新一批（模型还没看过）；
+#   2) 可压 ToolMessage 正文超过**高水位**时，按批压缩到**低水位**：硬边界 → plan step →
+#      step 内语义子边界（里程碑/成功失败转换/进程/写操作）→ 预算兜底。批内只压 eligible
+#      的成功结果；失败/被拒、受保护工具、写回执、未消费块保持原文；保留最近 K 个 block；
 #   3) 编排/state 回执（plan / memory / skill）只留最近一条，其余压成一行指针
 #      （current_plan 与 RUNTIME_STATE 已是权威）。
 # 这是**滞回**压缩：一次压一批、之后若干调用保持前缀命中；低于高水位时不做任何事。
+# 语义优先于预算：预算到达上限时先在 ±20% 容差内找最近的语义切点，找不到才硬切。
 # **终端输出的中间截断已下沉到 terminal MCP 自己**（mcp_service/terminal.py::
 # _compress_output）：写在消息落地之前，消息从第一次进入 state 就是最终形态，节点不再
 # 事后改写它。旧轮的整块折叠仍归 CompactNode。
 
 # read_file 去重的最小正文长度：被替换的旧正文太短时，指针和正文差不多，不值得换。
 _READ_DEDUP_MIN_CHARS = 1000
-# 轮内移动窗口的默认水位（当前轮消息 content 字符数，主要是 ToolMessage）。高水位触发、
-# 低水位停止；滞回避免每拍都改前缀、打碎 prompt cache。阈值不含稳定前缀与 AI 参数。
+# 轮内移动窗口的默认水位（当前轮**可压 ToolMessage 正文**字符数）。高水位触发、
+# 低水位停止；滞回避免每拍都改前缀、打碎 prompt cache。阈值不含稳定前缀、AI 参数与
+# 受保护/失败/写回执——那些不是可压池，压不动也不该压。
 _TURN_HIGH_WATERMARK_CHARS = 50000
 _TURN_LOW_WATERMARK_CHARS = 25000
-# 默认保留最近 K 条成功工具结果；再旧的才压。预算仍超时会从这些里再压，但至少留 keep_min 条。
-_TURN_KEEP_RECENT = 8
+# 默认保留最近 K 个 block；再旧的才压。按 block 而不是按消息，避免“一个块里多条结果”
+# 让保留量随工具数漂移。
+_TURN_KEEP_BLOCKS = 8
+# 单个批的上下界：低于 min 指针不划算；高于 max 一次改写的影响面太大。
+_MAX_BATCH_CHARS = 8000
+_MIN_BATCH_CHARS = 300
 # 被压正文的最小长度：太短的正文压成指针不省，反而多一行噪声。
 _MASK_MIN_CHARS = 300
 # 状态回执：每个工具只保留最近一条；旧回执的内容已由 current_plan / RUNTIME_STATE 承载。
@@ -1511,14 +1530,169 @@ _STATE_RECEIPT_TOOLS = frozenset({
     "create_plan", "update_plan_step", "clear_plan",
     "read_memory", "write_memory", "get_skill", "drop_skill",
 })
+# 写操作回执：Phase 1 保持原文（写文件的正文在 tool_call args 里，Phase 2 再处理）。
+_WRITE_TOOLS = frozenset({
+    "write_file", "edit_file", "create_file", "create_dir",
+    "delete_file", "delete_dir", "copy_path",
+})
 # 不进移动窗口的工具：
 # - web 四件套：正文由 CompactNode 在轮末归档进 notes，轮内压掉等于丢研究原料；
 # - ask_user：用户决定，必须保留；
-# - dispatch_subtasks：worker 结论本身就是"结论"，不是可重取的 dump。
+# - dispatch_subtasks：worker 结论本身就是"结论"，不是可重取的 dump；
+# - 写操作回执：Phase 1 保持原文。
 _NO_MASK_TOOLS = frozenset({
     "web_search", "extract_urls", "crawl_website", "deep_research",
     "ask_user", "dispatch_subtasks",
-}) | _STATE_RECEIPT_TOOLS
+}) | _STATE_RECEIPT_TOOLS | _WRITE_TOOLS
+
+
+@dataclass
+class _ToolCallInfo:
+    """一个 tool_call 及其兑现的 ToolMessage（批级压缩的最小观测）。"""
+
+    call_id: str | None
+    name: str
+    args: dict
+    tool_message: ToolMessage | None
+    status: str
+    eligible: bool = False
+
+
+@dataclass
+class _ToolBlock:
+    """结构原子：AIMessage(tool_calls) + 兑现它的全部 ToolMessage。"""
+
+    ai_message: AIMessage
+    calls: list[_ToolCallInfo]
+    start: int
+    end: int
+    complete: bool
+    ids_ok: bool
+    consumed: bool
+    plan_epoch: int
+    step_id: str | None
+    milestone: bool
+    eligible_chars: int = 0
+
+
+def _in_progress_step(plan) -> str | None:
+    """从 current_plan 取 in_progress 的 step id；没有返回 None。"""
+    for step in plan or []:
+        if isinstance(step, dict) and step.get("status") == "in_progress":
+            step_id = step.get("id")
+            return str(step_id) if step_id is not None else None
+    return None
+
+
+def _iter_tool_blocks(messages, initial_plan=None) -> tuple[list[_ToolBlock], list[int]]:
+    """把消息序列解析成 tool-call block，并记录工具块之外的消息位置。
+
+    plan step 从 `create_plan` / `update_plan_step` / `clear_plan` 的调用历史重建：
+    `create_plan` 开启新 epoch；`in_progress` 把 block 归到新 step；`done` / `pending`
+    只结束当前 step。`step=None` 是合法段（模型还没声明 step 或已 clear）。
+    """
+    blocks: list[_ToolBlock] = []
+    boundaries: list[int] = []
+    plan_epoch = 0
+    active_step = _in_progress_step(initial_plan)
+    i = 0
+    n = len(messages)
+    while i < n:
+        message = messages[i]
+        kind = type(message).__name__
+        if kind != "AIMessage" or not getattr(message, "tool_calls", None):
+            boundaries.append(i)
+            i += 1
+            continue
+
+        calls = list(message.tool_calls)
+        call_ids = [call.get("id") for call in calls if isinstance(call, dict)]
+        claimed: dict[str, ToolMessage] = {}
+        j = i + 1
+        while j < n and type(messages[j]).__name__ == "ToolMessage":
+            tool_message = messages[j]
+            call_id = getattr(tool_message, "tool_call_id", None)
+            if call_id in call_ids and call_id not in claimed:
+                claimed[call_id] = tool_message
+                j += 1
+            else:
+                break
+
+        step_before = active_step
+        new_step = None
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            name = (call.get("name") or "").strip()
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            if name == "create_plan":
+                plan_epoch += 1
+                active_step = None
+                new_step = None
+            elif name == "update_plan_step":
+                step_id = args.get("step_id")
+                step_id = str(step_id) if step_id is not None else None
+                status = args.get("status")
+                if status == "in_progress":
+                    active_step = step_id
+                    new_step = step_id
+                elif status in {"done", "pending"} and active_step == step_id:
+                    active_step = None
+            elif name == "clear_plan":
+                active_step = None
+
+        call_infos: list[_ToolCallInfo] = []
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            call_id = call.get("id")
+            tool_message = claimed.get(call_id) if call_id else None
+            status = CompactNode._tm_status(tool_message)[0] if tool_message is not None else "missing"
+            call_infos.append(
+                _ToolCallInfo(
+                    call_id=call_id,
+                    name=(call.get("name") or "").strip() or "?",
+                    args=call.get("args") if isinstance(call.get("args"), dict) else {},
+                    tool_message=tool_message,
+                    status=status,
+                )
+            )
+
+        complete = (
+            len(claimed) == len(call_ids)
+            and all(call_id is not None for call_id in call_ids)
+            and all(isinstance(call, dict) for call in calls)
+        )
+        ids_ok = all(getattr(m, "id", None) for m in [message, *claimed.values()])
+        consumed = False
+        for k in range(j, n):
+            if type(messages[k]).__name__ == "HumanMessage":
+                break
+            if type(messages[k]).__name__ == "AIMessage":
+                consumed = True
+                break
+        milestone = any(
+            call.name in _WRITE_TOOLS
+            or call.name in {"start_process", "process_kill", "update_plan_step", "create_plan", "clear_plan"}
+            or call.status in {"failed", "denied"}
+            for call in call_infos
+        )
+        blocks.append(
+            _ToolBlock(
+                ai_message=message,
+                calls=call_infos,
+                start=i,
+                end=j - 1,
+                complete=complete,
+                ids_ok=ids_ok,
+                consumed=consumed,
+                plan_epoch=plan_epoch,
+                step_id=new_step if new_step is not None else step_before,
+                milestone=milestone,
+            )
+        )
+        i = j
+    return blocks, boundaries
 
 
 class CompressNode:
@@ -1533,10 +1707,11 @@ class CompressNode:
       判据是 tool_call 的 `path`，**不再要求正文相同**：文件在两次读取之间被编辑或外部
       修改时，旧正文已经过期，留着反而误导。带行区间的读取只有在"最后一次覆盖旧读取的
       范围"时才替换（全文请求只与全文请求互替），避免把没读到的行当成已省略；
-    - **移动窗口**：当前轮消息 content 超过 `high_watermark_chars` 时，把**已消费的旧成功
-      ToolMessage** 压成一行指针，压到 `low_watermark_chars` 以下。保留最近
-      `keep_recent` 条成功结果、所有失败/被拒、`ask_user` 回答、以及最新一批（模型还没
-      看过）的工具结果。只改 content，不删消息；
+    - **批级移动窗口**：当前轮可压 ToolMessage 正文超过 `high_watermark_chars` 时，把
+      **已消费的旧成功结果**按批压成一条批级时间线 + 同批短戳，压到
+      `low_watermark_chars` 以下。保留最近 `keep_blocks` 个 block、所有失败/被拒、
+      `ask_user` 回答、以及未消费的最新 block。批的切点优先取 plan step / 语义里程碑，
+      预算（`max_batch_chars`）只作最后的安全上界。只改 content，不删消息；
     - **状态回执变薄**：`create_plan` / `update_plan_step` / `clear_plan` / `read_memory` /
       `write_memory` / `get_skill` / `drop_skill` 每个工具只保留最近一条回执，其余压成一行
       （`current_plan` 与 RUNTIME_STATE 已是权威）；
@@ -1562,27 +1737,36 @@ class CompressNode:
         read_dedup_min_chars: int = _READ_DEDUP_MIN_CHARS,
         high_watermark_chars: int = _TURN_HIGH_WATERMARK_CHARS,
         low_watermark_chars: int = _TURN_LOW_WATERMARK_CHARS,
-        keep_recent: int = _TURN_KEEP_RECENT,
+        keep_blocks: int = _TURN_KEEP_BLOCKS,
         mask_min_chars: int = _MASK_MIN_CHARS,
+        max_batch_chars: int = _MAX_BATCH_CHARS,
+        min_batch_chars: int = _MIN_BATCH_CHARS,
     ) -> None:
         """`read_dedup_min_chars`：被替换的旧 read_file 正文不短于它才指针化。
 
-        `high/low_watermark_chars`：当前轮消息 content 的高/低水位（字符数）；
-        `keep_recent`：默认保留的最近成功结果条数；`mask_min_chars`：被压正文的最小长度。
+        `high/low_watermark_chars`：可压 ToolMessage 正文的高/低水位（字符数）；
+        `keep_blocks`：保留最近 K 个 block；`mask_min_chars`：单条被压正文的最小长度；
+        `max_batch_chars` / `min_batch_chars`：单个批的上下界（语义切点优先，预算是兜底）。
         """
         if read_dedup_min_chars < 1:
             raise ValueError("read_dedup_min_chars 至少为 1")
         if not 0 < low_watermark_chars < high_watermark_chars:
             raise ValueError("low_watermark_chars 必须大于 0 且小于 high_watermark_chars")
-        if keep_recent < 0:
-            raise ValueError("keep_recent 不能为负")
+        if keep_blocks < 0:
+            raise ValueError("keep_blocks 不能为负")
         if mask_min_chars < 1:
             raise ValueError("mask_min_chars 至少为 1")
+        if min_batch_chars < 1:
+            raise ValueError("min_batch_chars 至少为 1")
+        if max_batch_chars < min_batch_chars:
+            raise ValueError("max_batch_chars 不能小于 min_batch_chars")
         self.read_dedup_min_chars = read_dedup_min_chars
         self.high_watermark_chars = high_watermark_chars
         self.low_watermark_chars = low_watermark_chars
-        self.keep_recent = keep_recent
+        self.keep_blocks = keep_blocks
         self.mask_min_chars = mask_min_chars
+        self.max_batch_chars = max_batch_chars
+        self.min_batch_chars = min_batch_chars
 
     async def __call__(self, state: AgentState) -> dict | AgentState:
         messages = list(state.get("messages") or [])
@@ -1601,6 +1785,7 @@ class CompressNode:
         for message in self._dedupe_reads(messages, region_start, args_by_call):
             by_id[message.id] = message
 
+        # 状态回执变薄仍按“当前轮总 content”触发：它不计入可压池，但旧回执会一直重放。
         turn_chars = self._turn_chars(messages, region_start)
         if turn_chars > self.high_watermark_chars:
             projected = turn_chars - self._saved(messages, by_id)
@@ -1609,11 +1794,18 @@ class CompressNode:
                     messages, region_start, args_by_call, by_id, projected
                 ):
                     by_id[message.id] = message
-                projected = turn_chars - self._saved(messages, by_id)
-            if projected > self.low_watermark_chars:
-                for message in self._mask_old_results(
-                    messages, region_start, args_by_call, by_id, projected
-                ):
+
+        # 批级压缩只看“可压 ToolMessage 正文”；先把去重/回执替换应用到工作副本。
+        working = [by_id.get(getattr(message, "id", None), message) for message in messages]
+        blocks, boundaries = _iter_tool_blocks(working, state.get("current_plan") or [])
+        region_blocks = [block for block in blocks if block.start >= region_start]
+        self._mark_eligibility(region_blocks)
+
+        compressible = sum(block.eligible_chars for block in region_blocks)
+        if compressible > self.high_watermark_chars:
+            plan_blocks = region_blocks[: max(0, len(region_blocks) - self.keep_blocks)]
+            for batch in self._plan_batches(plan_blocks, boundaries):
+                for message in self._mask_batch(batch):
                     by_id[message.id] = message
 
         if not by_id:
@@ -1656,6 +1848,32 @@ class CompressNode:
             after = len(str(getattr(new, "content", "") or ""))
             total += max(0, before - after)
         return total
+
+    def _mark_eligibility(self, blocks: list[_ToolBlock]) -> None:
+        """按 ToolMessage 逐条标记可压性；block 只提供结构/消费/配对约束。
+
+        失败/被拒、受保护工具（web/ask/dispatch/state）、写回执、未消费块、不完整块
+        与已带压缩标记的消息都不参与批级 mask；同一 block 里的其它成功结果仍可压。
+        """
+        for block in blocks:
+            block.eligible_chars = 0
+            block_ok = block.complete and block.ids_ok and block.consumed
+            for call in block.calls:
+                call.eligible = False
+                tool_message = call.tool_message
+                if not block_ok or tool_message is None or call.status != "ok":
+                    continue
+                content = tool_message.content
+                if not isinstance(content, str):
+                    continue
+                if (
+                    call.name not in _NO_MASK_TOOLS
+                    and getattr(tool_message, "id", None)
+                    and len(content) >= self.mask_min_chars
+                    and not self._is_marked(content)
+                ):
+                    call.eligible = True
+                    block.eligible_chars += len(content)
 
     @staticmethod
     def _has_later_ai(region: list, index: int) -> bool:
@@ -1892,87 +2110,157 @@ class CompressNode:
             return f"{prefix} {name} · {args.get('name', '?')}"
         return f"{prefix} {name}"
 
-    # ---------- 当前轮移动窗口：旧结果压成一行指针 ----------
+    # ---------- 批级移动窗口：语义切点优先，预算兜底 ----------
 
-    def _mask_old_results(
-        self,
-        messages: list,
-        region_start: int,
-        args_by_call: dict[str, dict],
-        by_id: dict[str, ToolMessage],
-        projected: int,
-    ) -> list[ToolMessage]:
-        """把已消费的旧成功 ToolMessage 压成一行指针，直到降到低水位。
+    def _plan_batches(
+        self, blocks: list[_ToolBlock], boundaries: list[int]
+    ) -> list[list[_ToolBlock]]:
+        """把当前轮 block 切成批：硬边界 → plan step → 预算（含语义切点）。
 
-        保留最近 `keep_recent` 条；若仍超低水位，再从这些里压到至少 2 条。
-        失败/被拒、最新一批（未消费）、状态回执与 web/ask/dispatch 都不参与。
+        `boundaries` 是工具块之外的消息下标（Human/System/Assistant/孤儿 ToolMessage）；
+        不完整/未消费 block 也不进批。批内可以夹着不可压的 block，只压 eligible 的
+        ToolMessage；批与批之间由 step 变化、硬边界或预算切点分开。
         """
-        region = messages[region_start:]
-        candidates: list[tuple[ToolMessage, str, int]] = []
-        for index, message in enumerate(region):
-            if not isinstance(message, ToolMessage):
-                continue
-            if not getattr(message, "id", None):
-                continue
-            name = (getattr(message, "name", "") or "").strip()
-            if not name or name in _NO_MASK_TOOLS:
-                continue
-            if message.id in by_id:
-                continue
-            content = message.content
-            if not isinstance(content, str):
-                continue
-            if len(content) < self.mask_min_chars or self._is_marked(content):
-                continue
-            status, _ = CompactNode._tm_status(message)
-            if status != "ok":
-                continue
-            if not self._has_later_ai(region, index):
-                continue
-            pointer = self._mask_pointer(message, args_by_call.get(message.tool_call_id) or {})
-            saving = len(content) - len(pointer)
-            if saving <= 0:
-                continue
-            candidates.append((message, pointer, saving))
+        if not blocks:
+            return []
+        batches: list[list[_ToolBlock]] = []
+        segment: list[_ToolBlock] = []
+        segment_key = None
+        prev_end = blocks[0].start - 1
 
-        protect_from = max(0, len(candidates) - self.keep_recent)
+        def flush() -> None:
+            nonlocal segment, segment_key
+            if segment:
+                batches.extend(self._plan_segment(segment))
+            segment = []
+            segment_key = None
+
+        for block in blocks:
+            if (
+                self._has_boundary(boundaries, prev_end, block.start)
+                or not block.complete
+                or not block.consumed
+            ):
+                flush()
+                prev_end = block.end
+                continue
+            key = (block.plan_epoch, block.step_id)
+            if segment and key != segment_key:
+                flush()
+            segment.append(block)
+            segment_key = key
+            prev_end = block.end
+        flush()
+        return batches
+
+    @staticmethod
+    def _has_boundary(boundaries: list[int], left: int, right: int) -> bool:
+        """`(left, right)` 之间是否有工具块之外的消息（硬边界）。"""
+        return any(left < position < right for position in boundaries)
+
+    def _plan_segment(self, blocks: list[_ToolBlock]) -> list[list[_ToolBlock]]:
+        """在一个 step 段内按预算切批；预算超限时优先在里程碑附近切。"""
+        batches: list[list[_ToolBlock]] = []
+        start = 0
+        n = len(blocks)
+        while start < n:
+            end = start
+            chars = 0
+            while end < n and chars + blocks[end].eligible_chars <= self.max_batch_chars:
+                chars += blocks[end].eligible_chars
+                end += 1
+
+            if end == n:
+                cut = n
+            else:
+                cut = self._semantic_cut(blocks, start, end)
+                if cut is None or cut <= start:
+                    cut = end if end > start else start + 1
+
+            batch = blocks[start:cut]
+            if self._batch_chars(batch) >= self.min_batch_chars:
+                batches.append(batch)
+            start = cut
+        return batches
+
+    def _semantic_cut(
+        self, blocks: list[_ToolBlock], start: int, end: int
+    ) -> int | None:
+        """在 `[start, end]` 里找最近的里程碑切点；只在预算的 ±20% 容差内采用。
+
+        里程碑 = 写操作完成、进程 start/kill、成功↔失败转换、plan 更新。找不到就返回
+        `None`，由调用方按预算硬切——语义优先，但预算仍是最后的安全上界。
+        """
+        threshold = int(self.max_batch_chars * 0.8)
+        chars = 0
+        cut = None
+        for index in range(start, end + 1):
+            chars += blocks[index].eligible_chars
+            if blocks[index].milestone and chars >= threshold:
+                cut = index + 1
+        return cut
+
+    @staticmethod
+    def _batch_chars(batch: list[_ToolBlock]) -> int:
+        return sum(block.eligible_chars for block in batch)
+
+    def _mask_batch(self, batch: list[_ToolBlock]) -> list[ToolMessage]:
+        """把一批里的 eligible ToolMessage 压成一条批级时间线 + 同批短戳。"""
+        calls = [call for block in batch for call in block.calls if call.eligible]
+        if not calls:
+            return []
         replacements: list[ToolMessage] = []
-
-        def take(entry: tuple[ToolMessage, str, int]) -> None:
-            nonlocal projected
-            message, pointer, saving = entry
-            replacements.append(message.model_copy(update={"content": pointer}))
-            projected -= saving
-
-        for entry in candidates[:protect_from]:
-            if projected <= self.low_watermark_chars:
-                break
-            take(entry)
-
-        if projected > self.low_watermark_chars and self.keep_recent > 0:
-            kept = candidates[protect_from:]
-            keep_min = min(2, self.keep_recent)
-            for index, entry in enumerate(kept):
-                if projected <= self.low_watermark_chars:
-                    break
-                if len(kept) - index <= keep_min:
-                    break
-                take(entry)
-
+        pointer = self._batch_pointer(calls)
+        stub = f"{self.MASK_MARKER_PREFIX} 同批已压缩"
+        for index, call in enumerate(calls):
+            tool_message = call.tool_message
+            if tool_message is None:
+                continue
+            replacements.append(
+                tool_message.model_copy(
+                    update={"content": pointer if index == 0 else stub}
+                )
+            )
         return replacements
 
-    def _mask_pointer(self, message: ToolMessage, args: dict) -> str:
-        """旧工具结果的一行指针：工具 + 目标 + 关键行；不复制正文。"""
-        name = (getattr(message, "name", "") or "?").strip()
-        bits = [f"{self.MASK_MARKER_PREFIX} {name}"]
-        target = self._mask_target(name, args)
-        if target:
-            bits.append(target)
-        key = self._key_line(message, name)
-        if key:
-            bits.append(key)
-        bits.append("需要时重新读取/执行")
-        return " · ".join(bits)
+    def _batch_pointer(self, calls: list[_ToolCallInfo]) -> str:
+        """批级时间线：工具×次数 + 目标/关键行；不复制正文。"""
+        counts: dict[str, int] = {}
+        groups: dict[str, list[str]] = {}
+        order: list[str] = []
+        for call in calls:
+            name = call.name
+            counts[name] = counts.get(name, 0) + 1
+            if name not in groups:
+                groups[name] = []
+                order.append(name)
+            pieces: list[str] = []
+            target = self._mask_target(name, call.args)
+            if target:
+                pieces.append(target)
+            if call.tool_message is not None:
+                key = self._key_line(call.tool_message, name)
+                if key:
+                    pieces.append(key)
+            if pieces:
+                groups[name].append(" · ".join(pieces))
+
+        parts: list[str] = []
+        for name in order:
+            details = groups[name][:3]
+            suffix = "；".join(details)
+            if len(groups[name]) > 3:
+                suffix += "；…"
+            part = f"{name}×{counts[name]}"
+            if suffix:
+                part += f"（{suffix}）"
+            parts.append(part)
+        text = (
+            f"{self.MASK_MARKER_PREFIX} "
+            + " · ".join(parts)
+            + " · 需要时重新读取/执行"
+        )
+        return text if len(text) <= 600 else text[:597] + "…"
 
     @staticmethod
     def _mask_target(name: str, args: dict) -> str:

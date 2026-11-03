@@ -340,7 +340,7 @@ def _batch(ai_id, items):
 
 
 def test_over_high_watermark_masks_old_results():
-    """超过高水位：旧的已消费成功结果变指针，最近 K 条与最新批保留。"""
+    """超过高水位：旧块按批压成一条时间线；最近 K 个 block 与最新块保留。"""
     messages = [HumanMessage(content="部署", id="h1")]
     messages += _batch(
         "a1",
@@ -357,18 +357,21 @@ def test_over_high_watermark_masks_old_results():
         messages,
         high_watermark_chars=50000,
         low_watermark_chars=30000,
-        keep_recent=1,
+        keep_blocks=1,
         mask_min_chars=100,
     )
     merged = _merged(messages, out)
 
+    # 批级时间线放在第一条被压消息上，包含同批其它调用的目标
     assert "已压缩" in _by_id(merged, "tc1").content
     assert "cmd=uv sync" in _by_id(merged, "tc1").content
     assert "exit_code: 0" in _by_id(merged, "tc1").content
-    assert "已压缩" in _by_id(merged, "tc2").content
-    assert "path=a.py" in _by_id(merged, "tc2").content
-    assert _by_id(merged, "tc3").content == "C" * 20000   # 最近 K 条
-    assert _by_id(merged, "tc4").content == "D" * 1000    # 最新批未消费
+    assert "path=a.py" in _by_id(merged, "tc1").content
+    assert "query=q" in _by_id(merged, "tc1").content
+    # 同批其余消息只留短戳
+    assert "同批已压缩" in _by_id(merged, "tc2").content
+    assert "同批已压缩" in _by_id(merged, "tc3").content
+    assert _by_id(merged, "tc4").content == "D" * 1000    # 最近 K=1 个 block
 
 
 def test_failed_results_are_not_masked():
@@ -388,9 +391,9 @@ def test_failed_results_are_not_masked():
 
     out = _run(
         messages,
-        high_watermark_chars=30000,
-        low_watermark_chars=10000,
-        keep_recent=0,
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=0,
         mask_min_chars=100,
     )
     merged = _merged(messages, out)
@@ -406,9 +409,9 @@ def test_latest_batch_is_not_masked():
 
     out = _run(
         messages,
-        high_watermark_chars=50000,
-        low_watermark_chars=30000,
-        keep_recent=0,
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=0,
         mask_min_chars=100,
     )
     merged = _merged(messages, out)
@@ -447,7 +450,7 @@ def test_state_receipts_are_slimmed():
         messages,
         high_watermark_chars=1000,
         low_watermark_chars=1,
-        keep_recent=8,
+        keep_blocks=8,
         mask_min_chars=100,
     )
     merged = _merged(messages, out)
@@ -474,7 +477,7 @@ def test_mask_is_idempotent():
     kwargs = dict(
         high_watermark_chars=30000,
         low_watermark_chars=10000,
-        keep_recent=0,
+        keep_blocks=0,
         mask_min_chars=100,
     )
     merged = _merged(messages, _run(messages, **kwargs))
@@ -489,7 +492,7 @@ def test_mask_preserves_metadata():
         messages,
         high_watermark_chars=30000,
         low_watermark_chars=10000,
-        keep_recent=0,
+        keep_blocks=0,
         mask_min_chars=100,
     )
     masked = _by_id(_merged(messages, out), "tc1")
@@ -521,15 +524,179 @@ def test_web_and_ask_are_not_masked():
         messages,
         high_watermark_chars=30000,
         low_watermark_chars=10000,
-        keep_recent=0,
+        keep_blocks=0,
         mask_min_chars=100,
     ) == {}
+
+
+#------------------ 批级分组：plan step、语义切点、部分压缩、保留窗口 ------------------
+
+
+def test_plan_step_change_starts_new_batch():
+    """plan step 变化是硬语义边界：前后不在同一个批。"""
+    messages = [HumanMessage(content="部署", id="h1")]
+    messages += _batch(
+        "a1",
+        [
+            ("c1", "update_plan_step", {"step_id": "1", "status": "in_progress"},
+             "step1 " + "A" * 5000),
+            ("c2", "read_file", {"path": "a.py"}, "B" * 5000),
+        ],
+    )
+    messages += _batch("a2", [("c3", "read_file", {"path": "b.py"}, "C" * 5000)])
+    messages += _batch(
+        "a3",
+        [
+            ("c4", "update_plan_step", {"step_id": "2", "status": "in_progress"},
+             "step2 " + "D" * 5000),
+            ("c5", "read_file", {"path": "c.py"}, "E" * 5000),
+        ],
+    )
+    messages += _batch("a4", [("c6", "read_file", {"path": "d.py"}, "F" * 100)])
+    messages.append(AIMessage(content="完成", id="ans"))
+
+    out = _run(
+        messages,
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=0,
+        mask_min_chars=100,
+        max_batch_chars=8000,
+    )
+    merged = _merged(messages, out)
+    # c2 在 step1、c5 在 step2，各自是自己批的首条 → 都能拿到完整时间线
+    assert "path=a.py" in _by_id(merged, "tc2").content
+    assert "path=c.py" in _by_id(merged, "tc5").content
+    # 没有跨 step 合并
+    assert "path=c.py" not in _by_id(merged, "tc2").content
+    assert "path=a.py" not in _by_id(merged, "tc5").content
+
+
+def test_mixed_block_masks_only_successful_sibling():
+    """混合块只压 eligible 的成功结果；写回执保持原文。"""
+    messages = [HumanMessage(content="部署", id="h1")]
+    messages += _batch(
+        "a1",
+        [
+            ("c1", "write_file", {"path": "x.py"}, "W" * 50),
+            ("c2", "search_content", {"path": ".", "query": "q"}, "S" * 20000),
+        ],
+    )
+    messages += _batch("a2", [("c3", "read_file", {"path": "y.py"}, "R" * 100)])
+    messages.append(AIMessage(content="完成", id="ans"))
+
+    out = _run(
+        messages,
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=0,
+        mask_min_chars=100,
+        max_batch_chars=8000,
+    )
+    merged = _merged(messages, out)
+    assert _by_id(merged, "tc1").content == "W" * 50
+    assert "已压缩" in _by_id(merged, "tc2").content
+
+
+def test_keep_blocks_protects_last_blocks():
+    """保留窗口按 block 计：最后 K 个 block 原样保留。"""
+    messages = [HumanMessage(content="部署", id="h1")]
+    messages += _batch("a1", [("c1", "read_file", {"path": "a.py"}, "A" * 20000)])
+    messages += _batch("a2", [("c2", "read_file", {"path": "b.py"}, "B" * 20000)])
+    messages += _batch("a3", [("c3", "read_file", {"path": "c.py"}, "C" * 20000)])
+    messages.append(AIMessage(content="完成", id="ans"))
+
+    out = _run(
+        messages,
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=1,
+        mask_min_chars=100,
+        max_batch_chars=8000,
+    )
+    merged = _merged(messages, out)
+    assert "已压缩" in _by_id(merged, "tc1").content
+    assert "已压缩" in _by_id(merged, "tc2").content
+    assert _by_id(merged, "tc3").content == "C" * 20000
+
+
+def test_batch_pointer_lists_same_batch_targets():
+    """同一批的多条结果：首条时间线列出全部目标，其余只留短戳。"""
+    messages = [HumanMessage(content="部署", id="h1")]
+    messages += _batch(
+        "a1",
+        [
+            ("c1", "read_file", {"path": "a.py"}, "A" * 20000),
+            ("c2", "read_file", {"path": "b.py"}, "B" * 20000),
+        ],
+    )
+    messages.append(AIMessage(content="完成", id="ans"))
+
+    out = _run(
+        messages,
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=0,
+        mask_min_chars=100,
+        max_batch_chars=8000,
+    )
+    merged = _merged(messages, out)
+    pointer = _by_id(merged, "tc1").content
+    assert "path=a.py" in pointer
+    assert "path=b.py" in pointer
+    assert "同批已压缩" in _by_id(merged, "tc2").content
+
+
+def test_protected_content_does_not_trigger_batch_mask():
+    """触发看可压正文：web 结果再大也不触发批级 mask。"""
+    messages = [HumanMessage(content="调研", id="h1")]
+    messages += _batch("a1", [("c1", "web_search", {"query": "q"}, "W" * 40000)])
+    messages += _batch("a2", [("c2", "read_file", {"path": "a.py"}, "R" * 100)])
+    messages.append(AIMessage(content="完成", id="ans"))
+
+    assert _run(
+        messages,
+        high_watermark_chars=30000,
+        low_watermark_chars=10000,
+        keep_blocks=0,
+        mask_min_chars=100,
+    ) == {}
+
+
+def test_budget_cut_prefers_semantic_milestone():
+    """预算超限时，切点优先落在里程碑（start_process）而不是硬切。"""
+    messages = [HumanMessage(content="部署", id="h1")]
+    messages += _batch("a1", [("c1", "read_file", {"path": "a.py"}, "A" * 4000)])
+    messages += _batch(
+        "a2",
+        [("c2", "start_process", {"command": "server"}, "started p1\n" + "B" * 4000)],
+    )
+    messages += _batch("a3", [("c3", "read_file", {"path": "c.py"}, "C" * 4000)])
+    messages.append(AIMessage(content="完成", id="ans"))
+
+    out = _run(
+        messages,
+        high_watermark_chars=5000,
+        low_watermark_chars=1000,
+        keep_blocks=0,
+        mask_min_chars=100,
+        max_batch_chars=10000,
+    )
+    merged = _merged(messages, out)
+    pointer = _by_id(merged, "tc1").content
+    assert "start_process" in pointer       # 里程碑把 a2 留在第一批
+    assert "path=c.py" not in pointer
+    assert "path=c.py" in _by_id(merged, "tc3").content
 
 
 def test_watermark_validation():
     with pytest.raises(ValueError):
         CompressNode(high_watermark_chars=100, low_watermark_chars=200)
     with pytest.raises(ValueError):
-        CompressNode(keep_recent=-1)
+        CompressNode(keep_blocks=-1)
     with pytest.raises(ValueError):
         CompressNode(mask_min_chars=0)
+    with pytest.raises(ValueError):
+        CompressNode(min_batch_chars=0)
+    with pytest.raises(ValueError):
+        CompressNode(max_batch_chars=100, min_batch_chars=200)
