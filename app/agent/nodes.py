@@ -1484,22 +1484,45 @@ class CompactNode:
 #   CompactNode  : messages[:last_human_index]        旧轮，轮末无条件执行
 #   CompressNode : messages[last_human_index + 1:]    当前轮，工具循环中执行
 # 轮内**不删消息**：图路由中间删掉结果会破坏 tool_call / ToolMessage 配对与调用方状态，
-# 因此只改 ToolMessage.content。当前规则只有一条：
-#   同一轮内对同一文件的重复 read_file：**最后一次成功读取为准**，其余换成指向它的指针
-#   （不看正文是否相同——文件随时可能被编辑，旧结果已经过期）。
-# 工具按结果时效性分两类：terminal / file_io 读取属"随时会变"的一类，压缩从严；web /
-# github / memory 等相对稳定，仍走轮末折叠。
+# 因此只改 ToolMessage.content。当前规则：
+#   1) 同一轮内对同一文件的重复 read_file：**最后一次成功读取为准**，其余换成指向它的指针
+#      （不看正文是否相同——文件随时可能被编辑，旧结果已经过期）；
+#   2) 当前轮内容超过**高水位**时，把已消费的旧成功结果压成一行指针，降到**低水位**；
+#      保留最近 K 条成功结果、所有失败/被拒、ask_user 回答、最新一批（模型还没看过）；
+#   3) 编排/state 回执（plan / memory / skill）只留最近一条，其余压成一行指针
+#      （current_plan 与 RUNTIME_STATE 已是权威）。
+# 这是**滞回**压缩：一次压一批、之后若干调用保持前缀命中；低于高水位时不做任何事。
 # **终端输出的中间截断已下沉到 terminal MCP 自己**（mcp_service/terminal.py::
 # _compress_output）：写在消息落地之前，消息从第一次进入 state 就是最终形态，节点不再
-# 事后改写它（对 prefix cache 更友好）。
-# 旧轮的整块折叠仍归 CompactNode。
+# 事后改写它。旧轮的整块折叠仍归 CompactNode。
 
 # read_file 去重的最小正文长度：被替换的旧正文太短时，指针和正文差不多，不值得换。
 _READ_DEDUP_MIN_CHARS = 1000
+# 轮内移动窗口的默认水位（当前轮消息 content 字符数，主要是 ToolMessage）。高水位触发、
+# 低水位停止；滞回避免每拍都改前缀、打碎 prompt cache。阈值不含稳定前缀与 AI 参数。
+_TURN_HIGH_WATERMARK_CHARS = 50000
+_TURN_LOW_WATERMARK_CHARS = 25000
+# 默认保留最近 K 条成功工具结果；再旧的才压。预算仍超时会从这些里再压，但至少留 keep_min 条。
+_TURN_KEEP_RECENT = 8
+# 被压正文的最小长度：太短的正文压成指针不省，反而多一行噪声。
+_MASK_MIN_CHARS = 300
+# 状态回执：每个工具只保留最近一条；旧回执的内容已由 current_plan / RUNTIME_STATE 承载。
+_STATE_RECEIPT_TOOLS = frozenset({
+    "create_plan", "update_plan_step", "clear_plan",
+    "read_memory", "write_memory", "get_skill", "drop_skill",
+})
+# 不进移动窗口的工具：
+# - web 四件套：正文由 CompactNode 在轮末归档进 notes，轮内压掉等于丢研究原料；
+# - ask_user：用户决定，必须保留；
+# - dispatch_subtasks：worker 结论本身就是"结论"，不是可重取的 dump。
+_NO_MASK_TOOLS = frozenset({
+    "web_search", "extract_urls", "crawl_website", "deep_research",
+    "ask_user", "dispatch_subtasks",
+}) | _STATE_RECEIPT_TOOLS
 
 
 class CompressNode:
-    """轮内字段压缩节点（`tool_node` / `orchestrate_node` → `llm_node` 的边上执行）。
+    """轮内压缩节点（`tool_node` / `orchestrate_node` → `llm_node` 的边上执行）。
 
     职责边界（与 `CompactNode` 分工）：
 
@@ -1510,11 +1533,18 @@ class CompressNode:
       判据是 tool_call 的 `path`，**不再要求正文相同**：文件在两次读取之间被编辑或外部
       修改时，旧正文已经过期，留着反而误导。带行区间的读取只有在"最后一次覆盖旧读取的
       范围"时才替换（全文请求只与全文请求互替），避免把没读到的行当成已省略；
-    - **终端输出不在这里处理**（2026-10-20 起）：`mcp_service/terminal.py` 在返回前用
-      `_compress_output()` 做中间截断，消息从写入 state 的第一刻就是截断版；
+    - **移动窗口**：当前轮消息 content 超过 `high_watermark_chars` 时，把**已消费的旧成功
+      ToolMessage** 压成一行指针，压到 `low_watermark_chars` 以下。保留最近
+      `keep_recent` 条成功结果、所有失败/被拒、`ask_user` 回答、以及最新一批（模型还没
+      看过）的工具结果。只改 content，不删消息；
+    - **状态回执变薄**：`create_plan` / `update_plan_step` / `clear_plan` / `read_memory` /
+      `write_memory` / `get_skill` / `drop_skill` 每个工具只保留最近一条回执，其余压成一行
+      （`current_plan` 与 RUNTIME_STATE 已是权威）；
+    - **终端输出不在这里做截断**（2026-10-20 起）：`mcp_service/terminal.py` 在返回前用
+      `_compress_output()` 做中间截断；本节点只在结果变旧后做指针化；
     - **只改 `ToolMessage.content`**：消息本身（id / tool_call_id / name /
       additional_kwargs / artifact）原样保留，因此不会拆断 tool_call 配对，也不增删消息；
-    - **幂等**：已带去重标记的消息不再处理；
+    - **幂等**：已带 `…[重复读取]` / `…[已压缩]` 标记的消息不再处理；
     - **不调 LLM**，纯确定性；没有需要压缩的消息时返回 `{}`。
 
     状态（2026-10-20）：已接进主图（`tool_node` / `orchestrate_node` → `compress_node`
@@ -1524,12 +1554,35 @@ class CompressNode:
     # read_file 去重：只处理这一种工具；指针里用最后一次的 tool_call_id 定位正文。
     READ_DEDUP_TOOL = "read_file"
     DEDUP_MARKER_PREFIX = "…[重复读取]"
+    # 移动窗口的指针标记；幂等判定同时认这两个前缀。
+    MASK_MARKER_PREFIX = "…[已压缩]"
 
-    def __init__(self, read_dedup_min_chars: int = _READ_DEDUP_MIN_CHARS) -> None:
-        """`read_dedup_min_chars`：被替换的旧 read_file 正文不短于它才指针化。"""
+    def __init__(
+        self,
+        read_dedup_min_chars: int = _READ_DEDUP_MIN_CHARS,
+        high_watermark_chars: int = _TURN_HIGH_WATERMARK_CHARS,
+        low_watermark_chars: int = _TURN_LOW_WATERMARK_CHARS,
+        keep_recent: int = _TURN_KEEP_RECENT,
+        mask_min_chars: int = _MASK_MIN_CHARS,
+    ) -> None:
+        """`read_dedup_min_chars`：被替换的旧 read_file 正文不短于它才指针化。
+
+        `high/low_watermark_chars`：当前轮消息 content 的高/低水位（字符数）；
+        `keep_recent`：默认保留的最近成功结果条数；`mask_min_chars`：被压正文的最小长度。
+        """
         if read_dedup_min_chars < 1:
             raise ValueError("read_dedup_min_chars 至少为 1")
+        if not 0 < low_watermark_chars < high_watermark_chars:
+            raise ValueError("low_watermark_chars 必须大于 0 且小于 high_watermark_chars")
+        if keep_recent < 0:
+            raise ValueError("keep_recent 不能为负")
+        if mask_min_chars < 1:
+            raise ValueError("mask_min_chars 至少为 1")
         self.read_dedup_min_chars = read_dedup_min_chars
+        self.high_watermark_chars = high_watermark_chars
+        self.low_watermark_chars = low_watermark_chars
+        self.keep_recent = keep_recent
+        self.mask_min_chars = mask_min_chars
 
     async def __call__(self, state: AgentState) -> dict | AgentState:
         messages = list(state.get("messages") or [])
@@ -1541,14 +1594,38 @@ class CompressNode:
             return {}
 
         region_start = anchor + 1
-        replacements = self._dedupe_reads(
-            messages, region_start, self._read_args_by_call(messages, region_start)
-        )
-        if not replacements:
-            return {}
-        return {"messages": replacements}
+        args_by_call = self._read_args_by_call(messages, region_start)
 
-    # ---------- 区域 ----------
+        # id → 替换后的 ToolMessage；后面的规则按 id 覆盖，最终按原消息顺序写回。
+        by_id: dict[str, ToolMessage] = {}
+        for message in self._dedupe_reads(messages, region_start, args_by_call):
+            by_id[message.id] = message
+
+        turn_chars = self._turn_chars(messages, region_start)
+        if turn_chars > self.high_watermark_chars:
+            projected = turn_chars - self._saved(messages, by_id)
+            if projected > self.low_watermark_chars:
+                for message in self._slim_state_receipts(
+                    messages, region_start, args_by_call, by_id, projected
+                ):
+                    by_id[message.id] = message
+                projected = turn_chars - self._saved(messages, by_id)
+            if projected > self.low_watermark_chars:
+                for message in self._mask_old_results(
+                    messages, region_start, args_by_call, by_id, projected
+                ):
+                    by_id[message.id] = message
+
+        if not by_id:
+            return {}
+        ordered = [
+            by_id[message.id]
+            for message in messages[region_start:]
+            if getattr(message, "id", None) in by_id
+        ]
+        return {"messages": ordered}
+
+    # ---------- 区域 / 预算 ----------
 
     @staticmethod
     def _last_human_index(messages: list) -> int:
@@ -1557,6 +1634,44 @@ class CompressNode:
             if isinstance(messages[index], HumanMessage):
                 return index
         return -1
+
+    @staticmethod
+    def _turn_chars(messages: list, region_start: int) -> int:
+        """当前轮消息 content 的字符总数（压缩预算的计量口径）。"""
+        return sum(
+            len(str(getattr(message, "content", "") or ""))
+            for message in messages[region_start:]
+        )
+
+    @staticmethod
+    def _saved(messages: list, by_id: dict[str, ToolMessage]) -> int:
+        """已生成的替换相对原文节省的字符数（负节省按 0 计）。"""
+        original = {m.id: m for m in messages if getattr(m, "id", None)}
+        total = 0
+        for mid, new in by_id.items():
+            old = original.get(mid)
+            if old is None:
+                continue
+            before = len(str(getattr(old, "content", "") or ""))
+            after = len(str(getattr(new, "content", "") or ""))
+            total += max(0, before - after)
+        return total
+
+    @staticmethod
+    def _has_later_ai(region: list, index: int) -> bool:
+        """这条消息之后、下一条 Human 之前是否已出现 AIMessage（是否已被模型消费）。"""
+        for message in region[index + 1:]:
+            if isinstance(message, AIMessage):
+                return True
+            if isinstance(message, HumanMessage):
+                return False
+        return False
+
+    def _is_marked(self, content: str) -> bool:
+        return (
+            self.DEDUP_MARKER_PREFIX in content
+            or self.MASK_MARKER_PREFIX in content
+        )
 
     # ---------- read_file 重复读取：最后一次留正文，其余变指针 ----------
 
@@ -1709,3 +1824,199 @@ class CompressNode:
             f"{self.DEDUP_MARKER_PREFIX} 同一文件以 tool_call_id={latest_call_id} 的"
             f"最后一次成功读取为准（{path}，{length} 字符）；此处旧结果不再展开。"
         )
+
+    # ---------- 状态回执：每个工具只留最近一条 ----------
+
+    def _slim_state_receipts(
+        self,
+        messages: list,
+        region_start: int,
+        args_by_call: dict[str, dict],
+        by_id: dict[str, ToolMessage],
+        projected: int,
+    ) -> list[ToolMessage]:
+        """把旧的状态回执压成一行；每个工具保留最近一条。"""
+        region = messages[region_start:]
+        entries: list[tuple[int, ToolMessage, str]] = []
+        latest_by_tool: dict[str, int] = {}
+        for index, message in enumerate(region):
+            if not isinstance(message, ToolMessage):
+                continue
+            name = (getattr(message, "name", "") or "").strip()
+            if name not in _STATE_RECEIPT_TOOLS:
+                continue
+            if not getattr(message, "id", None):
+                continue
+            latest_by_tool[name] = index
+            entries.append((index, message, name))
+
+        replacements: list[ToolMessage] = []
+        for index, message, name in entries:
+            if latest_by_tool.get(name) == index:
+                continue
+            if message.id in by_id:
+                continue
+            content = message.content
+            if not isinstance(content, str) or self._is_marked(content):
+                continue
+            status, _ = CompactNode._tm_status(message)
+            if status != "ok":
+                continue
+            if not self._has_later_ai(region, index):
+                continue
+            pointer = self._state_pointer(name, args_by_call.get(message.tool_call_id) or {})
+            saving = len(content) - len(pointer)
+            if saving <= 20:
+                continue
+            replacements.append(message.model_copy(update={"content": pointer}))
+            projected -= saving
+            if projected <= self.low_watermark_chars:
+                break
+        return replacements
+
+    @staticmethod
+    def _state_pointer(name: str, args: dict) -> str:
+        """状态回执的一行指针：保留"哪个工具、哪个目标、什么状态"。"""
+        prefix = CompressNode.MASK_MARKER_PREFIX
+        if name == "update_plan_step":
+            return f"{prefix} update_plan_step · 步骤 {args.get('step_id', '?')} → {args.get('status', '?')}"
+        if name == "create_plan":
+            steps = args.get("steps") or []
+            return f"{prefix} create_plan · {len(steps)} 步"
+        if name == "read_memory":
+            return f"{prefix} read_memory · 记忆已在 RUNTIME_STATE 注入"
+        if name == "write_memory":
+            key = args.get("key") or args.get("type") or "已写入"
+            return f"{prefix} write_memory · {key}（正文在 memory.md）"
+        if name in {"get_skill", "drop_skill"}:
+            return f"{prefix} {name} · {args.get('name', '?')}"
+        return f"{prefix} {name}"
+
+    # ---------- 当前轮移动窗口：旧结果压成一行指针 ----------
+
+    def _mask_old_results(
+        self,
+        messages: list,
+        region_start: int,
+        args_by_call: dict[str, dict],
+        by_id: dict[str, ToolMessage],
+        projected: int,
+    ) -> list[ToolMessage]:
+        """把已消费的旧成功 ToolMessage 压成一行指针，直到降到低水位。
+
+        保留最近 `keep_recent` 条；若仍超低水位，再从这些里压到至少 2 条。
+        失败/被拒、最新一批（未消费）、状态回执与 web/ask/dispatch 都不参与。
+        """
+        region = messages[region_start:]
+        candidates: list[tuple[ToolMessage, str, int]] = []
+        for index, message in enumerate(region):
+            if not isinstance(message, ToolMessage):
+                continue
+            if not getattr(message, "id", None):
+                continue
+            name = (getattr(message, "name", "") or "").strip()
+            if not name or name in _NO_MASK_TOOLS:
+                continue
+            if message.id in by_id:
+                continue
+            content = message.content
+            if not isinstance(content, str):
+                continue
+            if len(content) < self.mask_min_chars or self._is_marked(content):
+                continue
+            status, _ = CompactNode._tm_status(message)
+            if status != "ok":
+                continue
+            if not self._has_later_ai(region, index):
+                continue
+            pointer = self._mask_pointer(message, args_by_call.get(message.tool_call_id) or {})
+            saving = len(content) - len(pointer)
+            if saving <= 0:
+                continue
+            candidates.append((message, pointer, saving))
+
+        protect_from = max(0, len(candidates) - self.keep_recent)
+        replacements: list[ToolMessage] = []
+
+        def take(entry: tuple[ToolMessage, str, int]) -> None:
+            nonlocal projected
+            message, pointer, saving = entry
+            replacements.append(message.model_copy(update={"content": pointer}))
+            projected -= saving
+
+        for entry in candidates[:protect_from]:
+            if projected <= self.low_watermark_chars:
+                break
+            take(entry)
+
+        if projected > self.low_watermark_chars and self.keep_recent > 0:
+            kept = candidates[protect_from:]
+            keep_min = min(2, self.keep_recent)
+            for index, entry in enumerate(kept):
+                if projected <= self.low_watermark_chars:
+                    break
+                if len(kept) - index <= keep_min:
+                    break
+                take(entry)
+
+        return replacements
+
+    def _mask_pointer(self, message: ToolMessage, args: dict) -> str:
+        """旧工具结果的一行指针：工具 + 目标 + 关键行；不复制正文。"""
+        name = (getattr(message, "name", "") or "?").strip()
+        bits = [f"{self.MASK_MARKER_PREFIX} {name}"]
+        target = self._mask_target(name, args)
+        if target:
+            bits.append(target)
+        key = self._key_line(message, name)
+        if key:
+            bits.append(key)
+        bits.append("需要时重新读取/执行")
+        return " · ".join(bits)
+
+    @staticmethod
+    def _mask_target(name: str, args: dict) -> str:
+        """指针里的目标（路径 / 命令 / 查询 / 进程 id），尽量让人和模型都能定位。"""
+        if name == "read_file":
+            path = args.get("path")
+            if isinstance(path, str) and path.strip():
+                rng = CompressNode._read_range(args)
+                if rng is None:
+                    return f"path={path.strip()} · 全文"
+                start, end = rng
+                if end is None:
+                    return f"path={path.strip()} · 第 {start} 行起"
+                return f"path={path.strip()} · 第 {start}-{end} 行"
+        if name == "search_content":
+            path = args.get("path", ".")
+            query = args.get("query", "")
+            return f"path={path} · query={query}"
+        if name == "run_command":
+            return f"cmd={_one_line(str(args.get('command', '')), 80)}"
+        if name in {"process_wait", "process_read", "process_kill"}:
+            return f"process_id={args.get('process_id', '?')}"
+        if name in {"list_dir", "get_directory_tree"}:
+            return f"path={args.get('path', '.')}"
+        if name == "glob":
+            return f"pattern={args.get('pattern', '?')} · path={args.get('path', '.')}"
+        if name in {"write_file", "edit_file", "create_file", "create_dir", "delete_file", "delete_dir"}:
+            return f"path={args.get('path', args.get('dir_path', '?'))}"
+        if name == "copy_path":
+            return f"{args.get('source', '?')} → {args.get('destination', '?')}"
+        if name == "read_note":
+            return f"note={args.get('note_id', '?')}"
+        return ""
+
+    @staticmethod
+    def _key_line(message: ToolMessage, name: str) -> str:
+        """只给需要"结果摘要"的工具取首行；文件/目录类已有 target，不重复。"""
+        if name not in {
+            "run_command", "search_content", "start_process",
+            "process_wait", "process_read", "process_list",
+        }:
+            return ""
+        text = str(message.content or "").strip()
+        first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        if not first:
+            return ""
+        return first if len(first) <= 80 else first[:80] + "…"

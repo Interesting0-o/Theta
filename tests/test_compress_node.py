@@ -1,7 +1,8 @@
-"""CompressNode（轮内字段压缩）单测：当前只覆盖 read_file 重复读取指针化。
+"""CompressNode（轮内字段压缩）单测：read_file 去重 + 当前轮移动窗口 + 状态回执变薄。
 
 终端输出压缩 2026-10-20 移入 terminal MCP（mcp_service/terminal.py::_compress_output）；
-本节点不再处理终端 ToolMessage。区域边界、去重、区间覆盖、幂等等用例见下。
+本节点不再做终端截断，只在结果变旧后做指针化。区域边界、去重、区间覆盖、移动窗口、
+状态回执、幂等等用例见下。
 
 需要导出 WORKSPACE_PATH（app.agent 包 __init__ 会 import graph→mcp 链）。
 """
@@ -20,9 +21,9 @@ def _tc(name, cid, **args):
     return {"name": name, "args": args, "id": cid, "type": "tool_call"}
 
 
-def _run(messages, read_min=READ_MIN):
+def _run(messages, read_min=READ_MIN, **kwargs):
     return asyncio.run(
-        CompressNode(read_dedup_min_chars=read_min)({"messages": messages})
+        CompressNode(read_dedup_min_chars=read_min, **kwargs)({"messages": messages})
     )
 
 
@@ -322,3 +323,213 @@ def test_read_file_without_call_args_is_skipped():
 def test_read_dedup_min_chars_must_be_positive():
     with pytest.raises(ValueError):
         CompressNode(read_dedup_min_chars=0)
+
+
+#------------------ 当前轮移动窗口：高/低水位、保留区、状态回执 ------------------
+
+
+def _batch(ai_id, items):
+    """items: (call_id, name, args, content) → AIMessage + 对应 ToolMessages。"""
+    calls = [_tc(name, cid, **args) for cid, name, args, _ in items]
+    messages = [AIMessage(content="", tool_calls=calls, id=ai_id)]
+    for cid, name, _args, content in items:
+        messages.append(
+            ToolMessage(content=content, tool_call_id=cid, name=name, id=f"t{cid}")
+        )
+    return messages
+
+
+def test_over_high_watermark_masks_old_results():
+    """超过高水位：旧的已消费成功结果变指针，最近 K 条与最新批保留。"""
+    messages = [HumanMessage(content="部署", id="h1")]
+    messages += _batch(
+        "a1",
+        [
+            ("c1", "run_command", {"command": "uv sync", "description": "装依赖"},
+             "exit_code: 0\n" + "A" * 20000),
+            ("c2", "read_file", {"path": "a.py"}, "B" * 20000),
+            ("c3", "search_content", {"path": ".", "query": "q"}, "C" * 20000),
+        ],
+    )
+    messages += _batch("a2", [("c4", "read_file", {"path": "b.py"}, "D" * 1000)])
+
+    out = _run(
+        messages,
+        high_watermark_chars=50000,
+        low_watermark_chars=30000,
+        keep_recent=1,
+        mask_min_chars=100,
+    )
+    merged = _merged(messages, out)
+
+    assert "已压缩" in _by_id(merged, "tc1").content
+    assert "cmd=uv sync" in _by_id(merged, "tc1").content
+    assert "exit_code: 0" in _by_id(merged, "tc1").content
+    assert "已压缩" in _by_id(merged, "tc2").content
+    assert "path=a.py" in _by_id(merged, "tc2").content
+    assert _by_id(merged, "tc3").content == "C" * 20000   # 最近 K 条
+    assert _by_id(merged, "tc4").content == "D" * 1000    # 最新批未消费
+
+
+def test_failed_results_are_not_masked():
+    """失败/被拒结果保留原样，不参与移动窗口。"""
+    messages = [HumanMessage(content="部署", id="h1")]
+    messages += _batch(
+        "a1",
+        [
+            ("c1", "run_command", {"command": "bad"}, "exit_code: 1\n" + "E" * 20000),
+            ("c2", "read_file", {"path": "a.py"}, "B" * 20000),
+        ],
+    )
+    messages += _batch("a2", [("c3", "read_file", {"path": "b.py"}, "D" * 1000)])
+    for message in messages:
+        if isinstance(message, ToolMessage) and message.tool_call_id == "c1":
+            message.additional_kwargs = {"error_type": "tool_error"}
+
+    out = _run(
+        messages,
+        high_watermark_chars=30000,
+        low_watermark_chars=10000,
+        keep_recent=0,
+        mask_min_chars=100,
+    )
+    merged = _merged(messages, out)
+    assert _by_id(merged, "tc1").content.startswith("exit_code: 1")
+    assert "已压缩" in _by_id(merged, "tc2").content
+
+
+def test_latest_batch_is_not_masked():
+    """最新一批工具结果还没被模型看过，不能压。"""
+    messages = [HumanMessage(content="部署", id="h1")]
+    messages += _batch("a1", [("c1", "read_file", {"path": "a.py"}, "A" * 20000)])
+    messages += _batch("a2", [("c2", "read_file", {"path": "b.py"}, "B" * 40000)])
+
+    out = _run(
+        messages,
+        high_watermark_chars=50000,
+        low_watermark_chars=30000,
+        keep_recent=0,
+        mask_min_chars=100,
+    )
+    merged = _merged(messages, out)
+    assert "已压缩" in _by_id(merged, "tc1").content
+    assert _by_id(merged, "tc2").content == "B" * 40000
+
+
+def test_state_receipts_are_slimmed():
+    """plan/memory 回执每个工具只留最近一条；ask_user 保留。"""
+    messages = [HumanMessage(content="计划", id="h1")]
+    messages += _batch(
+        "a1",
+        [
+            ("c1", "update_plan_step", {"step_id": "1", "status": "in_progress"},
+             "步骤 1 in_progress\n" + "A" * 500),
+            ("c2", "read_memory", {}, "记忆全文\n" + "B" * 500),
+            ("c3", "write_memory", {"type": "decision", "content": "x"},
+             "已写入 [m1]\n" + "C" * 500),
+        ],
+    )
+    messages += _batch(
+        "a2",
+        [
+            ("c4", "update_plan_step", {"step_id": "2", "status": "in_progress"},
+             "步骤 2 in_progress\n" + "D" * 500),
+            ("c5", "read_memory", {}, "最新记忆\n" + "E" * 500),
+            ("c6", "write_memory", {"type": "decision", "content": "y"},
+             "已写入 [m2]\n" + "F" * 500),
+            ("c7", "ask_user", {"why": "w", "question": "q"},
+             "[user_answer] 用户选择了：1"),
+        ],
+    )
+    messages += _batch("a3", [("c8", "read_file", {"path": "a.py"}, "R" * 100)])
+
+    out = _run(
+        messages,
+        high_watermark_chars=1000,
+        low_watermark_chars=1,
+        keep_recent=8,
+        mask_min_chars=100,
+    )
+    merged = _merged(messages, out)
+
+    assert "已压缩" in _by_id(merged, "tc1").content
+    assert "步骤 1" in _by_id(merged, "tc1").content
+    assert "已压缩" in _by_id(merged, "tc2").content
+    assert "RUNTIME_STATE" in _by_id(merged, "tc2").content
+    assert "已压缩" in _by_id(merged, "tc3").content
+    assert "memory.md" in _by_id(merged, "tc3").content
+    # 每个工具的最新一条保留
+    assert "已压缩" not in _by_id(merged, "tc4").content
+    assert "已压缩" not in _by_id(merged, "tc5").content
+    assert "已压缩" not in _by_id(merged, "tc6").content
+    # ask_user 与最新批保留
+    assert _by_id(merged, "tc7").content.startswith("[user_answer]")
+    assert _by_id(merged, "tc8").content == "R" * 100
+
+
+def test_mask_is_idempotent():
+    messages = [HumanMessage(content="部署", id="h1")]
+    messages += _batch("a1", [("c1", "read_file", {"path": "a.py"}, "A" * 40000)])
+    messages += _batch("a2", [("c2", "read_file", {"path": "b.py"}, "B" * 1000)])
+    kwargs = dict(
+        high_watermark_chars=30000,
+        low_watermark_chars=10000,
+        keep_recent=0,
+        mask_min_chars=100,
+    )
+    merged = _merged(messages, _run(messages, **kwargs))
+    assert _run(merged, **kwargs) == {}
+
+
+def test_mask_preserves_metadata():
+    messages = [HumanMessage(content="部署", id="h1")]
+    messages += _batch("a1", [("c1", "read_file", {"path": "a.py"}, "A" * 40000)])
+    messages += _batch("a2", [("c2", "read_file", {"path": "b.py"}, "B" * 100)])
+    out = _run(
+        messages,
+        high_watermark_chars=30000,
+        low_watermark_chars=10000,
+        keep_recent=0,
+        mask_min_chars=100,
+    )
+    masked = _by_id(_merged(messages, out), "tc1")
+    assert masked.id == "tc1"
+    assert masked.tool_call_id == "c1"
+    assert masked.name == "read_file"
+
+
+def test_below_high_watermark_is_noop():
+    messages = [HumanMessage(content="部署", id="h1")]
+    messages += _batch("a1", [("c1", "read_file", {"path": "a.py"}, "A" * 20000)])
+    messages += _batch("a2", [("c2", "read_file", {"path": "b.py"}, "B" * 100)])
+    assert _run(
+        messages, high_watermark_chars=50000, low_watermark_chars=25000
+    ) == {}
+
+
+def test_web_and_ask_are_not_masked():
+    messages = [HumanMessage(content="部署", id="h1")]
+    messages += _batch(
+        "a1",
+        [
+            ("c1", "web_search", {"query": "q"}, "W" * 40000),
+            ("c2", "ask_user", {"why": "w", "question": "q"}, "A" * 100),
+        ],
+    )
+    messages += _batch("a2", [("c3", "read_file", {"path": "a.py"}, "R" * 100)])
+    assert _run(
+        messages,
+        high_watermark_chars=30000,
+        low_watermark_chars=10000,
+        keep_recent=0,
+        mask_min_chars=100,
+    ) == {}
+
+
+def test_watermark_validation():
+    with pytest.raises(ValueError):
+        CompressNode(high_watermark_chars=100, low_watermark_chars=200)
+    with pytest.raises(ValueError):
+        CompressNode(keep_recent=-1)
+    with pytest.raises(ValueError):
+        CompressNode(mask_min_chars=0)
