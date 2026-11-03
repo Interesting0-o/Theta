@@ -218,7 +218,7 @@ AIMessage(no tool_calls): 已实现并验证通过…
 # notes（另注入索引）：[notes#r2] 某主题研究（…）——如需细节 read_note 取回
 ```
 
-### 8.6 批级压缩：周期 / 原子 / 批（2026-11-03 设计稿，未落地）
+### 8.6 批级压缩：周期 / 原子 / 批（2026-11-03 设计稿，Phase 1 部分落地）
 
 **动机**：轮内 `CompressNode` 目前按单条 `ToolMessage` 选择与改写；单条压缩会拆散工具调用组、指针数量多，也无法利用相邻消息的语义关系。把操作单元提升到「批」：先分组，再对组做一次原子操作。
 
@@ -305,12 +305,33 @@ H, B1(A(tc n1), T…), B2(A(tc n2), T…), …, A_final
 - 语义子边界的精确集合（哪些信号作为预算附近的候选切点）；
 - 软边界若启用，权重、阈值、迟滞参数与 `segmentation_version`。
 
+**落地状态（2026-11-03）**：
+
+- `[x]` `CompressNode` 批级分组：`_iter_tool_blocks` / `_mark_eligibility` /
+  `_plan_batches` / `_semantic_cut` / `_mask_batch`；触发改用 `compressible_chars`；
+  保留最近 K 个 block；默认 `max_batch_chars=8000`、`min_batch_chars=300`；只改
+  `ToolMessage.content`；
+- `[x]` `CompactNode` 失败/被拒块保护：块内任一 `ToolMessage` 为 failed/denied 时整块不折；
+- `[ ]` 轮末压刚完成的周期（现状仍折最后一条 Human 之前的旧周期）；
+- `[ ]` 整块墓碑 / `clear_tool_inputs`（Phase 2，args 成本）；
+- `[ ]` `CompactNode` 与 `CompressNode` 统一到 `CycleBatchPlanner`；
+- `[ ]` 关键词/词嵌入软边界（可选实验）；
+- 验证：全量 **695 passed / 7 skipped**；IndexTTS2 step 758 样本上，当前轮 content
+  129,459 → 22,372（节省 107,087），15 条批级指针 + 9 条状态回执指针 + 14 条同批短戳，
+  失败/被拒原文保留；
+- 新增测试：`test_plan_step_change_starts_new_batch` /
+  `test_mixed_block_masks_only_successful_sibling` / `test_keep_blocks_protects_last_blocks` /
+  `test_batch_pointer_lists_same_batch_targets` /
+  `test_protected_content_does_not_trigger_batch_mask` /
+  `test_budget_cut_prefers_semantic_milestone`；CompactNode 的三条 failed/denied 用例改为
+  “整块保留”。
+
 ## 9. 落地清单（改动面）
 
 | 文件 | 改动（`[x]` = 2026-09-10 已核对落地，`[ ]` = 未做） |
 |---|---|
 | `app/agent/state.py` | `[x]` `notes: dict[str, NoteEntry]`（`NoteEntry` 在 `app/schema/agent_schema.py`）；`[ ]` `work_log: list[WorkLogEntry]` |
-| `app/agent/nodes.py` | `[x]` 新增 `CompactNode`（轮末折叠）；`[x]` `ReviewNode` 被拒时回灌带 `decision=denied` 戳的消息；`[ ]` ToolNode 的"意图 + verdict"日志条目；`[ ]` `LLMNode` 注入 `# 会话工作日志` 与 notes 索引（现只注入 提示词/工作区/计划/画像/记忆）；`[ ]` 批级压缩 planner（§8.6） |
+| `app/agent/nodes.py` | `[x]` 新增 `CompactNode`（轮末折叠）；`[x]` `ReviewNode` 被拒时回灌带 `decision=denied` 戳的消息；`[ ]` ToolNode 的"意图 + verdict"日志条目；`[ ]` `LLMNode` 注入 `# 会话工作日志` 与 notes 索引（现只注入 提示词/工作区/计划/画像/记忆）；`[x]` 批级压缩 Phase 1（CompressNode 批级分组 + CompactNode 失败块保护，§8.6）；`[ ]` 轮末刚完成周期 / 统一 planner |
 | `app/agent/tools.py` | `[x]` `read_note`（`InjectedState`，source=`notes`）；`[ ]` `search_notes` / `notes_by_topic` / `list_topics` / `update_note_tags` / `drop_note` |
 | `app/agent/graph.py` | `[x]` `compact_node` 已接线（位置：`llm_node` 无 tool_calls 且超预算 → compact → END，见 §8.1）；`[ ]` 二期回边预算触发 |
 | `app/agent/prompt.py` | `[x]` tool 轮 content 写一句话工作日志（"工作基调 8"）；`[x]` 折叠语义（"旧输出不会回来、需重取"）；`[ ]` notes/`read_note` 用法与 promote 收尾习惯 |
@@ -324,7 +345,7 @@ H, B1(A(tc n1), T…), B2(A(tc n2), T…), …, A_final
 
 - **P0（首期）**：`work_log` 结构化双半行 + `denied` 条目；notes 会话级 state dict + `read_note/search` + 懒分类工具；轮边界 `compact_node`；promote 收尾引导。收益最大、风险最低（只在轮界动手）。
   - **进度（2026-09-10 核对）**：`notes` 会话级 dict `[已落地]`、`read_note` `[已落地]`、轮边界 `compact_node` `[已落地]`（位置改在 END 前，见 §8.1）、审批被拒时回灌 `[approval_denied]` 消息 `[已落地]`（但**不是**设计里的 work_log `status=denied` 条目）。**未做**：`work_log`（含 verdict/意图双半行）、`search_notes`/懒分类工具、notes 索引注入、promote 收尾引导。
-- **P1**：同轮超长编排的滚动折叠（§8.1 回边触发），加 `keep_blocks` 保留区压力测试；notes 归档阈值/容量标定。批级压缩的设计（周期/chunk、plan step、语义子边界与预算兜底、远期软边界）见 §8.6。
+- **P1**：同轮超长编排的滚动折叠（§8.1 回边触发），加 `keep_blocks` 保留区压力测试；notes 归档阈值/容量标定。批级压缩 Phase 1（CompressNode 批级分组 + CompactNode 失败块保护）已落地；Phase 2（args/墓碑/刚完成周期/统一 planner/软边界）见 §8.6。
 - **P2（评估接线）**：evaluation 增加"上下文/轮数/token"断言，量化折叠前后达成率与成本；为 §8.4 阈值与"意图半行 token 增量/遵从率"提供实测依据。
 
 ## 11. 开放问题

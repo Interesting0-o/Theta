@@ -435,7 +435,7 @@ docs/CONTEXT_ENGINEERING.md（消息流转改动前必读）、docs/ARCHITECTURE
   侧的字符代理，不能当摘要阈值。详见
   [CONTEXT_COMPRESSION_SURVEY.md](CONTEXT_COMPRESSION_SURVEY.md) §4 第 6 条 / §5.4。
 - 相关背景：[[docs/CONTEXT_ENGINEERING]]（只流结论 / notes / 折叠目标态；**§8.6 批级压缩设计**：
-  周期/chunk、plan step 语义边界、预算切批、远期关键词/词嵌入软边界）、根目录 CLAUDE.md 上下文工程一节。
+  周期/chunk、plan step 语义边界、语义切点优先于预算、Phase 1 已落地）、根目录 CLAUDE.md 上下文工程一节。
 
 ## [ ] 缓存友好的提示顺序：稳定前缀 → 历史 → 动态尾部
 
