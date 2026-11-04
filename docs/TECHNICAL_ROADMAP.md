@@ -147,7 +147,7 @@ Git 没有独立 MCP server；Git 操作经 `run_command` 执行。只读 Git �
 
 上下文折叠分两层，引擎在 `app/agent/compression/`，`nodes.py` 只留两个 state 适配器：
 
-- **轮末 `CompactNode`**（无条件运行）：折叠最后一条 Human 之前、已被后续 AI 消息消费的完整工具块；失败/被拒块整块保留，联网正文归档到会话 `notes`，其余折叠即弃；通过 `RemoveMessage` 原位替换，不拆开 AI tool call 与其对应 ToolMessage。
+- **轮末 `CompactNode`**（无条件运行）：折叠最后一条 Human 之前、已被后续 AI 消息消费的工具块；按 plan epoch/step 分组，每组一条摘要。块内逐调用处置：编排 / 失败 / 被拒调用保留，联网正文归档到会话 `notes`，其余折叠；通过 `RemoveMessage` 原位替换，不拆开 AI tool call 与其对应 ToolMessage。保留回执必须排在折叠回执之前，否则整块保留。
 - **轮内 `CompressNode`**：在当前轮工具循环中做 read_file 去重、批级移动窗口（高水位触发、低水位停止）与状态回执变薄；只改 `ToolMessage.content`，不删消息。
 
 两者共享 `ToolBlock` 解析与策略表；当前计划单独存在 `current_plan` 并按轮注入，不依赖计划工具回执一直留在历史里。当前机制**不等于完整的长上下文解决方案**：预算仍是字符代理，尚未按 provider 的 token 用量校准；轮末也尚未折叠刚完成的周期。

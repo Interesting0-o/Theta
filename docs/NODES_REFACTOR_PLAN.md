@@ -1,7 +1,7 @@
 # `nodes.py` 重构方案（2026-11-04）
 
-> 状态：**方案稿；Stage 0 / 1 / 2 已落地（2026-11-04）**。Stage 3（统一 FoldGroup /
-> 按组摘要）与 Stage 4（可选 `nodes/` 包）未做。
+> 状态：**方案稿；Stage 0 / 1 / 2 / 3 已落地（2026-11-04）**。Stage 4（可选 `nodes/`
+> 包）未做。
 > 结论一句话：**先抽“上下文压缩引擎”，暂不把 `nodes.py` 机械拆成 `nodes/` 包。**
 
 ---
@@ -328,7 +328,8 @@ FoldPlan
 1. 批级 mask **不检查低水位**：超过高水位后把所有旧块压完，不会压到低水位就停；
 2. 语义切点可把首个超预算块带进批，**突破 `max_batch_chars`**；
 3. 增量 read 去重指针指向的最新读取**可能随后被 mask**，指针链失效；
-4. 混合块处置不一致：轮内只压成功兄弟；轮末任一失败/被拒则整块保留。
+4. 混合块处置不一致：轮内逐调用压成功兄弟；轮末原先“任一失败/被拒即整块保留”
+   （Stage 3 已把轮末也改为逐调用处置，但受回执邻接约束：保留回执在前才能折后面的成功兄弟）。
 
 **B. 不变量（重构前后都不许变）**
 
@@ -337,7 +338,7 @@ FoldPlan
 7. SQLite 重启后不重复摘要 / notes。
 
 > 2026-11-04：A 类 1–3 已随 Stage 1 翻转为目标行为（用例名不再带 `current`）；
-> A 类 4 的两条不一致是**有意的**（轮内可部分压、轮末整块保守），保持现状。
+> A 类 4 已随 Stage 3 统一为逐调用处置（仅保留“保留回执在前”的邻接约束）。
 
 ### Stage 1：修算法，不搬家（2026-11-04 落地 5/6）
 
@@ -372,15 +373,23 @@ FoldPlan
 - [ ] prefix cache 前后对比：本次以搬家为主（Stage 1 的预算/指针修复已轻微改变消息形态），
   尚无真实会话基线，留待 P2 评估接线。
 
-### Stage 3：统一 FoldGroup / FoldPlan（未做）
+### Stage 3：统一 FoldGroup / FoldPlan（2026-11-04 已落地）
 
-Stage 2 已完成其中两项：共享 `ToolBlock` 解析（`parser.py`）与统一策略表（`policy.py`）。
-剩下：
+- [x] 共享 `ToolBlock` 解析与 `group_segments()`：轮末与轮内共用同一套硬边界 / plan
+  epoch/step 分组；
+- [x] `FoldPlan` 增加 `groups`；每个 `FoldGroup` 产出一条 `SystemMessage`（组内仍按
+  被折调用一行，保留工作日志与 notes ref）。**摘要容量目前刻意不设上限**（2026-11-04
+  决定：截断会丢 notes ref，等有真实会话基线再定）；
+- [x] 轮末逐调用处置：编排 / 失败 / 被拒 KEEP，联网正文 ARCHIVE，其余 FOLD；
+  保留回执必须排在折叠回执之前，顺序不满足时整块保留（邻接约束）；
+- [x] 轮内保护表补上编排工具：`read_note` / `read_event_log` 等 state 回执不再被批级
+  mask（修掉 §2.2 点名的两套策略漂移）；
+- [x] `dispatch_subtasks` 的 worker 结论轮末也保留（`policy.KEEP_TOOLS`），与轮内一致；
+- [x] 修分组边界：硬边界之后的第一个块现在开新组/新批，不再被连带跳过；
+- [x] 全量 **713 passed / 7 skipped**。
 
-- `FoldPlan` 增加 `groups` / 按组摘要（当前只有 `removed` / `summary_lines` /
-  `archived_notes` / `replaced`）；
-- 允许块内逐调用处置（`FoldDecision`：KEEP / MASK / ARCHIVE / DROP），把轮末的
-  “整块保留/整块折叠”细化到调用级。
+Stage 3 没有引入独立的 `FoldDecision` 枚举：当前决策在 `compact._block_folding()`
+里以 `(folded_ids, kept_ids)` 表达；等出现第三种处置（如大块墓碑）再抽枚举。
 
 ### Stage 4：可选的 `nodes/` 包
 

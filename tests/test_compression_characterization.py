@@ -244,8 +244,12 @@ def test_compress_mixed_block_masks_only_successful_sibling(stamp):
     ],
     ids=["failed", "denied"],
 )
-def test_compact_mixed_block_with_failure_is_kept_whole(stamp):
-    """【不变量】轮末：块内任一失败/被拒 → 整块不折，成功兄弟也不折。"""
+def test_compact_mixed_block_with_failure_after_success_is_kept_whole(stamp):
+    """【不变量】轮末：保留回执排在折叠回执之后 → 整块不折（邻接约束）。
+
+    失败/被拒调用本身永远保留；成功兄弟能否折取决于回执顺序（失败在前时可折，
+    见 `test_compact_node.py::test_mixed_block_folds_success_after_failed_sibling`）。
+    """
     messages = [
         HumanMessage(content="跑测试", id="h1"),
         AIMessage(

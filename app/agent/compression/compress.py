@@ -81,6 +81,9 @@ class TurnCompressor:
         self.max_batch_chars = max_batch_chars
         self.min_batch_chars = min_batch_chars
         self._planner = CycleBatchPlanner(max_batch_chars, min_batch_chars)
+        # 编排/state 工具与轮末共享同一份策略源：read_note / read_event_log 等回执
+        # 在轮内也不能被批级 mask（§2.2 的两套策略漂移，2026-11-04 统一）。
+        self._orchestrate_tools = policy.orchestrate_tools()
 
     def compress(self, messages: list, current_plan=None) -> list[ToolMessage]:
         """返回当前轮需要替换的 ToolMessage（按原消息顺序）；无需压缩时返回 []。"""
@@ -190,6 +193,7 @@ class TurnCompressor:
                     continue
                 if (
                     call.name not in policy.NO_MASK_TOOLS
+                    and call.name not in self._orchestrate_tools
                     and call.call_id not in protected_ids
                     and getattr(tool_message, "id", None)
                     and len(content) >= self.mask_min_chars

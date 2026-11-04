@@ -510,6 +510,30 @@ def test_below_high_watermark_is_noop():
     ) == {}
 
 
+@pytest.mark.parametrize(
+    "tool_name", ["read_note", "read_event_log", "dispatch_subtasks"]
+)
+def test_protected_receipts_are_not_masked(tool_name):
+    """编排/state 回执与 worker 结论（dispatch_subtasks）在轮内也不压。"""
+    messages = [HumanMessage(content="查资料", id="h1")]
+    messages += _batch("a1", [("c1", tool_name, {}, "N" * 20000)])
+    messages += _batch("a2", [("c2", "read_file", {"path": "a.py"}, "R" * 20000)])
+    messages.append(AIMessage(content="完成", id="ans"))
+
+    out = _run(
+        messages,
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=0,
+        mask_min_chars=100,
+        max_batch_chars=8000,
+        min_batch_chars=100,
+    )
+    merged = _merged(messages, out)
+    assert _by_id(merged, "tc1").content == "N" * 20000
+    assert "已压缩" in _by_id(merged, "tc2").content
+
+
 def test_web_and_ask_are_not_masked():
     messages = [HumanMessage(content="部署", id="h1")]
     messages += _batch(

@@ -27,6 +27,10 @@ def _tc(name, cid):
     return {"name": name, "args": {}, "id": cid, "type": "tool_call"}
 
 
+def _tc_with(name, cid, **args):
+    return {"name": name, "args": args, "id": cid, "type": "tool_call"}
+
+
 def _run(messages, notes=None):
     """直驱 CompactNode，返回节点产出的 state 切片。"""
     state = {"messages": messages}
@@ -319,6 +323,20 @@ def test_orchestration_only_block_is_never_folded(name):
     assert _run(_orchestration_block(name)) == {}
 
 
+def test_dispatch_subtasks_result_is_kept():
+    """worker 结论是“结论”不是可重取 dump：轮末也保留原文。"""
+    messages = [
+        HumanMessage(content="调研", id="h1"),
+        AIMessage(content="派发", tool_calls=[_tc("dispatch_subtasks", "c1")], id="a1"),
+        ToolMessage(content="worker 结论" + "W" * 200, tool_call_id="c1",
+                    name="dispatch_subtasks", id="t1"),
+        AIMessage(content="汇总", id="ans1"),
+        HumanMessage(content="继续", id="h2"),
+        AIMessage(content="好", id="ans2"),
+    ]
+    assert _run(messages) == {}
+
+
 def test_ask_user_answer_survives_turn_end():
     """提问回答是单轮 state，折掉就永久丢失——必须保留。"""
     messages = [
@@ -461,3 +479,90 @@ def test_mixed_block_with_ordinary_before_orchestration_is_kept():
         AIMessage(content="好", id="ans2"),
     ]
     assert _run(messages) == {}
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [{"error_type": "tool_error"}, {"decision": "denied"}],
+    ids=["failed", "denied"],
+)
+def test_mixed_block_folds_success_after_failed_sibling(stamp):
+    """逐调用处置：失败/被拒调用保留，成功兄弟在邻接允许时照折。"""
+    messages = [
+        HumanMessage(content="跑测试", id="h1"),
+        AIMessage(
+            content="先跑再读",
+            tool_calls=[_tc("run_command", "c1"), _tc("read_file", "c2")],
+            id="a1",
+        ),
+        ToolMessage(content="E" * 200, tool_call_id="c1", name="run_command", id="t1",
+                    additional_kwargs=dict(stamp)),
+        ToolMessage(content="R" * 200, tool_call_id="c2", name="read_file", id="t2"),
+        AIMessage(content="有失败", id="ans1"),
+        HumanMessage(content="继续", id="h2"),
+        AIMessage(content="好", id="ans2"),
+    ]
+    out = _run(messages)
+
+    sys_msgs = [m for m in out["messages"] if isinstance(m, SystemMessage)]
+    assert len(sys_msgs) == 1
+    assert sys_msgs[0].id == "t2"                    # 摘要顶替第一条被折回执
+    assert "工具调用: read_file" in sys_msgs[0].content
+    assert "run_command" not in sys_msgs[0].content
+
+    merged = _merged(messages, out)
+    assert _by_id(merged, "t1").content == "E" * 200  # 失败/被拒正文保留
+    assert isinstance(_by_id(merged, "t2"), SystemMessage)
+    assert [tc["id"] for tc in _by_id(merged, "a1").tool_calls] == ["c1"]
+
+
+def test_mixed_block_with_failure_after_success_is_kept_whole():
+    """保留回执排在折叠回执之后：整块保留（摘要不能插在保留回执之前）。"""
+    messages = [
+        HumanMessage(content="先读再跑", id="h1"),
+        AIMessage(
+            content="先读再跑",
+            tool_calls=[_tc("read_file", "c1"), _tc("run_command", "c2")],
+            id="a1",
+        ),
+        ToolMessage(content="R" * 200, tool_call_id="c1", name="read_file", id="t1"),
+        ToolMessage(content="E" * 200, tool_call_id="c2", name="run_command", id="t2",
+                    additional_kwargs={"error_type": "tool_error"}),
+        AIMessage(content="有失败", id="ans1"),
+        HumanMessage(content="继续", id="h2"),
+        AIMessage(content="好", id="ans2"),
+    ]
+    assert _run(messages) == {}
+
+
+def test_fold_groups_split_by_plan_step():
+    """轮末按 plan step 分组：每组一条摘要，不跨 step 合并。"""
+    messages = [
+        HumanMessage(content="部署", id="h1"),
+        AIMessage(content="", tool_calls=[_tc_with("update_plan_step", "c0", step_id="1", status="in_progress")], id="a0"),
+        ToolMessage(content="步骤 1 in_progress", tool_call_id="c0", name="update_plan_step", id="t0"),
+        AIMessage(content="读 a", tool_calls=[_tc("read_file", "c1")], id="a1"),
+        ToolMessage(content="A" * 200, tool_call_id="c1", name="read_file", id="t1"),
+        AIMessage(content="读 b", tool_calls=[_tc("read_file", "c2")], id="a2"),
+        ToolMessage(content="B" * 200, tool_call_id="c2", name="read_file", id="t2"),
+        AIMessage(content="", tool_calls=[_tc_with("update_plan_step", "c3", step_id="2", status="in_progress")], id="a3"),
+        ToolMessage(content="步骤 2 in_progress", tool_call_id="c3", name="update_plan_step", id="t3"),
+        AIMessage(content="读 c", tool_calls=[_tc("read_file", "c4")], id="a4"),
+        ToolMessage(content="C" * 200, tool_call_id="c4", name="read_file", id="t4"),
+        AIMessage(content="读 d", tool_calls=[_tc("read_file", "c5")], id="a5"),
+        ToolMessage(content="D" * 200, tool_call_id="c5", name="read_file", id="t5"),
+        AIMessage(content="完成", id="ans1"),
+        HumanMessage(content="继续", id="h2"),
+        AIMessage(content="好", id="ans2"),
+    ]
+    out = _run(messages)
+
+    sys_msgs = [m for m in out["messages"] if isinstance(m, SystemMessage)]
+    assert len(sys_msgs) == 2
+    by_id = {m.id: m for m in sys_msgs}
+    assert "步骤 1" in by_id["a1"].content
+    assert "步骤 2" in by_id["a4"].content
+    assert "工作日志: 读 a" in by_id["a1"].content
+    assert "工作日志: 读 c" in by_id["a4"].content
+    assert "读 c" not in by_id["a1"].content          # 不跨 step 合并
+    assert "读 a" not in by_id["a4"].content

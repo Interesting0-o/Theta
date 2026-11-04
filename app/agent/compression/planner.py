@@ -1,10 +1,62 @@
-"""批级分组：硬边界 → plan step → 预算（语义切点优先，预算是硬上界）。
+"""批级 / 组级规划：硬边界 → plan step → 预算（语义切点优先）。
 
-纯确定性，不读 state、不改消息。Stage 3 会把轮末分组也并入同一个 planner。
+两个消费方共享同一套边界识别：
+
+- `group_segments()`：只按硬边界与 plan epoch/step 分组，不切预算——轮末 `FoldGroup` 用它；
+- `CycleBatchPlanner.plan_batches()`：在每组内再按预算切批——轮内移动窗口用它。
+
+纯确定性，不读 state、不改消息。
 """
 from __future__ import annotations
 
 from .models import ToolBlock
+
+
+def has_boundary(boundaries: list[int], left: int, right: int) -> bool:
+    """`(left, right)` 之间是否有工具块之外的消息（硬边界）。"""
+    return any(left < position < right for position in boundaries)
+
+
+def group_segments(
+    blocks: list[ToolBlock], boundaries: list[int]
+) -> list[list[ToolBlock]]:
+    """按硬边界与 plan epoch/step 把 block 切成组（不切预算）。
+
+    `boundaries` 是工具块之外的消息下标；不完整/未消费 block 也视为边界且不进入组。
+    同一 `(plan_epoch, step_id)` 的连续 block 留在同一组；key 变化即开新组。
+    """
+    if not blocks:
+        return []
+
+    segments: list[list[ToolBlock]] = []
+    segment: list[ToolBlock] = []
+    segment_key = None
+    prev_end = blocks[0].start - 1
+
+    def flush() -> None:
+        nonlocal segment, segment_key
+        if segment:
+            segments.append(segment)
+        segment = []
+        segment_key = None
+
+    for block in blocks:
+        # 不完整/未消费块本身不压，并充当分隔点。
+        if not block.complete or not block.consumed:
+            flush()
+            prev_end = block.end
+            continue
+        # 硬边界只负责“断开”，边界之后的第一个块应开新段，不能连块一起丢掉。
+        if has_boundary(boundaries, prev_end, block.start):
+            flush()
+        key = (block.plan_epoch, block.step_id)
+        if segment and key != segment_key:
+            flush()
+        segment.append(block)
+        segment_key = key
+        prev_end = block.end
+    flush()
+    return segments
 
 
 class CycleBatchPlanner:
@@ -17,48 +69,11 @@ class CycleBatchPlanner:
     def plan_batches(
         self, blocks: list[ToolBlock], boundaries: list[int]
     ) -> list[list[ToolBlock]]:
-        """把 blocks 切成批：硬边界 → plan step → 预算（含语义切点）。
-
-        `boundaries` 是工具块之外的消息下标（Human/System/Assistant/孤儿 ToolMessage）；
-        不完整/未消费 block 也不进批。批内可以夹着不可压的 block，只压 eligible 的
-        ToolMessage；批与批之间由 step 变化、硬边界或预算切点分开。
-        """
-        if not blocks:
-            return []
+        """先按硬边界/step 分组，再在组内按预算切批。"""
         batches: list[list[ToolBlock]] = []
-        segment: list[ToolBlock] = []
-        segment_key = None
-        prev_end = blocks[0].start - 1
-
-        def flush() -> None:
-            nonlocal segment, segment_key
-            if segment:
-                batches.extend(self._plan_segment(segment))
-            segment = []
-            segment_key = None
-
-        for block in blocks:
-            if (
-                self._has_boundary(boundaries, prev_end, block.start)
-                or not block.complete
-                or not block.consumed
-            ):
-                flush()
-                prev_end = block.end
-                continue
-            key = (block.plan_epoch, block.step_id)
-            if segment and key != segment_key:
-                flush()
-            segment.append(block)
-            segment_key = key
-            prev_end = block.end
-        flush()
+        for segment in group_segments(blocks, boundaries):
+            batches.extend(self._plan_segment(segment))
         return batches
-
-    @staticmethod
-    def _has_boundary(boundaries: list[int], left: int, right: int) -> bool:
-        """`(left, right)` 之间是否有工具块之外的消息（硬边界）。"""
-        return any(left < position < right for position in boundaries)
 
     def _plan_segment(self, blocks: list[ToolBlock]) -> list[list[ToolBlock]]:
         """在一个 step 段内按预算切批；预算超限时优先在里程碑附近切。"""

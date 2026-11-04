@@ -10,7 +10,7 @@
 | [TECHNICAL_ROADMAP.md](TECHNICAL_ROADMAP.md) | 技术路线与实现概览 | 汇总当前架构、技术栈、关键实现约束与未完成方向 |
 | [EXCEPTION_DESIGN.md](EXCEPTION_DESIGN.md) | 异常体系 | 异常的边界是语义过滤器——决定什么信息能进大模型的推理 |
 | [CONTEXT_ENGINEERING.md](CONTEXT_ENGINEERING.md) | 上下文工程 | work_log（意图+事实双半行）、notes 笔记区（会话级 + promote 进 repo）、滚动块折叠、批级压缩设计（§8.6，Phase 1 已落地） |
-| [NODES_REFACTOR_PLAN.md](NODES_REFACTOR_PLAN.md) | `nodes.py` 重构方案 | 压缩引擎已抽出（Stage 0–2）；下一步统一 `FoldGroup` / 按组摘要，暂不拆 `nodes/` 包 |
+| [NODES_REFACTOR_PLAN.md](NODES_REFACTOR_PLAN.md) | `nodes.py` 重构方案 | 压缩引擎与 `FoldGroup` 已落地（Stage 0–3）；暂不拆 `nodes/` 包（Stage 4 可选） |
 | [MULTI_AGENT.md](MULTI_AGENT.md) | 多 Agent 编排（草稿） | 拉起形态 / 审批回流 / 并行分发 vs DAG / 状态隔离 |
 | [LONG_TERM_MEMORY.md](LONG_TERM_MEMORY.md) | 长期记忆 + resource 重构 | 跨会话记忆 = 按工作区落 md + SystemMessage 注入 + 记忆写读工具；resource 按 工作区/会话 分目录 |
 | [SKILL_DESIGN.md](SKILL_DESIGN.md) | 技能（一期 §11 / 二期 §13 已落地，三期见 §13.10） | skill = 按需加载的领域包；差异化在"约束三分法"——软约束走 `SKILL.md` 正文（host 读取、注入系统提示）/ 硬闸门走 tool.json / 结构性拒绝写死在工具里。落地清单见 §11 |

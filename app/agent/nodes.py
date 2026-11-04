@@ -30,7 +30,7 @@ from app.config import THINKING_MODES, get_settings
 from app.schema.agent_schema import ImageRef, PlanStep
 from app.schema.approval_schema import GATE_ASK_USER, GATE_TOOL_APPROVAL
 from app.agent.compression import policy as compression_policy
-from app.agent.compression.compact import FOLD_HEADER, plan_compact
+from app.agent.compression.compact import plan_compact
 from app.agent.compression.parser import one_line
 from app.agent.compression.compress import (
     MAX_BATCH_CHARS,
@@ -1167,10 +1167,10 @@ class CompactNode:
 
     引擎产出一个 `FoldPlan`；本节点只做翻译：
 
-    - `SystemMessage(摘要, id=折叠区最早被删消息的 id)` 原位替换；
-    - `RemoveMessage` 删除其余被折块；
+    - 每个 `FoldGroup` 生成一条 `SystemMessage(摘要, id=该组最早被删消息的 id)` 原位替换；
+    - `RemoveMessage` 删除该组其余被折块；
     - `notes` 合并（仅联网四工具的成功正文）；
-    - 混合块里保留编排调用后的 `AIMessage` 副本由 `plan.replaced` 原位写回。
+    - 混合块里保留调用后的 `AIMessage` 副本由 `group.replaced` 原位写回。
 
     折叠区 = 最后一条 HumanMessage 之前（含更早轮次）；当前轮原样保留。折叠规则
     （完整/已消费、编排工具保护、失败/被拒整块保留、联网正文归档）见
@@ -1188,14 +1188,22 @@ class CompactNode:
 
         notes = dict(state.get("notes") or {})
         plan = plan_compact(messages, notes, self._orchestrate_tools)
-        if not plan.removed or not plan.summary_lines:
+        if not plan.groups:
             return {}
 
-        summary = FOLD_HEADER + "\n" + "\n".join(plan.summary_lines)
-        anchor = plan.removed[0]
-        updates: list = [SystemMessage(content=summary, id=anchor.id)]
-        updates += plan.replaced
-        updates += [RemoveMessage(id=m.id) for m in plan.removed[1:] if getattr(m, "id", None)]
+        updates: list = []
+        for group in plan.groups:
+            if not group.anchor_id or not group.removed:
+                continue
+            updates.append(SystemMessage(content=group.summary, id=group.anchor_id))
+            updates += group.replaced
+            updates += [
+                RemoveMessage(id=m.id)
+                for m in group.removed[1:]
+                if getattr(m, "id", None)
+            ]
+        if not updates:
+            return {}
 
         result: dict = {"messages": updates}
         if plan.archived_notes:

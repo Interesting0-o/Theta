@@ -21,6 +21,10 @@ ARCHIVE_TOOLS: frozenset[str] = frozenset(
     {"web_search", "extract_urls", "crawl_website", "deep_research"}
 )
 
+# 结论型结果：worker 返回的是最终结论，不是可重取的 dump；轮内与轮末都保留原文。
+# 编排工具（state 回执）另由 `orchestrate_tools()` 动态派生，两者在引擎里合并判断。
+KEEP_TOOLS: frozenset[str] = frozenset({"dispatch_subtasks"})
+
 # 状态回执：每个工具只保留最近一条；旧回执的内容已由 current_plan / RUNTIME_STATE 承载。
 STATE_RECEIPT_TOOLS: frozenset[str] = frozenset({
     "create_plan", "update_plan_step", "clear_plan",
@@ -40,5 +44,5 @@ WRITE_TOOLS: frozenset[str] = frozenset({
 # - 状态回执与写操作回执：见上。
 NO_MASK_TOOLS: frozenset[str] = frozenset({
     "web_search", "extract_urls", "crawl_website", "deep_research",
-    "ask_user", "dispatch_subtasks",
-}) | STATE_RECEIPT_TOOLS | WRITE_TOOLS
+    "ask_user",
+}) | KEEP_TOOLS | STATE_RECEIPT_TOOLS | WRITE_TOOLS

@@ -6,7 +6,8 @@
 （与仓库其余测试一致，不在本包处理）。
 
 模块分工：
-- `models.py`：结构原子（`ToolBlock` / `ToolCallInfo`）与折叠计划（`FoldPlan`）；
+- `models.py`：结构原子（`ToolBlock` / `ToolCallInfo`）、折叠组（`FoldGroup`）与
+  折叠计划（`FoldPlan`）；
 - `parser.py`：协议块解析、状态判定、read_file 行区间；
 - `policy.py`：编排 / 保护 / 归档 / 状态回执策略；
 - `planner.py`：批级分组（硬边界 → plan step → 预算）；
@@ -17,11 +18,12 @@
 """
 from .compact import FOLD_HEADER, plan_compact
 from .compress import TurnCompressor
-from .models import FoldPlan, ToolBlock, ToolCallInfo
+from .models import FoldGroup, FoldPlan, ToolBlock, ToolCallInfo
 from .parser import first_line, iter_tool_blocks, one_line, tm_status
-from .planner import CycleBatchPlanner
+from .planner import CycleBatchPlanner, group_segments
 from .policy import (
     ARCHIVE_TOOLS,
+    KEEP_TOOLS,
     NO_MASK_TOOLS,
     STATE_RECEIPT_TOOLS,
     WRITE_TOOLS,
@@ -32,7 +34,9 @@ __all__ = [
     "ARCHIVE_TOOLS",
     "CycleBatchPlanner",
     "FOLD_HEADER",
+    "FoldGroup",
     "FoldPlan",
+    "KEEP_TOOLS",
     "NO_MASK_TOOLS",
     "STATE_RECEIPT_TOOLS",
     "ToolBlock",
@@ -40,6 +44,7 @@ __all__ = [
     "TurnCompressor",
     "WRITE_TOOLS",
     "first_line",
+    "group_segments",
     "iter_tool_blocks",
     "one_line",
     "orchestrate_tools",
