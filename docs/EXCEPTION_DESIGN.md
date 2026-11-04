@@ -229,7 +229,7 @@ def format_tool_result(result) -> str:
 
 > **`ToolMessage` 上那枚结构化戳的单一落点 = 生产端**（2026-09-21）：形状是
 > `additional_kwargs` 里的 `{error_type: <语义标记>}` 或 `{decision: "denied"}`，**构造器只有
-> `app/agent/nodes.py::_tool_stamp()` 一个**（生产端 = ToolNode / ReviewNode，全仓仅有的两个写出点），
+> `app/agent/nodes/_shared.py::_tool_stamp()` 一个**（生产端 = ToolNode / ReviewNode，全仓仅有的两个写出点），
 > 键名（`STAMP_ERROR_TYPE` / `STAMP_DECISION` / `STAMP_DENIED`）也定义在那里；消费端只有
 > `CompactNode._tm_status`，它**只读常量**、不再解析 content 前缀（前缀回退只服务戳落地前的旧
 > checkpoint，取值必须与生产端一致——本轮就核对出 `[config_error]` 从来没匹配上过：`ConfigError`
@@ -294,7 +294,7 @@ except ConfigError as exc:
     sys.exit(1)
 ```
 
-> ⚠️ 仍未做的那一半：`get_settings()` **懒加载**。当前 `app/agent/nodes.py::LLMNode` 在模块顶层调用它
+> ⚠️ 仍未做的那一半：`get_settings()` **懒加载**。当前 `app/agent/nodes/_shared.py` 在模块顶层调用它
 > （`tools.py` 已无该调用），于是"`.env` 缺键"会在 **import 阶段**抛 `ValidationError` 崩掉，
 > 根本走不进入口的 try——所以 `ValidationError → ConfigError` 的翻译也就无从谈起。要补的是
 > 把模块顶层的调用挪进函数内。
@@ -333,7 +333,7 @@ except ConfigError as exc:
 - [x] 各文件工具：`resolve` 移出 try，操作失败保留 `except OSError → ToolResult(io_error)`
 - [x] `app/platform/tool_results.py`：`format_tool_result` 提取正文（`ToolNode` 调它）；`ToolNode` 的 `except Exception` 仅作传输层兜底（正文 `工具执行失败: …`、`error_type="tool_error"`）
 - [x] MCP 子进程 env 注入工作区：**`WORKSPACE_PATH`**（不是 `WORKSPACE_ROOT`），由 `app/platform/mcp.py::_build_servers` 注入；`app/config.py` 不参与（工作区已是图的构造期参量）
-- [~] 入口翻译：**已落地一半**——`app/main.py` 捕获 `ConfigError` 打一句人话 + 退出码 1（不再让它裹在 traceback 里）；**未做**：`get_settings()` 懒加载（现在 `app/agent/nodes.py::LLMNode` 顶层调用）与 `ValidationError → ConfigError` 的翻译
+- [~] 入口翻译：**已落地一半**——`app/main.py` 捕获 `ConfigError` 打一句人话 + 退出码 1（不再让它裹在 traceback 里）；**未做**：`get_settings()` 懒加载（现在 `app/agent/nodes/_shared.py` 顶层调用）与 `ValidationError → ConfigError` 的翻译
 - [x] 测试：越界拒绝（绝对路径/`../`/符号链接）、工作区内放行、`internal_error` 不冒充工具失败（`tests/test_guard.py`、`tests/test_file_io_sandbox.py`）
 
 ---

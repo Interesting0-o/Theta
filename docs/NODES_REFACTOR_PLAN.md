@@ -1,8 +1,8 @@
 # `nodes.py` 重构方案（2026-11-04）
 
-> 状态：**方案稿；Stage 0 / 1 / 2 / 3 已落地（2026-11-04）**。Stage 4（可选 `nodes/`
-> 包）未做。
-> 结论一句话：**先抽“上下文压缩引擎”，暂不把 `nodes.py` 机械拆成 `nodes/` 包。**
+> 状态：**Stage 0–4 均已落地（2026-11-04）**。
+> 结论：先抽上下文压缩引擎，再把执行节点拆成 `app/agent/nodes/` 包；`graph.py` 与
+> 测试仍从 `app.agent.nodes` 导入，子模块负责具体实现。
 
 ---
 
@@ -234,6 +234,8 @@ FoldPlan
 
 ## 6. 为什么不先拆 `nodes/` 包
 
+> 2026-11-04 注：Stage 4 已完成拆包；本节保留当时“先抽压缩引擎、暂缓拆包”的决策依据。
+
 五个执行节点的耦合不在文件层面，而在运行时协议层面。
 
 | 节点 | 拆包难点 |
@@ -388,19 +390,37 @@ FoldPlan
 - [x] 修分组边界：硬边界之后的第一个块现在开新组/新批，不再被连带跳过；
 - [x] 轮末折叠区扩到刚完成的周期（有最终答复时折到答复之前；无最终答复时退回旧轮，
   保留在途结果）——`CONTEXT_ENGINEERING.md` §8.6 未决点 1 落地；
-- [x] 全量 **714 passed / 7 skipped**。
+- [x] 全量 **723 passed / 7 skipped**（含 Stage 4 拆包后的回归）。
 
 Stage 3 没有引入独立的 `FoldDecision` 枚举：当前决策在 `compact._block_folding()`
 里以 `(folded_ids, kept_ids)` 表达；等出现第三种处置（如大块墓碑）再抽枚举。
 
-### Stage 4：可选的 `nodes/` 包
+补充（2026-11-04）：轮内 Phase 2 的整块墓碑已实现为 `tombstone_blocks` 开关
+（`TurnCompressor` / `CompressNode`，**默认 False**）；开启后完整、已消费、全部调用
+属于 `TOMBSTONE_TOOLS` 的旧块整块移除并原位留摘要，混合/受保护块仍走内容/args mask。
 
-只有满足以下条件才做：
+### Stage 4：`nodes/` 包（2026-11-04 已落地）
 
-- compression API 已稳定；
-- 出现第二个真实消费者；
-- 测试已经 patch 具体子模块；
-- 有明确的行为回归网。
+原计划四个条件里“出现第二个真实消费者”未满足，按用户决定直接完成拆包。落地形态：
+
+```text
+app/agent/nodes/
+  __init__.py       # 显式 re-export（graph.py / 测试入口不变）
+  _shared.py        # settings（import 期）/ logger / _tool_stamp
+  llm.py            # LLMNode
+  tool.py           # ToolNode
+  review.py         # ReviewNode + _tool_call_log
+  orchestrate.py    # OrchestrateNode + _EXTRA_SLICE_KEYS
+  queue.py          # QueueNode
+  compact_node.py   # CompactNode + needs_compact（state 适配器）
+  compress_node.py  # CompressNode（state 适配器）
+```
+
+- `settings = get_settings()` 的 import 期时机保留在 `_shared.py`；
+- `logger` 仍是 `app.agent.nodes`（caplog / 既有日志口径不变）；
+- monkeypatch 已改到具体子模块：`nodes.review.interrupt`、`nodes.llm.settings`、
+  `nodes.llm.memory_block` / `skills_block`；
+- 全量 **723 passed / 7 skipped**。
 
 ---
 
@@ -432,12 +452,13 @@ Stage 3 没有引入独立的 `FoldDecision` 枚举：当前决策在 `compact._
 
 ## 12. 结论
 
-**重构有必要，但第一刀不是拆 `nodes/` 包，而是抽 compression 引擎。**
+**重构已按“先测试、再算法、再结构、最后拆包”的顺序完成（2026-11-04）。**
 
-- 先补测试；
-- 先修算法；
-- 再抽结构；
-- 最后做按组轮末压缩；
-- `nodes/` 包暂缓。
+- Stage 0：characterization / 不变量回归网；
+- Stage 1：低水位、预算硬上界、read 指针、失败 plan 分组；
+- Stage 2：抽出 `app/agent/compression/`，`nodes.py` 只留适配器；
+- Stage 3：`FoldGroup` / 按组摘要 / 轮末逐调用处置；
+- Stage 4：`nodes.py` 拆成 `app/agent/nodes/` 包。
 
-这样才能保证每一步都可回滚、可定位、可验证。
+剩余事项不在本重构范围内：软边界实验、整块墓碑默认开启（需真实会话基线）、
+prefix cache / evaluation 接线。

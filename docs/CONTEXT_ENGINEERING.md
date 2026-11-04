@@ -10,13 +10,13 @@
 
 ## 1. 背景与问题
 
-- `AgentState.messages` 用 `add_messages` 累加（`app/agent/state.py`）；**已有轮末折叠**（`app/agent/nodes.py::CompactNode`，用 `RemoveMessage` 原位替换，见 §8），但没有**行内滚动折叠**（单轮超长编排内部仍会无限涨）。
+- `AgentState.messages` 用 `add_messages` 累加（`app/agent/state.py`）；**已有轮末折叠**（`app/agent/nodes/compact_node.py::CompactNode`，用 `RemoveMessage` 原位替换，见 §8），但没有**行内滚动折叠**（单轮超长编排内部仍会无限涨）。
 - 跨轮靠 checkpoint 持久化（现为 `AsyncSqliteSaver`，装配在 `app/platform/runtime.py`），所以每轮喂给模型的都是"当前历史 + 每轮重拼的系统消息"。
 - Token 大头几乎全在 `ToolMessage`：整文件读取、目录树、检索命中、命令输出、网页正文。而这些内容大多**时效极强**——文件一旦被改，几轮前的整文件 dump 就是纯噪声。
 
 ## 2. 现状：messages 里到底有什么
 
-进 `state["messages"]` 的只有四类（系统消息**不落库**，每轮由 `LLMNode` 现拼，见 `app/agent/nodes.py::LLMNode`）：
+进 `state["messages"]` 的只有四类（系统消息**不落库**，每轮由 `LLMNode` 现拼，见 `app/agent/nodes/llm.py::LLMNode`）：
 
 | # | 消息 | 来源 | 特征 / 体积 |
 |---|---|---|---|
@@ -301,16 +301,16 @@ H, B1(A(tc n1), T…), B2(A(tc n2), T…), …, A_final
 4. 批级时间线指针 + 短戳；保留最近 K 个 block；
 5. 触发改 `compressible_chars`，补 `min/max_batch_chars`；预算到达时先找语义切点，再硬切；
 6. 轮末折叠区扩到刚完成周期（保留 `A_final`），并与 `CompressNode` 统一到 `CycleBatchPlanner`；
-7. Phase 2：写操作 args 清理已落地（2026-11-04，`ARG_CLEAR_FIELDS`）；整块墓碑 / 视图化
-   仍未做；
+7. Phase 2：写操作 args 清理与整块墓碑均已落地（2026-11-04）；墓碑默认关闭
+   （`tombstone_blocks=False`），等真实会话基线后再决定是否开启；
 8. 远期：关键词/词嵌入软边界（可选实验），边界冻结并缓存 `segmentation_version`。
 
 **调研结论（2026-11-03，详见 extra 专题）**：
 
 - 轮末**压刚完成的周期**（保留 `A_final` 作结论载体）：与 SelfCompact/CAT 的“逻辑停止点压缩”一致；
 - Phase 1 维持 content 改写；Phase 2 的写操作 args 清理已落地（照 `clear_tool_inputs`
-  先例，只清 content / old_string / new_string）；**整块墓碑**（checkpoint 原文保留、
-  mask 是视图）仍未做；
+  先例，只清 content / old_string / new_string）；**整块墓碑**已实现但默认关闭，
+  原文保留在压缩前的 checkpoint，当前 state 只留墓碑；
 - K=8–10、`max_batch_chars`=6k–8k 有样本与业界参照；`min_batch_chars` 按“指针开销 × 批内条数”动态下界；
 - 混合 block 的 `in_progress` 更新归**新 step**；
 - 软边界（关键词+嵌入）降级为可选实验：三项独立工作用的是 agent 自声明/结构信号，不是事后嵌入聚类；
@@ -344,11 +344,14 @@ H, B1(A(tc n1), T…), B2(A(tc n2), T…), …, A_final
   当前轮工具块也折；无最终答复时退回最后一条 Human 之前，保留在途结果；
 - `[x]` Phase 2 写操作 args 清理（2026-11-04）：`write_file` / `create_file` 的
   `content`、`edit_file` 的 `old_string` / `new_string` 换成带长度指针，计入可压池；
-- `[ ]` 整块墓碑 / 视图化（checkpoint 原文保留、mask 是视图）；
+- `[x]` 整块墓碑（2026-11-04，**默认关闭** `tombstone_blocks=False`）：完整、已消费、
+  全部调用属于 `TOMBSTONE_TOOLS` 的旧块整块移除，原位留一条摘要；混合 / 含 web /
+  失败块仍走内容/args mask。原文保留在压缩前的 checkpoint（当前 state 只留墓碑）。
+  默认关闭是等真实会话的 prefix cache / 行为基线后再决定是否开启；
 - `[x]` `CompactNode` 与 `CompressNode` 统一到共享分组/解析/策略（`group_segments` +
   `parser` + `policy`；轮末只分组不切预算）；
 - `[ ]` 关键词/词嵌入软边界（可选实验）；
-- 验证：全量 **718 passed / 7 skipped**（2026-11-04）；IndexTTS2 step 758 样本上，当前轮
+- 验证：全量 **723 passed / 7 skipped**（2026-11-04）；IndexTTS2 step 758 样本上，当前轮
   content 129,459 → 22,372（节省 107,087），15 条批级指针 + 9 条状态回执指针 + 14 条
   同批短戳，失败/被拒原文保留；
 - 新增测试：`test_plan_step_change_starts_new_batch` /
@@ -365,7 +368,7 @@ H, B1(A(tc n1), T…), B2(A(tc n2), T…), …, A_final
 | 文件 | 改动（`[x]` = 2026-09-10 已核对落地，`[ ]` = 未做） |
 |---|---|
 | `app/agent/state.py` | `[x]` `notes: dict[str, NoteEntry]`（`NoteEntry` 在 `app/schema/agent_schema.py`）；`[ ]` `work_log: list[WorkLogEntry]` |
-| `app/agent/nodes.py` | `[x]` 新增 `CompactNode`（轮末折叠）；`[x]` `ReviewNode` 被拒时回灌带 `decision=denied` 戳的消息；`[ ]` ToolNode 的"意图 + verdict"日志条目；`[ ]` `LLMNode` 注入 `# 会话工作日志` 与 notes 索引（现只注入 提示词/工作区/计划/画像/记忆）；`[x]` 批级压缩 Phase 1（CompressNode 批级分组 + CompactNode 失败块保护，§8.6）；`[x]` 2026-11-04 压缩引擎抽出到 `app/agent/compression/`，本文件只留两个 state 适配器；`[ ]` 轮末刚完成周期 / 统一 planner |
+| `app/agent/nodes/` | `[x]` 新增 `CompactNode`（轮末折叠）；`[x]` `ReviewNode` 被拒时回灌带 `decision=denied` 戳的消息；`[ ]` ToolNode 的"意图 + verdict"日志条目；`[ ]` `LLMNode` 注入 `# 会话工作日志` 与 notes 索引（现只注入 提示词/工作区/计划/画像/记忆）；`[x]` 批级压缩 Phase 1（CompressNode 批级分组 + CompactNode 失败块保护，§8.6）；`[x]` 2026-11-04 压缩引擎抽出到 `app/agent/compression/`，本包只留两个 state 适配器；`[x]` 轮末刚完成周期 / 统一 planner；`[x]` Stage 4：拆成 `app/agent/nodes/` 包 |
 | `app/agent/compression/` | `[x]` 2026-11-04 抽出：`models` / `parser` / `policy` / `planner` / `compact` / `compress`；`[x]` Stage 3：`FoldGroup` / 按组摘要 / 逐调用处置已落地 |
 | `app/agent/tools.py` | `[x]` `read_note`（`InjectedState`，source=`notes`）；`[ ]` `search_notes` / `notes_by_topic` / `list_topics` / `update_note_tags` / `drop_note` |
 | `app/agent/graph.py` | `[x]` `compact_node` 已接线（位置：`llm_node` 无 tool_calls 且超预算 → compact → END，见 §8.1）；`[ ]` 二期回边预算触发 |
@@ -380,7 +383,7 @@ H, B1(A(tc n1), T…), B2(A(tc n2), T…), …, A_final
 
 - **P0（首期）**：`work_log` 结构化双半行 + `denied` 条目；notes 会话级 state dict + `read_note/search` + 懒分类工具；轮边界 `compact_node`；promote 收尾引导。收益最大、风险最低（只在轮界动手）。
   - **进度（2026-09-10 核对）**：`notes` 会话级 dict `[已落地]`、`read_note` `[已落地]`、轮边界 `compact_node` `[已落地]`（位置改在 END 前，见 §8.1）、审批被拒时回灌 `[approval_denied]` 消息 `[已落地]`（但**不是**设计里的 work_log `status=denied` 条目）。**未做**：`work_log`（含 verdict/意图双半行）、`search_notes`/懒分类工具、notes 索引注入、promote 收尾引导。
-- **P1**：同轮超长编排的滚动折叠（§8.1 回边触发），加 `keep_blocks` 保留区压力测试；notes 归档阈值/容量标定。批级压缩 Phase 1（CompressNode 批级分组 + CompactNode 失败块保护）已落地；Phase 2 的 args 清理、刚完成周期折叠、统一 planner 已落地；整块墓碑与软边界仍未做，见 §8.6。
+- **P1**：同轮超长编排的滚动折叠（§8.1 回边触发），加 `keep_blocks` 保留区压力测试；notes 归档阈值/容量标定。批级压缩 Phase 1（CompressNode 批级分组 + CompactNode 失败块保护）已落地；Phase 2 的 args 清理、整块墓碑（默认关闭）、刚完成周期折叠、统一 planner 已落地；软边界仍未做，见 §8.6。
 - **P2（评估接线）**：evaluation 增加"上下文/轮数/token"断言，量化折叠前后达成率与成本；为 §8.4 阈值与"意图半行 token 增量/遵从率"提供实测依据。
 
 ## 11. 开放问题

@@ -478,7 +478,7 @@ docs/CONTEXT_ENGINEERING.md（消息流转改动前必读）、docs/ARCHITECTURE
 "按实测**单次反思收益已足够，先只做一次**"。
 
 **归位**：按 `docs/ARCHITECTURE.md` §4 的判据，这是**图内的一条边/一个节点**（一条 run 内部的
-迭代），不是基座事件 → 落 `app/agent/nodes.py::ReflectNode`，**不进 `app/platform`**。
+迭代），不是基座事件 → 落 `app/agent/nodes/`（计划新增 `reflect.py::ReflectNode`），**不进 `app/platform`**。
 
 **要点（实现前须钉死）**：
 - **插入点**：`llm_node →(有 tool_calls)→ reflect_node → queue_node`。放在 queue **之前**，被否决
@@ -640,7 +640,7 @@ OS / conda / GPU / 系统 ffmpeg 属 ①；磁盘余量、`conda env list` 等�
 与 cap、§5 工具与路径安全不变量、§8 分期）——**注意 §8 的 Phase C 把"跨工作区共享记忆"与
 "分层摘要"列为"明确不做、后续再议"，本条正是把那条提前**；动手前先读该文，别与它的单文件格式 /
 `m1,m2,…` 编号 / "只存工作区里重取不到的结论"这三条既有纪律打架。代码落点：`app/resource/memory.py`
-（读写单点）、`app/resource/paths.py`（落点单点）、`app/agent/nodes.py::LLMNode`（注入点，
+（读写单点）、`app/resource/paths.py`（落点单点）、`app/agent/nodes/llm.py::LLMNode`（注入点，
 `memory_block` 在 `app/resource/memory.py`、`agent_md_block` 在 `app/resource/profile.py`）、
 `app/agent/tools.py`（`write_memory`/`read_memory` 与
 `InjectedWorkspace`）。证据见本文「工具面缺口」与「工作区语义」两条。
@@ -796,7 +796,7 @@ turn，处置（未找到 / 过大>5MB / 超 4 张 / 读取失败）写进正文
 **同时作废（引用的代码已删/早已修，不必再做）**：
 
 - ~~`app/schema/__init__.py` 漏导 `ImageRef` / `SkillPreflight`~~——**早已导出**（`__init__.py:4,10`）；
-- ~~`QueueNode` 空 docstring + 空 `__init__`~~——docstring 已写全（`nodes.py:1014`），且它本就没有 `__init__`；
+- ~~`QueueNode` 空 docstring + 空 `__init__`~~——docstring 已写全（`app/agent/nodes/queue.py`），且它本就没有 `__init__`；
 - ~~`mcp_service/git.py:110` 的 `_get_repos()` 双扫~~——`git.py` 已于 2026-09-15 整体删除；
 - ~~`file_io._resolve_path` ↔ `git._resolve_repo_path` 逐字同构~~——只剩下面那条 `file_io` /
   `mcp.py::_validate_workspace` 的两份近亲。

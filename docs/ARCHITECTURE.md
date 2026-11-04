@@ -97,10 +97,11 @@ LangGraph 擅长的：把"一条 agent run"描述成带状态机、可中断、�
 | `app/agent/tools.py::dispatch_subtasks` | **`mcp_service/dispatch.py`** | 四问第四问（派生独立进程 / 独立 Agent runtime）；memory 则按第三问留在编排工具 |
 
 **顺带定下的两条"单一落点"**（此前形状靠两侧注释互相指认）：`ToolMessage` 的结构化戳由生产端
-（`app/agent/nodes.py` 的 ToolNode / ReviewNode，经 `_tool_stamp`）定义、`compression.parser.tm_status` 只读常量；
+（`app/agent/nodes/tool.py` / `review.py`，经 `_tool_stamp`）定义、`compression.parser.tm_status` 只读常量；
 编排工具返回切片的协议由执行器（`OrchestrateNode` + `_EXTRA_SLICE_KEYS`）定义、`tools.py` 按它写。
-**为什么切片的权威在消费端**：生产者与执行器分居 `nodes.py` / `tools.py`，而 `nodes.py` 刻意不
-import `tools.py`，"权威放生产端"就得造一条反向 import——写成"执行器定义协议、生产端照写"即可。
+**为什么切片的权威在消费端**：生产者与执行器分居 `app/agent/nodes/` / `tools.py`，而
+`app/agent/nodes/` 刻意不 import `tools.py`，"权威放生产端"就得造一条反向 import——写成
+"执行器定义协议、生产端照写"即可。
 
 ### 4.2 文本渲染的落点：受众 / 形状主人 / 消费者数（2026-09-22 定）
 

@@ -93,7 +93,7 @@ resource/
 
 ## 4. 记忆注入（SystemMessage，每轮）`[已落地 2026-09-10]`
 
-在 `LLMNode`（`app/agent/nodes.py`）每轮拼系统消息时，追加一条：
+在 `LLMNode`（`app/agent/nodes/llm.py`）每轮拼系统消息时，追加一条：
 
 ```
 # 长期记忆
