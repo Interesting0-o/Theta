@@ -312,26 +312,31 @@ H, B1(A(tc n1), T…), B2(A(tc n2), T…), …, A_final
   保留最近 K 个 block；默认 `max_batch_chars=8000`、`min_batch_chars=300`；只改
   `ToolMessage.content`；
 - `[x]` `CompactNode` 失败/被拒块保护：块内任一 `ToolMessage` 为 failed/denied 时整块不折；
+- `[x]` 算法修复（2026-11-04，`NODES_REFACTOR_PLAN.md` Stage 1）：逐批压到低水位即停；
+  `max_batch_chars` 成为硬上界（语义切点只落在预算内）；read 去重目标受保护、不再被
+  mask；失败的 plan 调用不改变分组边界；
+- `[ ]` 摘要有容量上界（截断会丢 notes ref，容量与策略待定）；
 - `[ ]` 轮末压刚完成的周期（现状仍折最后一条 Human 之前的旧周期）；
 - `[ ]` 整块墓碑 / `clear_tool_inputs`（Phase 2，args 成本）；
 - `[ ]` `CompactNode` 与 `CompressNode` 统一到 `CycleBatchPlanner`；
 - `[ ]` 关键词/词嵌入软边界（可选实验）；
-- 验证：全量 **695 passed / 7 skipped**；IndexTTS2 step 758 样本上，当前轮 content
-  129,459 → 22,372（节省 107,087），15 条批级指针 + 9 条状态回执指针 + 14 条同批短戳，
-  失败/被拒原文保留；
+- 验证：全量 **705 passed / 7 skipped**（2026-11-04）；IndexTTS2 step 758 样本上，当前轮
+  content 129,459 → 22,372（节省 107,087），15 条批级指针 + 9 条状态回执指针 + 14 条
+  同批短戳，失败/被拒原文保留；
 - 新增测试：`test_plan_step_change_starts_new_batch` /
   `test_mixed_block_masks_only_successful_sibling` / `test_keep_blocks_protects_last_blocks` /
   `test_batch_pointer_lists_same_batch_targets` /
   `test_protected_content_does_not_trigger_batch_mask` /
   `test_budget_cut_prefers_semantic_milestone`；CompactNode 的三条 failed/denied 用例改为
-  “整块保留”。
+  “整块保留”；Stage 1 回归网见 `tests/test_compression_characterization.py`（10 例）。
 
 ## 9. 落地清单（改动面）
 
 | 文件 | 改动（`[x]` = 2026-09-10 已核对落地，`[ ]` = 未做） |
 |---|---|
 | `app/agent/state.py` | `[x]` `notes: dict[str, NoteEntry]`（`NoteEntry` 在 `app/schema/agent_schema.py`）；`[ ]` `work_log: list[WorkLogEntry]` |
-| `app/agent/nodes.py` | `[x]` 新增 `CompactNode`（轮末折叠）；`[x]` `ReviewNode` 被拒时回灌带 `decision=denied` 戳的消息；`[ ]` ToolNode 的"意图 + verdict"日志条目；`[ ]` `LLMNode` 注入 `# 会话工作日志` 与 notes 索引（现只注入 提示词/工作区/计划/画像/记忆）；`[x]` 批级压缩 Phase 1（CompressNode 批级分组 + CompactNode 失败块保护，§8.6）；`[ ]` 轮末刚完成周期 / 统一 planner |
+| `app/agent/nodes.py` | `[x]` 新增 `CompactNode`（轮末折叠）；`[x]` `ReviewNode` 被拒时回灌带 `decision=denied` 戳的消息；`[ ]` ToolNode 的"意图 + verdict"日志条目；`[ ]` `LLMNode` 注入 `# 会话工作日志` 与 notes 索引（现只注入 提示词/工作区/计划/画像/记忆）；`[x]` 批级压缩 Phase 1（CompressNode 批级分组 + CompactNode 失败块保护，§8.6）；`[x]` 2026-11-04 压缩引擎抽出到 `app/agent/compression/`，本文件只留两个 state 适配器；`[ ]` 轮末刚完成周期 / 统一 planner |
+| `app/agent/compression/` | `[x]` 2026-11-04 抽出：`models` / `parser` / `policy` / `planner` / `compact` / `compress`；`[ ]` Stage 3 统一 `FoldGroup` / 按组摘要 / 逐调用处置 |
 | `app/agent/tools.py` | `[x]` `read_note`（`InjectedState`，source=`notes`）；`[ ]` `search_notes` / `notes_by_topic` / `list_topics` / `update_note_tags` / `drop_note` |
 | `app/agent/graph.py` | `[x]` `compact_node` 已接线（位置：`llm_node` 无 tool_calls 且超预算 → compact → END，见 §8.1）；`[ ]` 二期回边预算触发 |
 | `app/agent/prompt.py` | `[x]` tool 轮 content 写一句话工作日志（"工作基调 8"）；`[x]` 折叠语义（"旧输出不会回来、需重取"）；`[ ]` notes/`read_note` 用法与 promote 收尾习惯 |

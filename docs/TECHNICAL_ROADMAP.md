@@ -145,11 +145,12 @@ Git 没有独立 MCP server；Git 操作经 `run_command` 执行。只读 Git �
 
 ### 4.5 上下文折叠
 
-现有 `CompactNode` 是**轮末**机制：消息正文总字符数超过默认 60,000 字符预算时，仅折叠最新用户消息之前、已被后续 AI 消息消费的完整工具调用块；通过 `RemoveMessage` 原位替换旧消息，避免拆开 AI tool call 与其对应的 ToolMessage。
+上下文折叠分两层，引擎在 `app/agent/compression/`，`nodes.py` 只留两个 state 适配器：
 
-联网检索的长正文归档到会话 `notes`，其他工具历史在压缩时丢弃；当前计划单独存在 `current_plan` 并按轮注入，而不依赖计划工具回执一直留在对话历史里。
+- **轮末 `CompactNode`**（无条件运行）：折叠最后一条 Human 之前、已被后续 AI 消息消费的完整工具块；失败/被拒块整块保留，联网正文归档到会话 `notes`，其余折叠即弃；通过 `RemoveMessage` 原位替换，不拆开 AI tool call 与其对应 ToolMessage。
+- **轮内 `CompressNode`**：在当前轮工具循环中做 read_file 去重、批级移动窗口（高水位触发、低水位停止）与状态回执变薄；只改 `ToolMessage.content`，不删消息。
 
-当前机制**不等于完整的长上下文解决方案**：单轮工具循环中不做滚动 compact；历史中的较早用户问答/最终答复也不会按轮归并。预算仍是字符阈值，尚未经过量化校准。
+两者共享 `ToolBlock` 解析与策略表；当前计划单独存在 `current_plan` 并按轮注入，不依赖计划工具回执一直留在历史里。当前机制**不等于完整的长上下文解决方案**：预算仍是字符代理，尚未按 provider 的 token 用量校准；轮末也尚未折叠刚完成的周期。
 
 ### 4.6 技能与动态工具
 
