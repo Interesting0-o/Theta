@@ -18,6 +18,8 @@ from langchain_core.messages import (
 )
 from langgraph.graph.message import add_messages
 
+from app.agent.compression.parser import tm_status
+from app.agent.compression.policy import orchestrate_tools
 from app.agent.nodes import CompactNode, needs_compact
 from app.platform.tool_results import coerce_tool_result
 
@@ -252,17 +254,17 @@ def test_coerce_tool_result_reconstructs_mcp_payload():
 
 
 def test_tm_status_prefers_stamp_over_content():
-    """_tm_status 优先读 additional_kwargs 结构化戳。"""
+    """tm_status 优先读 additional_kwargs 结构化戳。"""
     stamped = ToolMessage(content="成功文案", tool_call_id="c", name="run_command",
                           additional_kwargs={"error_type": "internal_error"})
-    assert CompactNode._tm_status(stamped) == ("failed", "internal_error")
+    assert tm_status(stamped) == ("failed", "internal_error")
 
     denied = ToolMessage(content="随便", tool_call_id="c", name="x",
                          additional_kwargs={"decision": "denied"})
-    assert CompactNode._tm_status(denied) == ("denied", "未执行")
+    assert tm_status(denied) == ("denied", "未执行")
 
     ok = ToolMessage(content="exit=0", tool_call_id="c", name="run_command")
-    assert CompactNode._tm_status(ok) == ("ok", "")
+    assert tm_status(ok) == ("ok", "")
 
 
 def test_needs_compact_budget_boundary():
@@ -304,11 +306,11 @@ def _orchestration_block(name):
 
 def test_orchestrate_tool_set_comes_from_tool_json():
     """编排集合由 tool.json 的 source 派生，不是手写名单。"""
-    node = CompactNode()
-    assert set(ORCHESTRATE_TOOL_NAMES) <= node.orchestrate_tools
-    assert "run_command" not in node.orchestrate_tools
-    assert "read_file" not in node.orchestrate_tools
-    assert "dispatch_subtasks" not in node.orchestrate_tools
+    tools = orchestrate_tools()
+    assert set(ORCHESTRATE_TOOL_NAMES) <= tools
+    assert "run_command" not in tools
+    assert "read_file" not in tools
+    assert "dispatch_subtasks" not in tools
 
 
 @pytest.mark.parametrize("name", ORCHESTRATE_TOOL_NAMES)

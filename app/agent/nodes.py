@@ -2,10 +2,6 @@ import asyncio
 import inspect
 import json
 import logging
-import posixpath
-import shlex
-import time
-from dataclasses import dataclass
 from inspect import signature
 from pathlib import Path
 from typing import Callable
@@ -30,9 +26,22 @@ from app.agent.prompt import (
     handoff_pointer_block,
     workspace_context_block,
 )
-from app.config import TEXT_BUDGET_CHARS, THINKING_MODES, get_settings
-from app.schema.agent_schema import ImageRef, NoteEntry, PlanStep
+from app.config import THINKING_MODES, get_settings
+from app.schema.agent_schema import ImageRef, PlanStep
 from app.schema.approval_schema import GATE_ASK_USER, GATE_TOOL_APPROVAL
+from app.agent.compression import policy as compression_policy
+from app.agent.compression.compact import FOLD_HEADER, plan_compact
+from app.agent.compression.parser import one_line
+from app.agent.compression.compress import (
+    MAX_BATCH_CHARS,
+    MASK_MIN_CHARS,
+    MIN_BATCH_CHARS,
+    READ_DEDUP_MIN_CHARS,
+    TURN_HIGH_WATERMARK_CHARS,
+    TURN_KEEP_BLOCKS,
+    TURN_LOW_WATERMARK_CHARS,
+    TurnCompressor,
+)
 
 # 顶部读一次 settings 是**行为契约**，不是随手一行：它让"缺 .env"在 import 期就响亮报错，而不是
 # 拖到第一次真去建模型时才炸（`app/agent/model.py` 于 2026-09-21 并入本模块，那行随之下移到这里；
@@ -44,17 +53,6 @@ logger = logging.getLogger(__name__)
 
 #----------------------工具调用日志（审核节点逐条输出）----------------------
 
-def _one_line(text: str, limit: int = 120) -> str:
-    """把多行文本**折叠成单行**（所有空白收敛成一个空格）再截断，用于控制台日志的紧凑展示。
-
-    ⚠️ 与 `CompactNode._first_line` **语义不同、刻意不合并**（2026-09-21 审计：两者曾经同名
-    `_short` 但一个折叠空白、一个取首行，读起来极易看错）：本函数要的是"JSON 参数压成一行"
-    （取首行会把参数丢掉一半），那个要的是"取首个非空行当摘要"。
-    """
-    text = " ".join((text or "").split())
-    return text if len(text) <= limit else text[:limit] + "…"
-
-
 def _tool_call_log(tool_call: dict) -> str:
     """把一条待审工具调用渲染成一行日志（工具名 + 紧凑参数）。"""
     name = tool_call.get("name") or "?"
@@ -63,7 +61,7 @@ def _tool_call_log(tool_call: dict) -> str:
         brief = json.dumps(args, ensure_ascii=False, sort_keys=True)
     except TypeError:
         brief = str(args)
-    return f"→ 工具调用: {name}  {_one_line(brief)}"
+    return f"→ 工具调用: {name}  {one_line(brief)}"
 
 #-------------------大模型节点----------------------
 
@@ -440,7 +438,7 @@ class LLMNode:
 #-------------------ToolMessage 的结构化戳（**生产端单点**）-------------------
 # 形状：`additional_kwargs` 里 `{"error_type": <语义标记>}` 或 `{"decision": "denied"}`（首次落地
 # 2026-09-16）。**生产端 = 本模块的 ToolNode / ReviewNode**（全仓只有这两个写出点，且都经
-# `_tool_stamp` 构造）；**消费端 = `CompactNode._tm_status`**（读这两个键）。
+# `_tool_stamp` 构造）；**消费端 = `compression.parser.tm_status`**（读这两个键）。
 #
 # 为什么不把键名/取值做成常量：**它们是字典的键，用变量承接与直接写字面量没有区别**
 # （2026-09-22 用户拍板）——常量该留给"要按值分派或校验"的地方（如 `GATE_*` / `ASK_SELECT_*`）。
@@ -601,9 +599,9 @@ class ReviewNode:
     # 集合 → 进普通工具队列（get_skill 是编排动作，它带来的工具不是）；② `dispatch_subtasks`
     # ——2026-09-21 起它是 `mcp_service/dispatch` 这个 server 的工具（派生 worker = 独立进程
     # 与独立 Agent runtime，四问的第四问），走 ToolNode，**不再进编排队列**。
-    ORCHESTRATE_SOURCES: frozenset[str] = frozenset(
-        {"plan", "notes", "ask", "memory", "events", "skill"}
-    )
+    # 单一来源在 `gates.ORCHESTRATE_SOURCES`（2026-11-04 下移：压缩引擎也要用它，
+    # 而 compression 不能反向 import 本模块）；这里保留同名类属性，便于读者按闸门查。
+    ORCHESTRATE_SOURCES: frozenset[str] = gates.ORCHESTRATE_SOURCES
 
     # 人机闸门的第二种载荷（docs/MULTI_AGENT.md §6）：source=ask 的工具（当前只有 ask_user）
     # **除了走编排执行器，还要在本节点再挂一次 interrupt 向人提问**。分流进编排队列照旧——
@@ -1149,13 +1147,9 @@ class QueueNode:
 
 
 #----------------------轮末压缩（compact_node）----------------------
-# 轮内压缩（CompressNode，下一步）的预算默认值。**轮末 CompactNode 不再使用它**——
-# 2026-10-20 起轮末压缩无条件启用，没有字符预算门；保留本值是为了轮内节点仍有同一个
-# "字符数代理"口径可用（届时按"当前轮"而不是全历史计量）。
+# 轮内压缩的预算默认值。**轮末 CompactNode 不再使用它**——2026-10-20 起轮末压缩无条件
+# 启用，没有字符预算门；保留本值是为了轮内节点仍有同一个"字符数代理"口径可用。
 _CONTEXT_BUDGET_DEFAULT = 60000
-
-# 归档正文截断上限（字符；值归 app/config.py::TEXT_BUDGET_CHARS，与记忆/画像/技能同族一处出处）
-_NOTE_MAX = TEXT_BUDGET_CHARS
 
 
 def needs_compact(state, budget: int) -> bool:
@@ -1169,47 +1163,23 @@ def needs_compact(state, budget: int) -> bool:
 
 
 class CompactNode:
-    """轮末压缩节点（END 前执行）：把更早轮次已消费的旧工具块折叠成一条 SystemMessage。
+    """轮末压缩节点（END 前执行）：`compression.compact` 的 **state 适配器**。
 
-    - **无条件启用**（2026-10-20）：每回合末都运行，没有字符预算门；没有可折块时返回 {}；
-    - 折叠区 = 最后一条 HumanMessage 之前（含更早轮次）；当前轮（Human 及其后）原样保留；
-    - 只折"完整且已消费"的工具块（AIMessage(tool_calls) + 兑现它的全部 ToolMessages；
-      块之后、下一条 Human 之前必须已经出现过 AIMessage），状态据 ToolMessage 判定；
-    - **编排工具不折**：`tool.json` 中 source ∈ {plan, notes, ask, memory, skill} 的工具
-      只操作会话 state（计划快照、提问回答、记忆/技能回执），不是可重取的外部结果——折掉
-      就是误伤。整块都是编排工具 → 整块保留；混合块（编排 + 普通）→ 只折普通调用，保留
-      编排调用及其 ToolMessage，并原位改写 AIMessage 的 tool_calls 子集；
-    - **失败/被拒块不折**：块内任一 `ToolMessage` 为 failed/denied 时整块保留，错误正文
-      不压缩；
-    - 联网四工具的成功正文归档进 notes；
-    - 返回：`SystemMessage(摘要, id=折叠区最早被删消息的 id)` 原位替换 + `RemoveMessage`
-      删除其余被折块（混合块另加一条 AIMessage 改写）——不尾追加，messages 尾部仍是本轮
-      最终答复（main.py 打印不受影响）。
+    引擎产出一个 `FoldPlan`；本节点只做翻译：
 
-    纯确定性逻辑，不调 LLM。压缩的内部纯函数只被本节点使用，故收成静态方法，不外泄。
+    - `SystemMessage(摘要, id=折叠区最早被删消息的 id)` 原位替换；
+    - `RemoveMessage` 删除其余被折块；
+    - `notes` 合并（仅联网四工具的成功正文）；
+    - 混合块里保留编排调用后的 `AIMessage` 副本由 `plan.replaced` 原位写回。
+
+    折叠区 = 最后一条 HumanMessage 之前（含更早轮次）；当前轮原样保留。折叠规则
+    （完整/已消费、编排工具保护、失败/被拒整块保留、联网正文归档）见
+    `app/agent/compression/compact.py`。纯确定性、不调 LLM；没有可折块时返回 `{}`。
     """
-    _FOLD_HEADER = "# 历史工具记录（已折叠）"
-    # **回退路径**用的 content 前缀表：只服务"戳落地前写进 checkpoint 的旧消息"。
-    # 取值必须与生产端的 `error_type` 一致（`mcp_service/utils.py::guard` 的分类 + 各 server
-    # 手写的 io_error）。`ConfigError` 经 `_type_token` 去 "Error" 后缀 → `config`（**不是**
-    # config_error——2026-09-21 核对时发现旧表这一项从来没匹配上过）。
-    _FAIL_PREFIXES: tuple[str, ...] = (
-        "[approval_denied]", "[workspace_violation]", "[io_error]", "[internal_error]",
-        "[invalid_argument]", "[config]",
-    )
-    # 进笔记区的工具：仅联网四件套——其结果花钱、不可免费重取（时效性/可重取性判据）；
-    # 其余工具（文件读/命令输出/git/终端）结果时效强、重取便宜，折叠即弃、绝不进笔记。
-    ARCHIVE_TOOLS: frozenset[str] = frozenset(
-        {"web_search", "extract_urls", "crawl_website", "deep_research"}
-        )
 
     def __init__(self) -> None:
-        """编排工具集合从 tool.json 的 source 派生（策略单点：gates.tool_config）。"""
-        self.orchestrate_tools = frozenset(
-            name
-            for name, conf in gates.tool_config().items()
-            if conf.get("source") in ReviewNode.ORCHESTRATE_SOURCES
-        )
+        """编排工具集合从 tool.json 的 source 派生（策略单点：compression.policy）。"""
+        self._orchestrate_tools = compression_policy.orchestrate_tools()
 
     async def __call__(self, state: AgentState) -> dict | AgentState:
         messages = list(state.get("messages") or [])
@@ -1217,278 +1187,21 @@ class CompactNode:
             return {}
 
         notes = dict(state.get("notes") or {})
-        removed, lines, additions, replaced = self._plan(messages, notes)
-        if not removed or not lines:
+        plan = plan_compact(messages, notes, self._orchestrate_tools)
+        if not plan.removed or not plan.summary_lines:
             return {}
 
-        summary = CompactNode._FOLD_HEADER + "\n" + "\n".join(lines)
-        anchor = removed[0]
+        summary = FOLD_HEADER + "\n" + "\n".join(plan.summary_lines)
+        anchor = plan.removed[0]
         updates: list = [SystemMessage(content=summary, id=anchor.id)]
-        updates += replaced
-        updates += [RemoveMessage(id=m.id) for m in removed[1:] if getattr(m, "id", None)]
+        updates += plan.replaced
+        updates += [RemoveMessage(id=m.id) for m in plan.removed[1:] if getattr(m, "id", None)]
 
         result: dict = {"messages": updates}
-        if additions:
-            notes.update(additions)
+        if plan.archived_notes:
+            notes.update(plan.archived_notes)
             result["notes"] = notes
         return result
-
-    # ---------- 压缩内部纯函数（只被本节点单方使用 → 静态方法，保证职责单一） ----------
-
-    @staticmethod
-    def _tm_status(message) -> tuple[str, str]:
-        """从一条 ToolMessage 判定其工具块状态。
-
-        优先读 additional_kwargs 的结构化戳（键与构造器由生产端单点给出：ToolNode / ReviewNode
-        经 `_tool_stamp` 写，见本节顶部的说明）：
-        - decision=denied → denied（未执行）；
-        - error_type=… → failed（该类型）。
-        未挂戳的旧消息再回退解析 content 前缀（[approval_denied] / [error_type]…）。
-        判定只信工具回执，绝不信模型 content。
-        """
-        extra = getattr(message, "additional_kwargs", None) or {}
-        if extra.get("decision") == "denied":
-            return "denied", "未执行"
-        error_type = extra.get("error_type")
-        if error_type:
-            return "failed", str(error_type)
-
-        # 回退：解析 content 前缀（兼容戳落地前 checkpoint 里的历史消息）
-        text = str(getattr(message, "content", "") or "").strip()
-        if not text:
-            return "ok", ""
-        if text.startswith("[approval_denied]"):
-            return "denied", "未执行"
-        for tag in CompactNode._FAIL_PREFIXES[1:]:
-            if text.startswith(tag):
-                return "failed", tag.strip("[]")
-        if text.startswith(("工具不存在或未注册", "工具执行失败", "工具返回格式非法")):
-            return "failed", CompactNode._first_line(text, 60)
-        return "ok", ""
-
-    @staticmethod
-    def _render_line(reason: str, tool: str, status: str, detail: str = "", note_ref: str = "") -> str:
-        """拼一条摘要行：工作日志 → 工具调用 → 状态（→ 详情见 notes）。"""
-        parts: list[str] = []
-        if reason:
-            parts.append(f"工作日志: {reason}")
-        if tool:
-            parts.append(f"工具调用: {tool}")
-        state_part = f"状态: {status}"
-        if detail:
-            state_part += f"（{detail}）"
-        parts.append(state_part)
-        line = " | ".join(parts)
-        if note_ref:
-            line += f" | 详情见 {note_ref}"
-        return line
-
-    @staticmethod
-    def _reason_of(ai) -> str:
-        """取块内 AIMessage 的 content（prompt 引导模型写成一句话工作日志），非 str 视为空。"""
-        content = getattr(ai, "content", None)
-        return content.strip() if isinstance(content, str) else ""
-
-    @staticmethod
-    def _is_consumed(region: list, start: int) -> bool:
-        """块之后、下一条 HumanMessage 之前是否已出现 AIMessage。
-
-        "已消费"= 模型已经对这批工具结果作出过反应（CONTEXT_ENGINEERING §3 不变量 2）。
-        只扫到折叠区末尾（最后一条 Human 之前）：
-        - 更早的轮次会先撞到下一条 Human → False（该轮以 ToolMessage 收尾，模型没反应过）；
-        - 当前轮（最后一条 Human 及其后）本就不在 region 里。
-        """
-        for message in region[start:]:
-            if isinstance(message, HumanMessage):
-                return False
-            if isinstance(message, AIMessage):
-                return True
-        return False
-
-    @staticmethod
-    def _first_line(text: str, limit: int) -> str:
-        """取首个非空行并截断——摘要行 detail 与 notes 标题共用（2026-09-21 前是两份逐字相同的
-        拷贝，只有默认 limit 不同：60 / 80）。`limit` 由调用点显式给，不再各带一个默认值。
-        """
-        line = next((ln.strip() for ln in (text or "").splitlines() if ln.strip()), "")
-        return line if len(line) <= limit else line[:limit] + "…"
-
-    @staticmethod
-    def _new_note_ref(notes: dict) -> tuple[str, int]:
-        """下一个笔记 key（notes#r<n>）与其编号，取现有 key 最大号 +1。"""
-        max_n = 0
-        for key in notes:
-            if isinstance(key, str) and key.startswith("notes#r"):
-                try:
-                    max_n = max(max_n, int(key[len("notes#r"):]))
-                except ValueError:
-                    pass
-        return f"notes#r{max_n + 1}", max_n + 1
-
-    def _plan(
-        self, messages: list, notes: dict
-    ) -> tuple[list, list[str], dict[str, NoteEntry], list[AIMessage]]:
-        """扫描消息，决定折叠哪些"更早轮次、已消费的完整工具块"，并生成摘要行与新增 notes。
-
-        返回 (removed, summary_lines, archived, replaced)：
-        - removed：可删除的消息，按消息顺序排列，removed[0] 即折叠区最早被删消息
-          （将作为 SystemMessage 原位替换锚点）。整块折叠时含 AIMessage(tool_calls) +
-          兑现它的 ToolMessages；混合块只含被折的普通 ToolMessages；
-        - summary_lines：每个**被折** tool_call 一行（reason · 工具 · 状态 · 指向）；
-        - archived：本次新增的 notes（key=notes#r<n>，仅联网四工具的成功正文）；
-        - replaced：混合块里保留编排调用后的 AIMessage 副本（tool_calls 只留编排调用），
-          由调用方原位写回；整块折叠 / 整块保留时为空。
-
-        不折叠：无 tool_calls 的 AIMessage（答复）、Human、SystemMessage、块不完整（有悬空
-        call）、块内消息缺稳定 id、块未被消费（块后、下一条 Human 前没有 AIMessage）、
-        整块都是编排工具、以及折叠区为空（单轮会话）。
-        """
-        # 锚点 = 最后一条 HumanMessage；它及其后（当前轮）原样保留，只折更早轮次
-        anchor = -1
-        for i, m in enumerate(messages):
-            if isinstance(m, HumanMessage):
-                anchor = i
-        if anchor <= 0:
-            return [], [], {}, []
-        region = messages[:anchor]
-
-        removed: list = []
-        lines: list[str] = []
-        archived: dict[str, NoteEntry] = {}
-        replaced: list[AIMessage] = []
-        ref_num: int | None = None  # 首次归档时初始化为现有最大号 +1
-
-        i = 0
-        n = len(region)
-        while i < n:
-            m = region[i]
-            if not (isinstance(m, AIMessage) and getattr(m, "tool_calls", None)):
-                i += 1
-                continue
-
-            call_ids = [tc.get("id") for tc in m.tool_calls if isinstance(tc, dict)]
-            block: list = [m]
-            claimed: dict[str, ToolMessage] = {}
-            j = i + 1
-            # 收集紧随其后、兑现本块各 tool_call 的 ToolMessage
-            while j < n:
-                nxt = region[j]
-                if (
-                    isinstance(nxt, ToolMessage)
-                    and nxt.tool_call_id in call_ids
-                    and nxt.tool_call_id not in claimed
-                ):
-                    claimed[nxt.tool_call_id] = nxt
-                    block.append(nxt)
-                    j += 1
-                else:
-                    break
-            i = j  # 游标越过本块 ToolMessage 段
-
-            complete = (
-                len(claimed) == len(call_ids)
-                and all(cid is not None for cid in call_ids)
-                and all(isinstance(tc, dict) for tc in m.tool_calls)
-            )
-            # 原位替换要求每条待删消息都有稳定 id（生产 add_messages 自动赋 uuid）；
-            # 块还必须已被模型消费——折掉模型还没看过的工具结果，等于从历史里抽走它。
-            if not (
-                complete
-                and all(getattr(b, "id", None) for b in block)
-                and CompactNode._is_consumed(region, j)
-            ):
-                continue
-
-            # 编排工具只动 state（计划/提问/记忆/技能回执），不是可重取的外部结果：
-            # 整块都是编排工具 → 原样保留；混合块 → 只折普通调用，保留编排调用与回执。
-            kept_calls = [
-                tc
-                for tc in m.tool_calls
-                if (tc.get("name") or "").strip() in self.orchestrate_tools
-            ]
-            folded_calls = [
-                tc
-                for tc in m.tool_calls
-                if (tc.get("name") or "").strip() not in self.orchestrate_tools
-            ]
-            if not folded_calls:
-                continue
-
-            # 失败/被拒块不折：错误正文必须原样留在历史里（§8.3 不变量）。
-            folded_status = [
-                CompactNode._tm_status(claimed.get(tc.get("id")))[0]
-                for tc in folded_calls
-                if claimed.get(tc.get("id")) is not None
-            ]
-            if any(status in {"failed", "denied"} for status in folded_status):
-                continue
-
-            # 混合块里摘要 SystemMessage 会顶替第一条被折的普通 ToolMessage。为保持
-            # AIMessage(tool_calls) → ToolMessage 的邻接关系，要求编排回执全部排在
-            # 普通回执之前（生产路径恒成立：OrchestrateNode 先跑、ToolNode 后跑）；
-            # 顺序不满足就整块不折，宁可少压也不产生非法消息序列。
-            kept_ids = {tc.get("id") for tc in kept_calls}
-            folded_ids = {tc.get("id") for tc in folded_calls}
-            if kept_calls:
-                last_kept = max(
-                    (
-                        index
-                        for index, item in enumerate(block)
-                        if isinstance(item, ToolMessage) and item.tool_call_id in kept_ids
-                    ),
-                    default=-1,
-                )
-                first_folded = min(
-                    (
-                        index
-                        for index, item in enumerate(block)
-                        if isinstance(item, ToolMessage) and item.tool_call_id in folded_ids
-                    ),
-                    default=len(block),
-                )
-                if first_folded < last_kept:
-                    continue
-
-            reason = CompactNode._reason_of(m)
-            for tc in folded_calls:
-                name = (tc.get("name") or "").strip()
-                tm = claimed.get(tc.get("id"))  # type: ignore
-                status, detail = CompactNode._tm_status(tm) if tm is not None else ("ok", "")
-
-                note_ref = ""
-                # 仅联网四工具的成功正文进笔记区（其余工具结果时效强、可重取，折叠即弃）
-                if name in CompactNode.ARCHIVE_TOOLS and status == "ok" and tm is not None:
-                    content = str(tm.content or "").strip()
-                    if content and not content.startswith("["):
-                        if ref_num is None:
-                            _, ref_num = CompactNode._new_note_ref(notes)
-                        ref = f"notes#r{ref_num}"
-                        content_cap = content if len(content) <= _NOTE_MAX else content[:_NOTE_MAX] + "…"
-                        archived[ref] = {
-                            "title": CompactNode._first_line(content, 80),
-                            "source_tool": name,
-                            "content": content_cap,
-                            "created": int(time.time()),
-                            "size": len(content),
-                        }
-                        note_ref = ref
-                        ref_num += 1
-
-                lines.append(CompactNode._render_line(reason, name, status, detail, note_ref))
-
-            block_removed = [
-                b
-                for b in block
-                if isinstance(b, ToolMessage) and b.tool_call_id in folded_ids
-            ]
-            if not kept_calls:
-                block_removed.insert(0, m)
-            removed.extend(block_removed)
-            if kept_calls:
-                # 原位改写 AIMessage：只留编排调用的 tool_calls，普通调用的回执被删。
-                replaced.append(m.model_copy(update={"tool_calls": kept_calls}))
-
-        return removed, lines, archived, replaced
 
 
 #----------------------轮内压缩（compress_node）----------------------
@@ -1496,815 +1209,43 @@ class CompactNode:
 #   CompactNode  : messages[:last_human_index]        旧轮，轮末无条件执行
 #   CompressNode : messages[last_human_index + 1:]    当前轮，工具循环中执行
 # 轮内**不删消息**：图路由中间删掉结果会破坏 tool_call / ToolMessage 配对与调用方状态，
-# 因此只改 ToolMessage.content。当前规则：
-#   1) 同一轮内对同一文件的重复 read_file：**最后一次成功读取为准**，其余换成指向它的指针
-#      （不看正文是否相同——文件随时可能被编辑，旧结果已经过期）；
-#   2) 可压 ToolMessage 正文超过**高水位**时，按批压缩到**低水位**：硬边界 → plan step →
-#      step 内语义子边界（里程碑/成功失败转换/进程/写操作）→ 预算兜底。批内只压 eligible
-#      的成功结果；失败/被拒、受保护工具、写回执、未消费块保持原文；保留最近 K 个 block；
-#   3) 编排/state 回执（plan / memory / skill）只留最近一条，其余压成一行指针
-#      （current_plan 与 RUNTIME_STATE 已是权威）。
-# 这是**滞回**压缩：一次压一批、之后若干调用保持前缀命中；低于高水位时不做任何事。
-# 语义优先于预算：预算到达上限时先在 ±20% 容差内找最近的语义切点，找不到才硬切。
-# **终端输出的中间截断已下沉到 terminal MCP 自己**（mcp_service/terminal.py::
-# _compress_output）：写在消息落地之前，消息从第一次进入 state 就是最终形态，节点不再
-# 事后改写它。旧轮的整块折叠仍归 CompactNode。
-
-# read_file 去重的最小正文长度：被替换的旧正文太短时，指针和正文差不多，不值得换。
-_READ_DEDUP_MIN_CHARS = 1000
-# 轮内移动窗口的默认水位（当前轮**可压 ToolMessage 正文**字符数）。高水位触发、
-# 低水位停止；滞回避免每拍都改前缀、打碎 prompt cache。阈值不含稳定前缀、AI 参数与
-# 受保护/失败/写回执——那些不是可压池，压不动也不该压。
-_TURN_HIGH_WATERMARK_CHARS = 50000
-_TURN_LOW_WATERMARK_CHARS = 25000
-# 默认保留最近 K 个 block；再旧的才压。按 block 而不是按消息，避免“一个块里多条结果”
-# 让保留量随工具数漂移。
-_TURN_KEEP_BLOCKS = 8
-# 单个批的上下界：低于 min 指针不划算；高于 max 一次改写的影响面太大。
-_MAX_BATCH_CHARS = 8000
-_MIN_BATCH_CHARS = 300
-# 被压正文的最小长度：太短的正文压成指针不省，反而多一行噪声。
-_MASK_MIN_CHARS = 300
-# 状态回执：每个工具只保留最近一条；旧回执的内容已由 current_plan / RUNTIME_STATE 承载。
-_STATE_RECEIPT_TOOLS = frozenset({
-    "create_plan", "update_plan_step", "clear_plan",
-    "read_memory", "write_memory", "get_skill", "drop_skill",
-})
-# 写操作回执：Phase 1 保持原文（写文件的正文在 tool_call args 里，Phase 2 再处理）。
-_WRITE_TOOLS = frozenset({
-    "write_file", "edit_file", "create_file", "create_dir",
-    "delete_file", "delete_dir", "copy_path",
-})
-# 不进移动窗口的工具：
-# - web 四件套：正文由 CompactNode 在轮末归档进 notes，轮内压掉等于丢研究原料；
-# - ask_user：用户决定，必须保留；
-# - dispatch_subtasks：worker 结论本身就是"结论"，不是可重取的 dump；
-# - 写操作回执：Phase 1 保持原文。
-_NO_MASK_TOOLS = frozenset({
-    "web_search", "extract_urls", "crawl_website", "deep_research",
-    "ask_user", "dispatch_subtasks",
-}) | _STATE_RECEIPT_TOOLS | _WRITE_TOOLS
-
-
-@dataclass
-class _ToolCallInfo:
-    """一个 tool_call 及其兑现的 ToolMessage（批级压缩的最小观测）。"""
-
-    call_id: str | None
-    name: str
-    args: dict
-    tool_message: ToolMessage | None
-    status: str
-    eligible: bool = False
-
-
-@dataclass
-class _ToolBlock:
-    """结构原子：AIMessage(tool_calls) + 兑现它的全部 ToolMessage。"""
-
-    ai_message: AIMessage
-    calls: list[_ToolCallInfo]
-    start: int
-    end: int
-    complete: bool
-    ids_ok: bool
-    consumed: bool
-    plan_epoch: int
-    step_id: str | None
-    milestone: bool
-    eligible_chars: int = 0
-
-
-def _in_progress_step(plan) -> str | None:
-    """从 current_plan 取 in_progress 的 step id；没有返回 None。"""
-    for step in plan or []:
-        if isinstance(step, dict) and step.get("status") == "in_progress":
-            step_id = step.get("id")
-            return str(step_id) if step_id is not None else None
-    return None
-
-
-def _iter_tool_blocks(messages, initial_plan=None) -> tuple[list[_ToolBlock], list[int]]:
-    """把消息序列解析成 tool-call block，并记录工具块之外的消息位置。
-
-    plan step 从 `create_plan` / `update_plan_step` / `clear_plan` 的调用历史重建：
-    `create_plan` 开启新 epoch；`in_progress` 把 block 归到新 step；`done` / `pending`
-    只结束当前 step。`step=None` 是合法段（模型还没声明 step 或已 clear）。
-    """
-    blocks: list[_ToolBlock] = []
-    boundaries: list[int] = []
-    plan_epoch = 0
-    active_step = _in_progress_step(initial_plan)
-    i = 0
-    n = len(messages)
-    while i < n:
-        message = messages[i]
-        kind = type(message).__name__
-        if kind != "AIMessage" or not getattr(message, "tool_calls", None):
-            boundaries.append(i)
-            i += 1
-            continue
-
-        calls = list(message.tool_calls)
-        call_ids = [call.get("id") for call in calls if isinstance(call, dict)]
-        claimed: dict[str, ToolMessage] = {}
-        j = i + 1
-        while j < n and type(messages[j]).__name__ == "ToolMessage":
-            tool_message = messages[j]
-            call_id = getattr(tool_message, "tool_call_id", None)
-            if call_id in call_ids and call_id not in claimed:
-                claimed[call_id] = tool_message
-                j += 1
-            else:
-                break
-
-        step_before = active_step
-        new_step = None
-        for call in calls:
-            if not isinstance(call, dict):
-                continue
-            name = (call.get("name") or "").strip()
-            args = call.get("args") if isinstance(call.get("args"), dict) else {}
-            if name == "create_plan":
-                plan_epoch += 1
-                active_step = None
-                new_step = None
-            elif name == "update_plan_step":
-                step_id = args.get("step_id")
-                step_id = str(step_id) if step_id is not None else None
-                status = args.get("status")
-                if status == "in_progress":
-                    active_step = step_id
-                    new_step = step_id
-                elif status in {"done", "pending"} and active_step == step_id:
-                    active_step = None
-            elif name == "clear_plan":
-                active_step = None
-
-        call_infos: list[_ToolCallInfo] = []
-        for call in calls:
-            if not isinstance(call, dict):
-                continue
-            call_id = call.get("id")
-            tool_message = claimed.get(call_id) if call_id else None
-            status = CompactNode._tm_status(tool_message)[0] if tool_message is not None else "missing"
-            call_infos.append(
-                _ToolCallInfo(
-                    call_id=call_id,
-                    name=(call.get("name") or "").strip() or "?",
-                    args=call.get("args") if isinstance(call.get("args"), dict) else {},
-                    tool_message=tool_message,
-                    status=status,
-                )
-            )
-
-        complete = (
-            len(claimed) == len(call_ids)
-            and all(call_id is not None for call_id in call_ids)
-            and all(isinstance(call, dict) for call in calls)
-        )
-        ids_ok = all(getattr(m, "id", None) for m in [message, *claimed.values()])
-        consumed = False
-        for k in range(j, n):
-            if type(messages[k]).__name__ == "HumanMessage":
-                break
-            if type(messages[k]).__name__ == "AIMessage":
-                consumed = True
-                break
-        milestone = any(
-            call.name in _WRITE_TOOLS
-            or call.name in {"start_process", "process_kill", "update_plan_step", "create_plan", "clear_plan"}
-            or call.status in {"failed", "denied"}
-            for call in call_infos
-        )
-        blocks.append(
-            _ToolBlock(
-                ai_message=message,
-                calls=call_infos,
-                start=i,
-                end=j - 1,
-                complete=complete,
-                ids_ok=ids_ok,
-                consumed=consumed,
-                plan_epoch=plan_epoch,
-                step_id=new_step if new_step is not None else step_before,
-                milestone=milestone,
-            )
-        )
-        i = j
-    return blocks, boundaries
-
-
+# 因此只改 ToolMessage.content。算法与阈值见 `app/agent/compression/compress.py`。
 class CompressNode:
-    """轮内压缩节点（`tool_node` / `orchestrate_node` → `llm_node` 的边上执行）。
+    """轮内压缩节点：`compression.compress.TurnCompressor` 的 **state 适配器**。
 
-    职责边界（与 `CompactNode` 分工）：
-
-    - **只看当前轮**：最后一条 HumanMessage 之后；`last_human` 之前一律不动；
-    - **read_file 同文件只留最新**：同一轮内、同一路径的多次成功读取，**最后一次成功
-      读取**保留正文，其余（正文不短于 `read_dedup_min_chars` 的）换成
-      `…[重复读取] 同一文件以 tool_call_id=<最后一次成功读取> 为准…`。
-      判据是 tool_call 的 `path`，**不再要求正文相同**：文件在两次读取之间被编辑或外部
-      修改时，旧正文已经过期，留着反而误导。带行区间的读取只有在"最后一次覆盖旧读取的
-      范围"时才替换（全文请求只与全文请求互替），避免把没读到的行当成已省略；
-    - **批级移动窗口**：当前轮可压 ToolMessage 正文超过 `high_watermark_chars` 时，把
-      **已消费的旧成功结果**按批压成一条批级时间线 + 同批短戳，压到
-      `low_watermark_chars` 以下。保留最近 `keep_blocks` 个 block、所有失败/被拒、
-      `ask_user` 回答、以及未消费的最新 block。批的切点优先取 plan step / 语义里程碑，
-      预算（`max_batch_chars`）只作最后的安全上界。只改 content，不删消息；
-    - **状态回执变薄**：`create_plan` / `update_plan_step` / `clear_plan` / `read_memory` /
-      `write_memory` / `get_skill` / `drop_skill` 每个工具只保留最近一条回执，其余压成一行
-      （`current_plan` 与 RUNTIME_STATE 已是权威）；
-    - **终端输出不在这里做截断**（2026-10-20 起）：`mcp_service/terminal.py` 在返回前用
-      `_compress_output()` 做中间截断；本节点只在结果变旧后做指针化；
-    - **只改 `ToolMessage.content`**：消息本身（id / tool_call_id / name /
-      additional_kwargs / artifact）原样保留，因此不会拆断 tool_call 配对，也不增删消息；
-    - **幂等**：已带 `…[重复读取]` / `…[已压缩]` 标记的消息不再处理；
-    - **不调 LLM**，纯确定性；没有需要压缩的消息时返回 `{}`。
+    引擎负责当前轮的三件事（细节见引擎模块 docstring）：read_file 去重指针化、批级
+    移动窗口、状态回执变薄。本节点只把引擎返回的 ToolMessage 替换按原顺序写回 state；
+    不增删消息、不改 tool_call 配对、不调 LLM。
 
     状态（2026-10-20）：已接进主图（`tool_node` / `orchestrate_node` → `compress_node`
     → `llm_node`）；worker 子图不带本节点。
     """
 
-    # read_file 去重：只处理这一种工具；指针里用最后一次的 tool_call_id 定位正文。
-    READ_DEDUP_TOOL = "read_file"
-    DEDUP_MARKER_PREFIX = "…[重复读取]"
-    # 移动窗口的指针标记；幂等判定同时认这两个前缀。
-    MASK_MARKER_PREFIX = "…[已压缩]"
-
     def __init__(
         self,
-        read_dedup_min_chars: int = _READ_DEDUP_MIN_CHARS,
-        high_watermark_chars: int = _TURN_HIGH_WATERMARK_CHARS,
-        low_watermark_chars: int = _TURN_LOW_WATERMARK_CHARS,
-        keep_blocks: int = _TURN_KEEP_BLOCKS,
-        mask_min_chars: int = _MASK_MIN_CHARS,
-        max_batch_chars: int = _MAX_BATCH_CHARS,
-        min_batch_chars: int = _MIN_BATCH_CHARS,
+        read_dedup_min_chars: int = READ_DEDUP_MIN_CHARS,
+        high_watermark_chars: int = TURN_HIGH_WATERMARK_CHARS,
+        low_watermark_chars: int = TURN_LOW_WATERMARK_CHARS,
+        keep_blocks: int = TURN_KEEP_BLOCKS,
+        mask_min_chars: int = MASK_MIN_CHARS,
+        max_batch_chars: int = MAX_BATCH_CHARS,
+        min_batch_chars: int = MIN_BATCH_CHARS,
     ) -> None:
-        """`read_dedup_min_chars`：被替换的旧 read_file 正文不短于它才指针化。
-
-        `high/low_watermark_chars`：可压 ToolMessage 正文的高/低水位（字符数）；
-        `keep_blocks`：保留最近 K 个 block；`mask_min_chars`：单条被压正文的最小长度；
-        `max_batch_chars` / `min_batch_chars`：单个批的上下界（语义切点优先，预算是兜底）。
-        """
-        if read_dedup_min_chars < 1:
-            raise ValueError("read_dedup_min_chars 至少为 1")
-        if not 0 < low_watermark_chars < high_watermark_chars:
-            raise ValueError("low_watermark_chars 必须大于 0 且小于 high_watermark_chars")
-        if keep_blocks < 0:
-            raise ValueError("keep_blocks 不能为负")
-        if mask_min_chars < 1:
-            raise ValueError("mask_min_chars 至少为 1")
-        if min_batch_chars < 1:
-            raise ValueError("min_batch_chars 至少为 1")
-        if max_batch_chars < min_batch_chars:
-            raise ValueError("max_batch_chars 不能小于 min_batch_chars")
-        self.read_dedup_min_chars = read_dedup_min_chars
-        self.high_watermark_chars = high_watermark_chars
-        self.low_watermark_chars = low_watermark_chars
-        self.keep_blocks = keep_blocks
-        self.mask_min_chars = mask_min_chars
-        self.max_batch_chars = max_batch_chars
-        self.min_batch_chars = min_batch_chars
+        """参数语义与校验见 `TurnCompressor.__init__`（本节点只做透传）。"""
+        self._engine = TurnCompressor(
+            read_dedup_min_chars=read_dedup_min_chars,
+            high_watermark_chars=high_watermark_chars,
+            low_watermark_chars=low_watermark_chars,
+            keep_blocks=keep_blocks,
+            mask_min_chars=mask_min_chars,
+            max_batch_chars=max_batch_chars,
+            min_batch_chars=min_batch_chars,
+        )
 
     async def __call__(self, state: AgentState) -> dict | AgentState:
         messages = list(state.get("messages") or [])
         if not messages:
             return {}
 
-        anchor = self._last_human_index(messages)
-        if anchor < 0:
-            return {}
-
-        region_start = anchor + 1
-        args_by_call = self._read_args_by_call(messages, region_start)
-
-        # id → 替换后的 ToolMessage；后面的规则按 id 覆盖，最终按原消息顺序写回。
-        by_id: dict[str, ToolMessage] = {}
-        for message in self._dedupe_reads(messages, region_start, args_by_call):
-            by_id[message.id] = message
-
-        # 状态回执变薄仍按“当前轮总 content”触发：它不计入可压池，但旧回执会一直重放。
-        turn_chars = self._turn_chars(messages, region_start)
-        if turn_chars > self.high_watermark_chars:
-            projected = turn_chars - self._saved(messages, by_id)
-            if projected > self.low_watermark_chars:
-                for message in self._slim_state_receipts(
-                    messages, region_start, args_by_call, by_id, projected
-                ):
-                    by_id[message.id] = message
-
-        # 批级压缩只看“可压 ToolMessage 正文”；先把去重/回执替换应用到工作副本。
-        working = [by_id.get(getattr(message, "id", None), message) for message in messages]
-        blocks, boundaries = _iter_tool_blocks(working, state.get("current_plan") or [])
-        region_blocks = [block for block in blocks if block.start >= region_start]
-        self._mark_eligibility(region_blocks)
-
-        compressible = sum(block.eligible_chars for block in region_blocks)
-        if compressible > self.high_watermark_chars:
-            plan_blocks = region_blocks[: max(0, len(region_blocks) - self.keep_blocks)]
-            for batch in self._plan_batches(plan_blocks, boundaries):
-                for message in self._mask_batch(batch):
-                    by_id[message.id] = message
-
-        if not by_id:
-            return {}
-        ordered = [
-            by_id[message.id]
-            for message in messages[region_start:]
-            if getattr(message, "id", None) in by_id
-        ]
-        return {"messages": ordered}
-
-    # ---------- 区域 / 预算 ----------
-
-    @staticmethod
-    def _last_human_index(messages: list) -> int:
-        """当前轮起点：最后一条 HumanMessage 的下标；没有则 -1。"""
-        for index in range(len(messages) - 1, -1, -1):
-            if isinstance(messages[index], HumanMessage):
-                return index
-        return -1
-
-    @staticmethod
-    def _turn_chars(messages: list, region_start: int) -> int:
-        """当前轮消息 content 的字符总数（压缩预算的计量口径）。"""
-        return sum(
-            len(str(getattr(message, "content", "") or ""))
-            for message in messages[region_start:]
-        )
-
-    @staticmethod
-    def _saved(messages: list, by_id: dict[str, ToolMessage]) -> int:
-        """已生成的替换相对原文节省的字符数（负节省按 0 计）。"""
-        original = {m.id: m for m in messages if getattr(m, "id", None)}
-        total = 0
-        for mid, new in by_id.items():
-            old = original.get(mid)
-            if old is None:
-                continue
-            before = len(str(getattr(old, "content", "") or ""))
-            after = len(str(getattr(new, "content", "") or ""))
-            total += max(0, before - after)
-        return total
-
-    def _mark_eligibility(self, blocks: list[_ToolBlock]) -> None:
-        """按 ToolMessage 逐条标记可压性；block 只提供结构/消费/配对约束。
-
-        失败/被拒、受保护工具（web/ask/dispatch/state）、写回执、未消费块、不完整块
-        与已带压缩标记的消息都不参与批级 mask；同一 block 里的其它成功结果仍可压。
-        """
-        for block in blocks:
-            block.eligible_chars = 0
-            block_ok = block.complete and block.ids_ok and block.consumed
-            for call in block.calls:
-                call.eligible = False
-                tool_message = call.tool_message
-                if not block_ok or tool_message is None or call.status != "ok":
-                    continue
-                content = tool_message.content
-                if not isinstance(content, str):
-                    continue
-                if (
-                    call.name not in _NO_MASK_TOOLS
-                    and getattr(tool_message, "id", None)
-                    and len(content) >= self.mask_min_chars
-                    and not self._is_marked(content)
-                ):
-                    call.eligible = True
-                    block.eligible_chars += len(content)
-
-    @staticmethod
-    def _has_later_ai(region: list, index: int) -> bool:
-        """这条消息之后、下一条 Human 之前是否已出现 AIMessage（是否已被模型消费）。"""
-        for message in region[index + 1:]:
-            if isinstance(message, AIMessage):
-                return True
-            if isinstance(message, HumanMessage):
-                return False
-        return False
-
-    def _is_marked(self, content: str) -> bool:
-        return (
-            self.DEDUP_MARKER_PREFIX in content
-            or self.MASK_MARKER_PREFIX in content
-        )
-
-    # ---------- read_file 重复读取：最后一次留正文，其余变指针 ----------
-
-    @staticmethod
-    def _read_args_by_call(messages: list, region_start: int) -> dict[str, dict]:
-        """当前轮 tool_call_id → 调用参数（read_file 的 path 用来确认"同一个文件"）。"""
-        args_by_call: dict[str, dict] = {}
-        for message in messages[region_start:]:
-            if not isinstance(message, AIMessage):
-                continue
-            for call in getattr(message, "tool_calls", None) or []:
-                if isinstance(call, dict) and call.get("id"):
-                    args = call.get("args")
-                    args_by_call[call["id"]] = args if isinstance(args, dict) else {}
-        return args_by_call
-
-    def _dedupe_reads(
-        self,
-        messages: list,
-        region_start: int,
-        args_by_call: dict[str, dict],
-    ) -> list[ToolMessage]:
-        """同一轮内同一文件的多次 read_file：最后一次成功读取留正文，其余换成指针。
-
-        与旧实现的区别：**不再比较正文**。文件是随时可能变的资源，内容相同只是巧合；
-        真正可信的是时间上最后一次读取。失败/被拒的读取不参与替换（既不当目标，也不被替换），
-        避免把一个错误回执当成"最新内容"。
-
-        带行区间时加一道覆盖检查：最后一次必须覆盖旧读取的行范围，否则保留旧正文——
-        例如"全文读 → 编辑 → 只复查第 10 行"时，不能把全文读换成第 10 行的指针。
-        """
-        entries: list[dict] = []
-        for message in messages[region_start:]:
-            if not isinstance(message, ToolMessage):
-                continue
-            name = (getattr(message, "name", "") or "").strip()
-            if name != self.READ_DEDUP_TOOL:
-                continue
-            content = message.content
-            if not isinstance(content, str):
-                continue
-
-            call_id = message.tool_call_id
-            args = args_by_call.get(call_id) if call_id else None
-            if not isinstance(args, dict):
-                continue
-            path = args.get("path")
-            if not isinstance(path, str) or not path.strip():
-                continue
-
-            extra = message.additional_kwargs or {}
-            ok = not extra.get("error_type") and extra.get("decision") != "denied"
-            entries.append(
-                {
-                    "message": message,
-                    "call_id": call_id,
-                    "path": self._norm_path(path),
-                    "display_path": path.strip(),
-                    "content": content,
-                    "range": self._read_range(args),
-                    "ok": ok,
-                }
-            )
-
-        # 每个路径取时间上最后一次成功读取（倒序扫描；指针消息不能当目标）
-        latest_by_path: dict[str, dict] = {}
-        for entry in reversed(entries):
-            if not entry["ok"] or self.DEDUP_MARKER_PREFIX in entry["content"]:
-                continue
-            latest_by_path.setdefault(entry["path"], entry)
-
-        replacements: list[ToolMessage] = []
-        for entry in entries:
-            latest = latest_by_path.get(entry["path"])
-            if latest is None or latest is entry:
-                continue
-            if not entry["ok"]:
-                continue
-            if self.DEDUP_MARKER_PREFIX in entry["content"]:  # 幂等：已指针化
-                continue
-            if len(entry["content"]) < self.read_dedup_min_chars:
-                continue
-            if not entry["call_id"] or not latest["call_id"]:
-                continue
-            if not self._covers(latest["range"], entry["range"]):
-                continue
-
-            replacements.append(
-                entry["message"].model_copy(
-                    update={
-                        "content": self._dedup_pointer(
-                            latest["call_id"],
-                            latest["display_path"],
-                            len(latest["content"]),
-                        )
-                    }
-                )
-            )
-        return replacements
-
-    @staticmethod
-    def _read_range(args: dict) -> tuple[int, int | None] | None:
-        """把 read_file 参数折成请求范围；None = 无行区间的全文请求。
-
-        `end_line=None` 表示"从 start_line 往后"（大文件最多 200 行、小文件到文件尾），
-        这里保留 None，交给覆盖检查按"到文件尾/单次上限"处理。
-        """
-        start = args.get("start_line")
-        end = args.get("end_line")
-        start = start if isinstance(start, int) and start >= 1 else None
-        end = end if isinstance(end, int) and end >= 1 else None
-        if start is None and end is None:
-            return None
-        return (start or 1, end)
-
-    @staticmethod
-    def _covers(
-        latest: tuple[int, int | None] | None,
-        earlier: tuple[int, int | None] | None,
-    ) -> bool:
-        """最后一次读取是否覆盖旧读取请求的范围。
-
-        - 全文请求只与全文请求互替：大文件的"全文"实际是前 200 行预览，不能声称覆盖区间；
-        - 区间读取要求 latest 起点不晚于 earlier，且终点不早于 earlier；
-        - `end=None`（到文件尾/单次 200 行上限）只与同为 `end=None` 的请求互认。
-        """
-        if latest is None:
-            return earlier is None
-        if earlier is None:
-            return False
-
-        latest_start, latest_end = latest
-        earlier_start, earlier_end = earlier
-        if latest_start > earlier_start:
-            return False
-        if latest_end is None:
-            return earlier_end is None
-        if earlier_end is None:
-            return False
-        return latest_end >= earlier_end
-
-    @staticmethod
-    def _norm_path(path: str) -> str:
-        """路径归一（只用于判等）：统一分隔符、消掉 `./` 与冗余 `..`。"""
-        return posixpath.normpath(path.strip().replace("\\", "/"))
-
-    def _dedup_pointer(self, latest_call_id: str, path: str, length: int) -> str:
-        """指针正文：指向最后一次成功读取，不复制原文。"""
-        return (
-            f"{self.DEDUP_MARKER_PREFIX} 同一文件以 tool_call_id={latest_call_id} 的"
-            f"最后一次成功读取为准（{path}，{length} 字符）；此处旧结果不再展开。"
-        )
-
-    # ---------- 状态回执：每个工具只留最近一条 ----------
-
-    def _slim_state_receipts(
-        self,
-        messages: list,
-        region_start: int,
-        args_by_call: dict[str, dict],
-        by_id: dict[str, ToolMessage],
-        projected: int,
-    ) -> list[ToolMessage]:
-        """把旧的状态回执压成一行；每个工具保留最近一条。"""
-        region = messages[region_start:]
-        entries: list[tuple[int, ToolMessage, str]] = []
-        latest_by_tool: dict[str, int] = {}
-        for index, message in enumerate(region):
-            if not isinstance(message, ToolMessage):
-                continue
-            name = (getattr(message, "name", "") or "").strip()
-            if name not in _STATE_RECEIPT_TOOLS:
-                continue
-            if not getattr(message, "id", None):
-                continue
-            latest_by_tool[name] = index
-            entries.append((index, message, name))
-
-        replacements: list[ToolMessage] = []
-        for index, message, name in entries:
-            if latest_by_tool.get(name) == index:
-                continue
-            if message.id in by_id:
-                continue
-            content = message.content
-            if not isinstance(content, str) or self._is_marked(content):
-                continue
-            status, _ = CompactNode._tm_status(message)
-            if status != "ok":
-                continue
-            if not self._has_later_ai(region, index):
-                continue
-            pointer = self._state_pointer(name, args_by_call.get(message.tool_call_id) or {})
-            saving = len(content) - len(pointer)
-            if saving <= 20:
-                continue
-            replacements.append(message.model_copy(update={"content": pointer}))
-            projected -= saving
-            if projected <= self.low_watermark_chars:
-                break
-        return replacements
-
-    @staticmethod
-    def _state_pointer(name: str, args: dict) -> str:
-        """状态回执的一行指针：保留"哪个工具、哪个目标、什么状态"。"""
-        prefix = CompressNode.MASK_MARKER_PREFIX
-        if name == "update_plan_step":
-            return f"{prefix} update_plan_step · 步骤 {args.get('step_id', '?')} → {args.get('status', '?')}"
-        if name == "create_plan":
-            steps = args.get("steps") or []
-            return f"{prefix} create_plan · {len(steps)} 步"
-        if name == "read_memory":
-            return f"{prefix} read_memory · 记忆已在 RUNTIME_STATE 注入"
-        if name == "write_memory":
-            key = args.get("key") or args.get("type") or "已写入"
-            return f"{prefix} write_memory · {key}（正文在 memory.md）"
-        if name in {"get_skill", "drop_skill"}:
-            return f"{prefix} {name} · {args.get('name', '?')}"
-        return f"{prefix} {name}"
-
-    # ---------- 批级移动窗口：语义切点优先，预算兜底 ----------
-
-    def _plan_batches(
-        self, blocks: list[_ToolBlock], boundaries: list[int]
-    ) -> list[list[_ToolBlock]]:
-        """把当前轮 block 切成批：硬边界 → plan step → 预算（含语义切点）。
-
-        `boundaries` 是工具块之外的消息下标（Human/System/Assistant/孤儿 ToolMessage）；
-        不完整/未消费 block 也不进批。批内可以夹着不可压的 block，只压 eligible 的
-        ToolMessage；批与批之间由 step 变化、硬边界或预算切点分开。
-        """
-        if not blocks:
-            return []
-        batches: list[list[_ToolBlock]] = []
-        segment: list[_ToolBlock] = []
-        segment_key = None
-        prev_end = blocks[0].start - 1
-
-        def flush() -> None:
-            nonlocal segment, segment_key
-            if segment:
-                batches.extend(self._plan_segment(segment))
-            segment = []
-            segment_key = None
-
-        for block in blocks:
-            if (
-                self._has_boundary(boundaries, prev_end, block.start)
-                or not block.complete
-                or not block.consumed
-            ):
-                flush()
-                prev_end = block.end
-                continue
-            key = (block.plan_epoch, block.step_id)
-            if segment and key != segment_key:
-                flush()
-            segment.append(block)
-            segment_key = key
-            prev_end = block.end
-        flush()
-        return batches
-
-    @staticmethod
-    def _has_boundary(boundaries: list[int], left: int, right: int) -> bool:
-        """`(left, right)` 之间是否有工具块之外的消息（硬边界）。"""
-        return any(left < position < right for position in boundaries)
-
-    def _plan_segment(self, blocks: list[_ToolBlock]) -> list[list[_ToolBlock]]:
-        """在一个 step 段内按预算切批；预算超限时优先在里程碑附近切。"""
-        batches: list[list[_ToolBlock]] = []
-        start = 0
-        n = len(blocks)
-        while start < n:
-            end = start
-            chars = 0
-            while end < n and chars + blocks[end].eligible_chars <= self.max_batch_chars:
-                chars += blocks[end].eligible_chars
-                end += 1
-
-            if end == n:
-                cut = n
-            else:
-                cut = self._semantic_cut(blocks, start, end)
-                if cut is None or cut <= start:
-                    cut = end if end > start else start + 1
-
-            batch = blocks[start:cut]
-            if self._batch_chars(batch) >= self.min_batch_chars:
-                batches.append(batch)
-            start = cut
-        return batches
-
-    def _semantic_cut(
-        self, blocks: list[_ToolBlock], start: int, end: int
-    ) -> int | None:
-        """在 `[start, end]` 里找最近的里程碑切点；只在预算的 ±20% 容差内采用。
-
-        里程碑 = 写操作完成、进程 start/kill、成功↔失败转换、plan 更新。找不到就返回
-        `None`，由调用方按预算硬切——语义优先，但预算仍是最后的安全上界。
-        """
-        threshold = int(self.max_batch_chars * 0.8)
-        chars = 0
-        cut = None
-        for index in range(start, end + 1):
-            chars += blocks[index].eligible_chars
-            if blocks[index].milestone and chars >= threshold:
-                cut = index + 1
-        return cut
-
-    @staticmethod
-    def _batch_chars(batch: list[_ToolBlock]) -> int:
-        return sum(block.eligible_chars for block in batch)
-
-    def _mask_batch(self, batch: list[_ToolBlock]) -> list[ToolMessage]:
-        """把一批里的 eligible ToolMessage 压成一条批级时间线 + 同批短戳。"""
-        calls = [call for block in batch for call in block.calls if call.eligible]
-        if not calls:
-            return []
-        replacements: list[ToolMessage] = []
-        pointer = self._batch_pointer(calls)
-        stub = f"{self.MASK_MARKER_PREFIX} 同批已压缩"
-        for index, call in enumerate(calls):
-            tool_message = call.tool_message
-            if tool_message is None:
-                continue
-            replacements.append(
-                tool_message.model_copy(
-                    update={"content": pointer if index == 0 else stub}
-                )
-            )
-        return replacements
-
-    def _batch_pointer(self, calls: list[_ToolCallInfo]) -> str:
-        """批级时间线：工具×次数 + 目标/关键行；不复制正文。"""
-        counts: dict[str, int] = {}
-        groups: dict[str, list[str]] = {}
-        order: list[str] = []
-        for call in calls:
-            name = call.name
-            counts[name] = counts.get(name, 0) + 1
-            if name not in groups:
-                groups[name] = []
-                order.append(name)
-            pieces: list[str] = []
-            target = self._mask_target(name, call.args)
-            if target:
-                pieces.append(target)
-            if call.tool_message is not None:
-                key = self._key_line(call.tool_message, name)
-                if key:
-                    pieces.append(key)
-            if pieces:
-                groups[name].append(" · ".join(pieces))
-
-        parts: list[str] = []
-        for name in order:
-            details = groups[name][:3]
-            suffix = "；".join(details)
-            if len(groups[name]) > 3:
-                suffix += "；…"
-            part = f"{name}×{counts[name]}"
-            if suffix:
-                part += f"（{suffix}）"
-            parts.append(part)
-        text = (
-            f"{self.MASK_MARKER_PREFIX} "
-            + " · ".join(parts)
-            + " · 需要时重新读取/执行"
-        )
-        return text if len(text) <= 600 else text[:597] + "…"
-
-    @staticmethod
-    def _mask_target(name: str, args: dict) -> str:
-        """指针里的目标（路径 / 命令 / 查询 / 进程 id），尽量让人和模型都能定位。"""
-        if name == "read_file":
-            path = args.get("path")
-            if isinstance(path, str) and path.strip():
-                rng = CompressNode._read_range(args)
-                if rng is None:
-                    return f"path={path.strip()} · 全文"
-                start, end = rng
-                if end is None:
-                    return f"path={path.strip()} · 第 {start} 行起"
-                return f"path={path.strip()} · 第 {start}-{end} 行"
-        if name == "search_content":
-            path = args.get("path", ".")
-            query = args.get("query", "")
-            return f"path={path} · query={query}"
-        if name == "run_command":
-            return f"cmd={_one_line(str(args.get('command', '')), 80)}"
-        if name in {"process_wait", "process_read", "process_kill"}:
-            return f"process_id={args.get('process_id', '?')}"
-        if name in {"list_dir", "get_directory_tree"}:
-            return f"path={args.get('path', '.')}"
-        if name == "glob":
-            return f"pattern={args.get('pattern', '?')} · path={args.get('path', '.')}"
-        if name in {"write_file", "edit_file", "create_file", "create_dir", "delete_file", "delete_dir"}:
-            return f"path={args.get('path', args.get('dir_path', '?'))}"
-        if name == "copy_path":
-            return f"{args.get('source', '?')} → {args.get('destination', '?')}"
-        if name == "read_note":
-            return f"note={args.get('note_id', '?')}"
-        return ""
-
-    @staticmethod
-    def _key_line(message: ToolMessage, name: str) -> str:
-        """只给需要"结果摘要"的工具取首行；文件/目录类已有 target，不重复。"""
-        if name not in {
-            "run_command", "search_content", "start_process",
-            "process_wait", "process_read", "process_list",
-        }:
-            return ""
-        text = str(message.content or "").strip()
-        first = next((line.strip() for line in text.splitlines() if line.strip()), "")
-        if not first:
-            return ""
-        return first if len(first) <= 80 else first[:80] + "…"
+        updates = self._engine.compress(messages, state.get("current_plan") or [])
+        return {"messages": updates} if updates else {}

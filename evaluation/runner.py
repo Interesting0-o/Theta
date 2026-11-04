@@ -131,7 +131,7 @@ def _capture_trace(result: EvalResult, output: Dict[str, Any], seen: set) -> Non
     """把本轮新增的 AI tool_calls / ToolMessage 记进 result.trace。
 
     只记结构化信息（工具名、参数、tool_call_id、状态、正文前 500 字符），不复制整份历史。
-    状态口径与 `CompactNode._tm_status` 一致：优先读 `additional_kwargs` 的
+    状态口径与 `compression.parser.tm_status` 一致：优先读 `additional_kwargs` 的
     `error_type` / `decision`，没有就按正文 `[error_type]` / `[approval_denied]` 回退判定。
     """
     messages = output.get("messages") or []

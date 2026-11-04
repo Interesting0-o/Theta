@@ -33,6 +33,13 @@ from app.schema.agent_schema import ASK_SELECT_DEFAULT, ASK_SELECT_MODES
 
 _TOOL_CONFIG_PATH = Path(__file__).with_name("tool.json")
 
+# 编排/state 工具的 source 集合（2026-11-04 从 `ReviewNode` 移到判定层）。
+# 消费者：`ReviewNode` 分流、`compression.policy.orchestrate_tools` 派生折叠保护集。
+# 放在这里是为了让压缩引擎不必反向 import `nodes.py`。
+ORCHESTRATE_SOURCES: frozenset[str] = frozenset(
+    {"plan", "notes", "ask", "memory", "events", "skill"}
+)
+
 
 @lru_cache(maxsize=1)
 def tool_config() -> dict[str, dict]:
