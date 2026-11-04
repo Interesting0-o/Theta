@@ -23,6 +23,9 @@ from .parser import first_line, iter_tool_blocks, one_line, tm_status
 from .planner import CycleBatchPlanner, group_segments
 from .policy import (
     ARCHIVE_TOOLS,
+    ARG_CLEAR_FIELDS,
+    ARG_CLEAR_MARKER,
+    ARG_CLEAR_TOOLS,
     KEEP_TOOLS,
     NO_MASK_TOOLS,
     STATE_RECEIPT_TOOLS,
@@ -32,6 +35,9 @@ from .policy import (
 
 __all__ = [
     "ARCHIVE_TOOLS",
+    "ARG_CLEAR_FIELDS",
+    "ARG_CLEAR_MARKER",
+    "ARG_CLEAR_TOOLS",
     "CycleBatchPlanner",
     "FOLD_HEADER",
     "FoldGroup",

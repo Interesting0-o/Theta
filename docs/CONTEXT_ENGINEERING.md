@@ -147,25 +147,27 @@
 
 ### 8.1 触发位置
 
-第一版只做**轮边界折叠**。设计原写"挂在 START 之后"，**实现改挂在 END 之前**（`llm_node` 判无 `tool_calls` 且历史超预算 → `compact_node` → `END`）：
+第一版只做**轮边界折叠**。设计原写"挂在 START 之后"，**实现改挂在 END 之前**（`llm_node` 判无 `tool_calls` → `compact_node` → `END`）：
 
 ```
-START ─► llm_node ──(无 tool_calls 且超预算)──► compact_node ─► END
-             └──────(否则/有 tool_calls)──────► …
+START ─► llm_node ──(无 tool_calls)──► compact_node ─► END
+             └──────(有 tool_calls)────► …
 ```
 
-两者时机等效（都在"上一轮已收尾、下一条用户消息之前"），但挂在 END 前省掉每轮一次节点执行、也让"是否需要折"与"这轮是否结束"共用同一个判定（`needs_compact` 与路由同源，见 `app/agent/graph.py::route_after_llm`）。`[已落地]`
+两者时机等效（都在"上一轮已收尾、下一条用户消息之前"）。2026-10-20 起轮末压缩
+**无条件启用**：没有字符预算门，没有可折块时节点自己返回 `{}`。`[已落地]`
 
-二期（单个超长编排内部的滚动折叠）仍在 `tool_node → llm_node`、`orchestrate_node → llm_node` 回边加预算触发，靠 §8.3 的"保留区"保护刚返回、待模型反应的块。`[未做]`
+轮内滚动折叠已落地为 `CompressNode`（`tool_node` / `orchestrate_node` → `compress_node`
+→ `llm_node`），做 read_file 去重、批级移动窗口与状态回执变薄，详见 §8.6。`[已落地]`
 
 ### 8.2 折叠算法
 
-预算超限才动手，否则原样直通（零成本、幂等）：
+轮末无条件运行；没有可折块时原样直通（零成本、幂等）：
 
-1. 算消息总成本（字符数，见 §8.4）；未超预算 → 不变。
-2. **保留区** = **最后一条 `HumanMessage` 及其后的全部内容**（= 当前轮），原样保留——最新一批工具结果必然留到本轮收尾供模型总结。**实现里没有 `keep_blocks` 计数**：锚点就是"当前轮从哪开始"，比按块数保留更贴语义。
-3. **折叠区** = 最后一条 `HumanMessage` 之前的消息。沿块边界整块剪除（见 §3.1）：只折**完整**的工具块（`AIMessage(tool_calls)` + 兑现它的全部 ToolMessage，缺一条就整块跳过）；被剪块的可重取内容不重建为消息（省 token）。
-4. 产出新 `messages` 写回 state（决定性地；对相同输入产生相同输出，便于无 LLM 单测固化）。
+1. 把消息解析成工具块；没有可折块 → 不变。
+2. **保留区** = **最终答复**（末条无 `tool_calls` 的 `AIMessage`）及其后的内容；最终答复是结论载体，原样保留。当前轮已闭环的工具块可以折（§8.6 调研结论：在逻辑停止点压缩）。
+3. **折叠区** = 最终答复之前的消息。没有最终答复（steering 提前收口等）时退回"最后一条 `HumanMessage` 之前"，当前轮在途结果保持原样。沿块边界剪除（见 §3.1）：只折**完整且已消费**的工具块；失败/被拒、编排回执、worker 结论保留原文；联网正文归档 notes；其余按调用折叠。
+4. 产出新 `messages` 写回 state（决定性地；对相同输入产生相同输出，便于无 LLM 单测固化）。多个 plan step 会分成多个 `FoldGroup`，每组一条摘要。
 
 一个前提：**别先污染再清理**——`OrchestrateNode`/`ToolNode` 仍按现状把回执写入历史（这是协议需要的），折叠在轮边界统一处理冗余，不在写入时做特判。
 
@@ -186,8 +188,14 @@ START ─► llm_node ──(无 tool_calls 且超预算)──► compact_node 
 
 ### 8.4 预算与触发阈值
 
-- 无 tiktoken 类本地分词：DeepSeek 走 OpenAI 兼容，token 数在 agent 侧不可精确算。**实现只用了字符数单阈值**（`_CONTEXT_BUDGET_DEFAULT = 60000`，`nodes.py`），**没有块数阈值、也没有 env 覆盖**——阈值经 `CompactNode(content_budget_chars=…)` 构造参数可调，`needs_compact(state, budget)` 与路由共用同一口径。
-- **不走 `app/config.py` 的 Settings**：该文件字段全无默认值、须在 `.env` 出现（历史约定）。预算阈值属于可调内部参数，用模块常量 + 构造参数即可，避免每次加参都动 `.env`。（原记的"与 `WORKSPACE_PATH` 走纯 env 的先例一致"**已失效**：工作区自 2026-09-10 起是图的构造期参量，不再是 env 输入。）
+- 无 tiktoken 类本地分词：DeepSeek 走 OpenAI 兼容，token 数在 agent 侧不可精确算。
+  **轮末不再使用字符预算门**（2026-10-20 起无条件）；字符阈值只服务轮内
+  `CompressNode` 的高/低水位（`TURN_HIGH_WATERMARK_CHARS` / `TURN_LOW_WATERMARK_CHARS`，
+  经构造参数可调）。`needs_compact(state, budget)` 与 `_CONTEXT_BUDGET_DEFAULT`
+  仅测试/兼容保留，不在生产路径上。
+- **不走 `app/config.py` 的 Settings**：阈值属于可调内部参数，用模块常量 + 构造参数
+  即可，避免每次加参都动 `.env`。（工作区自 2026-09-10 起是图的构造期参量，不再是
+  env 输入。）
 
 ### 8.5 折叠前后示意
 
@@ -259,7 +267,12 @@ H, B1(A(tc n1), T…), B2(A(tc n2), T…), …, A_final
 - 批内第一条被压 `ToolMessage` 放批级时间线指针：
   `…[已压缩·批3] read_file×3 (paths) · run_command×2 (cmd, exit=0) …；失败/受保护结果保留，需要时重读`
 - 同批其余被压消息放短戳 `…[同批已压缩]`；
-- 不改 `AIMessage.tool_calls`，不拆 `tool_call` / `ToolMessage` 配对。
+- 不改 `tool_call` / `ToolMessage` 配对。
+
+**Phase 2（2026-11-04）：旧写操作的大 args 也压**——`write_file` / `create_file` 的
+`content`、`edit_file` 的 `old_string` / `new_string` 换成带原长度的指针
+（`…[参数已省略 原 N 字符；文件为准]`），`path` 等定位信息保留；`tool_call_id` / 调用
+关系不变。可清 args 与可压正文一起计入 `compressible_chars`，共享高低水位与批预算。
 
 **保留与触发**：
 
@@ -277,7 +290,8 @@ H, B1(A(tc n1), T…), B2(A(tc n2), T…), …, A_final
 - 整块严格（任一失败/受保护就跳过）节省 92,964，终态 content 34,261（高于 25k 低水位）；按 `ToolMessage` 部分压缩节省 109,743，终态 content 17,482、合计 51,012；
 - plan step 段：`None` 39,243 / step2 33,923 / step4 31,299 / step5 8,878；step + 8k 预算约 18 批，与连续窗 + 8k 同批数，但不跨 step；
 - 无 `max_batch_chars` 时 4 批、单批 31k–39k，会过冲低水位；8k 时可停在目标附近；
-- args 仍剩 33.5k（写操作 args 是大头）：content-only 到不了更低，Phase 2 需整块墓碑或 `clear_tool_inputs`。
+- args 仍剩 33.5k（写操作 args 是大头）：content-only 到不了更低。Phase 2 已把写操作的
+  大 args 换成指针并计入可压池；整块墓碑（视图化）仍未做。
 
 **与现状的差异 / 落地顺序**：
 
@@ -287,13 +301,16 @@ H, B1(A(tc n1), T…), B2(A(tc n2), T…), …, A_final
 4. 批级时间线指针 + 短戳；保留最近 K 个 block；
 5. 触发改 `compressible_chars`，补 `min/max_batch_chars`；预算到达时先找语义切点，再硬切；
 6. 轮末折叠区扩到刚完成周期（保留 `A_final`），并与 `CompressNode` 统一到 `CycleBatchPlanner`；
-7. Phase 2：旧块整块墓碑 / 清 tool inputs，解决 args 成本（写操作 args 单独一类）；
+7. Phase 2：写操作 args 清理已落地（2026-11-04，`ARG_CLEAR_FIELDS`）；整块墓碑 / 视图化
+   仍未做；
 8. 远期：关键词/词嵌入软边界（可选实验），边界冻结并缓存 `segmentation_version`。
 
 **调研结论（2026-11-03，详见 extra 专题）**：
 
 - 轮末**压刚完成的周期**（保留 `A_final` 作结论载体）：与 SelfCompact/CAT 的“逻辑停止点压缩”一致；
-- Phase 1 维持 content 改写；Phase 2 再做**整块墓碑**（checkpoint 原文保留，mask 是视图），args 清理照 `clear_tool_inputs` 先例，写操作 args 单独一类；
+- Phase 1 维持 content 改写；Phase 2 的写操作 args 清理已落地（照 `clear_tool_inputs`
+  先例，只清 content / old_string / new_string）；**整块墓碑**（checkpoint 原文保留、
+  mask 是视图）仍未做；
 - K=8–10、`max_batch_chars`=6k–8k 有样本与业界参照；`min_batch_chars` 按“指针开销 × 批内条数”动态下界；
 - 混合 block 的 `in_progress` 更新归**新 step**；
 - 软边界（关键词+嵌入）降级为可选实验：三项独立工作用的是 agent 自声明/结构信号，不是事后嵌入聚类；
@@ -323,12 +340,15 @@ H, B1(A(tc n1), T…), B2(A(tc n2), T…), …, A_final
   mask；`dispatch_subtasks` 的 worker 结论轮末也保留（`policy.KEEP_TOOLS`）；
 - `[ ]` 摘要有容量上界（2026-11-04 决定**暂不设上限**：截断会丢 notes ref，等真实
   会话基线再定）；
-- `[ ]` 轮末压刚完成的周期（现状仍折最后一条 Human 之前的旧周期）；
-- `[ ]` 整块墓碑 / `clear_tool_inputs`（Phase 2，args 成本）；
+- `[x]` 轮末压刚完成的周期（2026-11-04，§8.6 未决点 1）：有最终答复时折到答复之前，
+  当前轮工具块也折；无最终答复时退回最后一条 Human 之前，保留在途结果；
+- `[x]` Phase 2 写操作 args 清理（2026-11-04）：`write_file` / `create_file` 的
+  `content`、`edit_file` 的 `old_string` / `new_string` 换成带长度指针，计入可压池；
+- `[ ]` 整块墓碑 / 视图化（checkpoint 原文保留、mask 是视图）；
 - `[x]` `CompactNode` 与 `CompressNode` 统一到共享分组/解析/策略（`group_segments` +
   `parser` + `policy`；轮末只分组不切预算）；
 - `[ ]` 关键词/词嵌入软边界（可选实验）；
-- 验证：全量 **713 passed / 7 skipped**（2026-11-04）；IndexTTS2 step 758 样本上，当前轮
+- 验证：全量 **718 passed / 7 skipped**（2026-11-04）；IndexTTS2 step 758 样本上，当前轮
   content 129,459 → 22,372（节省 107,087），15 条批级指针 + 9 条状态回执指针 + 14 条
   同批短戳，失败/被拒原文保留；
 - 新增测试：`test_plan_step_change_starts_new_batch` /
@@ -360,7 +380,7 @@ H, B1(A(tc n1), T…), B2(A(tc n2), T…), …, A_final
 
 - **P0（首期）**：`work_log` 结构化双半行 + `denied` 条目；notes 会话级 state dict + `read_note/search` + 懒分类工具；轮边界 `compact_node`；promote 收尾引导。收益最大、风险最低（只在轮界动手）。
   - **进度（2026-09-10 核对）**：`notes` 会话级 dict `[已落地]`、`read_note` `[已落地]`、轮边界 `compact_node` `[已落地]`（位置改在 END 前，见 §8.1）、审批被拒时回灌 `[approval_denied]` 消息 `[已落地]`（但**不是**设计里的 work_log `status=denied` 条目）。**未做**：`work_log`（含 verdict/意图双半行）、`search_notes`/懒分类工具、notes 索引注入、promote 收尾引导。
-- **P1**：同轮超长编排的滚动折叠（§8.1 回边触发），加 `keep_blocks` 保留区压力测试；notes 归档阈值/容量标定。批级压缩 Phase 1（CompressNode 批级分组 + CompactNode 失败块保护）已落地；Phase 2（args/墓碑/刚完成周期/统一 planner/软边界）见 §8.6。
+- **P1**：同轮超长编排的滚动折叠（§8.1 回边触发），加 `keep_blocks` 保留区压力测试；notes 归档阈值/容量标定。批级压缩 Phase 1（CompressNode 批级分组 + CompactNode 失败块保护）已落地；Phase 2 的 args 清理、刚完成周期折叠、统一 planner 已落地；整块墓碑与软边界仍未做，见 §8.6。
 - **P2（评估接线）**：evaluation 增加"上下文/轮数/token"断言，量化折叠前后达成率与成本；为 §8.4 阈值与"意图半行 token 增量/遵从率"提供实测依据。
 
 ## 11. 开放问题

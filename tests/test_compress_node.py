@@ -553,6 +553,110 @@ def test_web_and_ask_are_not_masked():
     ) == {}
 
 
+#------------------ Phase 2：写操作 args 清理 ------------------
+
+
+def test_write_args_are_cleared_for_old_blocks():
+    """旧写操作的大 content 换成指针；path 与 ToolMessage 回执保留。"""
+    messages = [HumanMessage(content="写文件", id="h1")]
+    messages += _batch(
+        "a1",
+        [("c1", "write_file", {"path": "a.py", "content": "X" * 20000}, "已写入 a.py")],
+    )
+    messages += _batch("a2", [("c2", "read_file", {"path": "b.py"}, "R" * 200)])
+    messages.append(AIMessage(content="完成", id="ans"))
+
+    out = _run(
+        messages,
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=1,
+        mask_min_chars=100,
+        max_batch_chars=30000,
+        min_batch_chars=100,
+    )
+    merged = _merged(messages, out)
+
+    args = _by_id(merged, "a1").tool_calls[0]["args"]
+    assert args["path"] == "a.py"
+    assert "参数已省略" in args["content"]
+    assert "20000" in args["content"]
+    assert _by_id(merged, "tc1").content == "已写入 a.py"   # 写回执本身受保护
+
+
+def test_edit_file_args_are_cleared():
+    """edit_file 的 old_string / new_string 都清；path 与 replace_all 保留。"""
+    messages = [HumanMessage(content="编辑", id="h1")]
+    messages += _batch(
+        "a1",
+        [("c1", "edit_file", {
+            "path": "a.py",
+            "old_string": "OLD" * 2000,
+            "new_string": "NEW" * 2000,
+            "replace_all": False,
+        }, "已编辑")],
+    )
+    messages += _batch("a2", [("c2", "read_file", {"path": "b.py"}, "R" * 200)])
+    messages.append(AIMessage(content="完成", id="ans"))
+
+    out = _run(
+        messages,
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=1,
+        mask_min_chars=100,
+        max_batch_chars=30000,
+        min_batch_chars=100,
+    )
+    merged = _merged(messages, out)
+
+    args = _by_id(merged, "a1").tool_calls[0]["args"]
+    assert args["path"] == "a.py"
+    assert args["replace_all"] is False
+    assert "参数已省略" in args["old_string"]
+    assert "参数已省略" in args["new_string"]
+
+
+def test_recent_write_args_are_kept():
+    """保留窗口内的写操作 args 不动。"""
+    messages = [HumanMessage(content="写文件", id="h1")]
+    messages += _batch(
+        "a1",
+        [("c1", "write_file", {"path": "a.py", "content": "X" * 20000}, "已写入")],
+    )
+    messages.append(AIMessage(content="完成", id="ans"))
+
+    assert _run(
+        messages,
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=1,
+        mask_min_chars=100,
+        max_batch_chars=30000,
+        min_batch_chars=100,
+    ) == {}
+
+
+def test_write_args_cleanup_is_idempotent():
+    messages = [HumanMessage(content="写文件", id="h1")]
+    messages += _batch(
+        "a1",
+        [("c1", "write_file", {"path": "a.py", "content": "X" * 20000}, "已写入")],
+    )
+    messages += _batch("a2", [("c2", "read_file", {"path": "b.py"}, "R" * 200)])
+    messages.append(AIMessage(content="完成", id="ans"))
+    kwargs = dict(
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=1,
+        mask_min_chars=100,
+        max_batch_chars=30000,
+        min_batch_chars=100,
+    )
+    merged = _merged(messages, _run(messages, **kwargs))
+    assert _run(merged, **kwargs) == {}
+
+
 #------------------ 批级分组：plan step、语义切点、部分压缩、保留窗口 ------------------
 
 

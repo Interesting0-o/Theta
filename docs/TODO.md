@@ -41,7 +41,7 @@ h1 里只保留一个 `<RUNTIME_STATE>` 块。⚠️ `SYSTEM_PROMPT` 改了，ev
 fixtures 已陈旧，跑评估前需 `--record`（或 `--live`）重录。
 另：终端输出的中间截断已从 `CompressNode` 下沉到 terminal MCP
 （`mcp_service/terminal.py::_compress_output`），消息写入 state 时就是最终形态；
-`CompressNode` 现在只保留 `read_file` 同文件重复读取的指针化。
+`CompressNode` 现在做 read_file 去重 + 批级移动窗口 + 状态回执变薄（§8.6）。
 
 **Phase 2（已完成 2026-10-20）**：确定性 event log 落在
 `resource/<ws_key>/sessions/<sid>/event_log.jsonl`（`app/resource/event_log.py`），每个
@@ -396,7 +396,12 @@ tool.json 的 `source: mcp_service/web_search` 同义）；`_EXTRA_SLICE_KEYS`�
 docs/CONTEXT_ENGINEERING.md（消息流转改动前必读）、docs/ARCHITECTURE.md §4（图内 vs 基座）、
 文末「相关但未立项」的**长回合止损**（取消 = 扔掉整轮，队列 = 带着上下文转向，互补不互替）。
 
-## [ ] 运行中 compact：工具循环中间的上下文收口
+## [~] 运行中 compact：工具循环中间的上下文收口
+
+> **状态（2026-11-04）**：已落地为轮内 `CompressNode`（批级移动窗口 + read 去重 +
+> 状态回执变薄，见 `CONTEXT_ENGINEERING.md` §8.6）。本条目保留动机与实测数据；原计划的
+> “折更早轮次完整块”被替换为“当前轮移动窗口”，因为长单轮没有可折的旧 Human 轮次
+> （见下方 2026-10-18 实测）。
 
 **问题**（2026-09-07 长回合实测）：主 agent 一轮里大量工具调用（如一次 jupyter 审计
 ~67 次、20 分钟）时，历史里的**读文件/检索结果作为 ToolMessage 每轮原样重发**，上下文越滚

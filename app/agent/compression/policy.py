@@ -37,6 +37,16 @@ WRITE_TOOLS: frozenset[str] = frozenset({
     "delete_file", "delete_dir", "copy_path",
 })
 
+# Phase 2：可清 args 的写操作（大字段可重取——磁盘即真值）。
+# 只清这些字段，path / replace_all 等定位信息保留；调用关系与 tool_call_id 不动。
+ARG_CLEAR_MARKER = "…[参数已省略"
+ARG_CLEAR_FIELDS: dict[str, tuple[str, ...]] = {
+    "write_file": ("content",),
+    "create_file": ("content",),
+    "edit_file": ("old_string", "new_string"),
+}
+ARG_CLEAR_TOOLS: frozenset[str] = frozenset(ARG_CLEAR_FIELDS)
+
 # 不进轮内移动窗口的工具：
 # - web 四件套：正文由轮末归档进 notes，轮内压掉等于丢研究原料；
 # - ask_user：用户决定，必须保留；

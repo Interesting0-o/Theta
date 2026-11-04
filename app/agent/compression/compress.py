@@ -5,8 +5,8 @@
     CompressNode : messages[last_human_index + 1:]    当前轮，工具循环中执行
 
 轮内**不删消息**：图路由中间删掉结果会破坏 tool_call / ToolMessage 配对与调用方状态，
-因此只改 `ToolMessage.content`。本模块只产出替换后的 ToolMessage，state 合并由
-`nodes.py::CompressNode` 适配器负责。
+因此只改 `ToolMessage.content` 与旧写操作的 `tool_call.args`（Phase 2；id / 配对不动）。
+本模块只产出替换后的消息，state 合并由 `nodes.py::CompressNode` 适配器负责。
 """
 from __future__ import annotations
 
@@ -85,8 +85,12 @@ class TurnCompressor:
         # 在轮内也不能被批级 mask（§2.2 的两套策略漂移，2026-11-04 统一）。
         self._orchestrate_tools = policy.orchestrate_tools()
 
-    def compress(self, messages: list, current_plan=None) -> list[ToolMessage]:
-        """返回当前轮需要替换的 ToolMessage（按原消息顺序）；无需压缩时返回 []。"""
+    def compress(self, messages: list, current_plan=None) -> list:
+        """返回当前轮需要替换的消息（ToolMessage / AIMessage，按原顺序）；无需压缩时 []。
+
+        AIMessage 替换只用于 Phase 2 的写操作 args 清理——tool_call 本身与 tool_call_id
+        不变，只把 content / old_string / new_string 换成带长度的指针。
+        """
         if not messages:
             return []
 
@@ -174,11 +178,12 @@ class TurnCompressor:
         blocks: list[ToolBlock],
         protected_ids: frozenset[str] | set[str] = frozenset(),
     ) -> None:
-        """按 ToolMessage 逐条标记可压性；block 只提供结构/消费/配对约束。
+        """逐条标记可压性：ToolMessage 正文 + 旧写操作的大 args。
 
-        失败/被拒、受保护工具（web/ask/dispatch/state）、写回执、未消费块、不完整块、
-        已带压缩标记的消息，以及**被去重指针引用的最新读取**都不参与批级 mask；
-        同一 block 里的其它成功结果仍可压。
+        block 只提供结构/消费/配对约束。失败/被拒、受保护工具（web/ask/dispatch/state）、
+        写回执、未消费块、不完整块、已带压缩标记的消息，以及**被去重指针引用的最新读取**
+        都不参与正文 mask；同一 block 里的其它成功结果仍可压。写回执虽然正文受保护，但
+        其中的大 args（content / old_string / new_string）可压，单独计入同一可压池。
         """
         for block in blocks:
             block.eligible_chars = 0
@@ -201,6 +206,55 @@ class TurnCompressor:
                 ):
                     call.eligible = True
                     block.eligible_chars += len(content)
+
+                # Phase 2：写操作的大 args 也可压（即使回执本身受保护）。与 content
+                # 可压性独立，但同样只处理已消费块里的成功调用。
+                call.arg_chars = self._clearable_arg_chars(call)
+                if call.arg_chars >= self.mask_min_chars:
+                    call.arg_eligible = True
+                    block.eligible_chars += call.arg_chars
+
+    @staticmethod
+    def _clearable_arg_chars(call: ToolCallInfo) -> int:
+        """该调用可清的 args 字符数（已清过的字段返回 0，保证幂等）。"""
+        fields = policy.ARG_CLEAR_FIELDS.get(call.name)
+        if not fields:
+            return 0
+        total = 0
+        for key in fields:
+            value = call.args.get(key)
+            if (
+                isinstance(value, str)
+                and value
+                and policy.ARG_CLEAR_MARKER not in value
+            ):
+                total += len(value)
+        return total
+
+    @staticmethod
+    def _clear_args(ai_message: AIMessage, calls: list[ToolCallInfo]) -> AIMessage:
+        """把指定调用的写操作大字段换成带长度的指针；只改 args，不动 id / name。"""
+        target_ids = {call.call_id for call in calls}
+        new_calls = []
+        for tool_call in ai_message.tool_calls:
+            if tool_call.get("id") not in target_ids:
+                new_calls.append(tool_call)
+                continue
+            name = (tool_call.get("name") or "").strip()
+            fields = policy.ARG_CLEAR_FIELDS.get(name, ())
+            args = dict(tool_call.get("args") or {})
+            for key in fields:
+                value = args.get(key)
+                if (
+                    isinstance(value, str)
+                    and value
+                    and policy.ARG_CLEAR_MARKER not in value
+                ):
+                    args[key] = (
+                        f"{policy.ARG_CLEAR_MARKER} 原 {len(value)} 字符；文件为准]"
+                    )
+            new_calls.append({**tool_call, "args": args})
+        return ai_message.model_copy(update={"tool_calls": new_calls})
 
     @staticmethod
     def _has_later_ai(region: list, index: int) -> bool:
@@ -441,23 +495,33 @@ class TurnCompressor:
 
     # ---------- 批级移动窗口：语义切点优先，预算兜底 ----------
 
-    def _mask_batch(self, batch: list[ToolBlock]) -> list[ToolMessage]:
-        """把一批里的 eligible ToolMessage 压成一条批级时间线 + 同批短戳。"""
-        calls = [call for block in batch for call in block.calls if call.eligible]
-        if not calls:
+    def _mask_batch(self, batch: list[ToolBlock]) -> list:
+        """把一批里的 eligible 内容压成批级时间线；同时清理写操作的大 args。"""
+        content_calls = [call for block in batch for call in block.calls if call.eligible]
+        arg_blocks = [
+            (block.ai_message, [call for call in block.calls if call.arg_eligible])
+            for block in batch
+        ]
+        arg_blocks = [(ai_message, calls) for ai_message, calls in arg_blocks if calls]
+        if not content_calls and not arg_blocks:
             return []
-        replacements: list[ToolMessage] = []
-        pointer = self._batch_pointer(calls)
-        stub = f"{self.MASK_MARKER_PREFIX} 同批已压缩"
-        for index, call in enumerate(calls):
-            tool_message = call.tool_message
-            if tool_message is None:
-                continue
-            replacements.append(
-                tool_message.model_copy(
-                    update={"content": pointer if index == 0 else stub}
+
+        replacements: list = []
+        if content_calls:
+            pointer = self._batch_pointer(content_calls)
+            stub = f"{self.MASK_MARKER_PREFIX} 同批已压缩"
+            for index, call in enumerate(content_calls):
+                tool_message = call.tool_message
+                if tool_message is None:
+                    continue
+                replacements.append(
+                    tool_message.model_copy(
+                        update={"content": pointer if index == 0 else stub}
+                    )
                 )
-            )
+
+        for ai_message, calls in arg_blocks:
+            replacements.append(self._clear_args(ai_message, calls))
         return replacements
 
     def _batch_pointer(self, calls: list[ToolCallInfo]) -> str:

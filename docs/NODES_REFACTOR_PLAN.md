@@ -386,7 +386,9 @@ FoldPlan
   mask（修掉 §2.2 点名的两套策略漂移）；
 - [x] `dispatch_subtasks` 的 worker 结论轮末也保留（`policy.KEEP_TOOLS`），与轮内一致；
 - [x] 修分组边界：硬边界之后的第一个块现在开新组/新批，不再被连带跳过；
-- [x] 全量 **713 passed / 7 skipped**。
+- [x] 轮末折叠区扩到刚完成的周期（有最终答复时折到答复之前；无最终答复时退回旧轮，
+  保留在途结果）——`CONTEXT_ENGINEERING.md` §8.6 未决点 1 落地；
+- [x] 全量 **714 passed / 7 skipped**。
 
 Stage 3 没有引入独立的 `FoldDecision` 枚举：当前决策在 `compact._block_folding()`
 里以 `(folded_ids, kept_ids)` 表达；等出现第三种处置（如大块墓碑）再抽枚举。

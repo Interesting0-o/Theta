@@ -21,6 +21,9 @@ class ToolCallInfo:
     tool_message: ToolMessage | None
     status: str
     eligible: bool = False
+    # Phase 2：可清 args 的写操作（大字段）与节省的字符数；与 content 可压性独立。
+    arg_chars: int = 0
+    arg_eligible: bool = False
 
 
 @dataclass
