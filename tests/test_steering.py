@@ -26,7 +26,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
-import app.agent.nodes as nodes_module
+import app.agent.nodes.llm as llm_module
 from app.agent.graph import get_main_agent_graph
 from app.platform.mcp import _reset_pools_for_tests, close_session_pool
 from app.platform.runtime import UserMailbox
@@ -60,14 +60,14 @@ class HookModel(BaseChatModel):
 
 
 def _spy_disk_io(monkeypatch) -> dict[str, int]:
-    """给 nodes 命名空间里的两处读盘（记忆 / 技能正文）装计数器。
+    """给 LLMNode 所在模块的两处读盘（记忆 / 技能正文）装计数器。
 
-    LLMNode 经模块级名字调用它们，patch `app.agent.nodes` 的绑定即命中。收口拍**一次都不
-    该被调**——防止将来有人把 peek 挪到系统提示装配之后而不被发现（零模型调用 ≠ 零成本）。
+    LLMNode 经模块级名字调用它们，patch `app.agent.nodes.llm` 的绑定即命中。收口拍**一次都
+    不该被调**——防止将来有人把 peek 挪到系统提示装配之后而不被发现（零模型调用 ≠ 零成本）。
     """
     counts = {"memory": 0, "skills": 0}
-    real_memory_block = nodes_module.memory_block
-    real_skills_block = nodes_module.skills_block
+    real_memory_block = llm_module.memory_block
+    real_skills_block = llm_module.skills_block
 
     def counting_memory_block(workspace_path):
         counts["memory"] += 1
@@ -77,8 +77,8 @@ def _spy_disk_io(monkeypatch) -> dict[str, int]:
         counts["skills"] += 1
         return real_skills_block(names)
 
-    monkeypatch.setattr(nodes_module, "memory_block", counting_memory_block)
-    monkeypatch.setattr(nodes_module, "skills_block", counting_skills_block)
+    monkeypatch.setattr(llm_module, "memory_block", counting_memory_block)
+    monkeypatch.setattr(llm_module, "skills_block", counting_skills_block)
     return counts
 
 

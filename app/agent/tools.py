@@ -17,7 +17,7 @@
     `InjectedToolCallId` 标注，会从模型可见 schema 里剔除——模型只看到真正的业务参数
     （如 `steps` / `step_id` / `status`）；
   * 返回值 = "要写回 state 的切片"：本组给 `current_plan` + `messages`。**形状规则以执行器
-    为准**（nodes.py::OrchestrateNode，那里是本协议的权威——messages 必给、current_plan 可选且
+    为准**（app/agent/nodes/orchestrate.py::OrchestrateNode，那里是本协议的权威——messages 必给、current_plan 可选且
     链式、其余切片要在 `_EXTRA_SLICE_KEYS` 里登记）；本模块只按它写，不另立一份说法；
   * 计划的核心逻辑（规划、推进状态、清空、快照回显）由本模块内实现，
     不放在 utils.py——工具自成一个整体，docstring 即给模型的使用手册。
@@ -304,7 +304,7 @@ note_tools: List[BaseTool] = [
 # ------------------------- 向用户提问（ask，source="ask"）-------------------------
 # 人机闸门的第二种载荷（docs/MULTI_AGENT.md §6）：模型在需求不明确时把选项摆给用户、等回答。
 #
-# **interrupt 不在本函数里**，而在 `ReviewNode` 的闸门分支（app/agent/nodes.py）。为什么：
+# **interrupt 不在本函数里**，而在 `ReviewNode` 的闸门分支（app/agent/nodes/review.py）。为什么：
 # LangGraph 的 resume 会**整节点重跑**（实测见该处注释），interrupt 之前的外部副作用会被真切
 # 第二次；`OrchestrateNode` 同批次里可能有 write_memory，所以它不能承载 interrupt。
 # 分工是：**ReviewNode 提问并把人的回答写进 state 的 `ask_answers`**，本工具随后被
@@ -392,7 +392,7 @@ ask_tool: List[BaseTool] = [
 class InjectedWorkspace(InjectedToolArg):
     """标记"需要工作区"的工具参数为运行时注入（对模型隐藏）。
 
-    由 OrchestrateNode 按签名代填（nodes.py::OrchestrateNode._invoke）：memory 系列工具用它定位
+    由 OrchestrateNode 按签名代填（app/agent/nodes/orchestrate.py::OrchestrateNode._invoke）：memory 系列工具用它定位
     `resource/<ws_key>/memory/memory.md`（模型看不到这个参数，也就无法指定记忆文件路径），
     技能加载/卸载用它决定能力型 server 在哪个工作区里跑。
 

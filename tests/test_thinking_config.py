@@ -105,8 +105,7 @@ def test_reasoning_content_survives_in_the_raw_sdk_object():
 def _model_with_thinking(monkeypatch, mode: str) -> ChatOpenAI:
     """用假 settings 构造模型：只换 `CHAT_THINKING`，其余照真配置的字段形状。"""
     monkeypatch.setattr(
-        nodes_module,
-        "settings",
+        "app.agent.nodes.llm.settings",
         SimpleNamespace(
             CHAT_MODEL_NAME="fake-model",
             CHAT_MODEL_URL="http://127.0.0.1:1/v1",

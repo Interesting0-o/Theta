@@ -137,7 +137,7 @@ class SkillMeta:
 
     与 `MemoryEntry` 同族：都是"**解析出来的值对象**"（这里由 `app/resource/skills.py::scan_skills`
     从 SKILL.md 的 frontmatter 解析），且**消费者跨模块**（`app/agent/tools.py` 的
-    `get_skill`/`drop_skill`、`app/agent/nodes.py::LLMNode` 的注入块、构图期把目录烤进 docstring），
+    `get_skill`/`drop_skill`、`app/agent/nodes/llm.py::LLMNode` 的注入块、构图期把目录烤进 docstring），
     所以落在这里，而不是定义在扫描器旁边。
 
     - name：技能名（frontmatter 的 `name`，缺省退化用目录名）——模型传给 `get_skill` 的标识；

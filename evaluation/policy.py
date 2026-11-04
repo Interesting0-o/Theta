@@ -2,7 +2,7 @@
 
 真实 TUI（`app/platform/turn.py::drive_turn` 的 park/resume）里闸门的决定来自用户输入；
 评估要把这部分替换成**确定性策略**，否则无法批量跑。每个策略是 `(payload: dict) -> Decision`
-的函数，payload 即 ReviewNode interrupt 出的字典（见 app/agent/nodes.py::ReviewNode）：
+的函数，payload 即 ReviewNode interrupt 出的字典（见 app/agent/nodes/review.py::ReviewNode）：
 审批含 tool_name / tool_args / tool_call_id / current_step，提问含 why / question / options
 ——用 `payload["type"]` 区分（`app/schema/approval_schema.py`）。
 

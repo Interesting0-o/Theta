@@ -1,7 +1,7 @@
 """压缩引擎的结构原子与折叠计划。
 
 本模块只放**数据结构**：不做解析、不做策略、不碰 LangGraph state。字段刻意与
-`app/agent/nodes.py` 的 state 适配器解耦；后续若把处置升级成显式 `FoldDecision`
+`app/agent/nodes/` 的 state 适配器解耦；后续若把处置升级成显式 `FoldDecision`
 枚举，只在本模块扩展。
 """
 from dataclasses import dataclass, field

@@ -1,6 +1,7 @@
 """轮末折叠引擎：把更早轮次已消费的旧工具块规划成 `FoldPlan`。
 
-纯确定性、不调 LLM、不碰 LangGraph state。节点适配器（`nodes.py::CompactNode`）只把
+纯确定性、不调 LLM、不碰 LangGraph state。节点适配器
+（`app/agent/nodes/compact_node.py::CompactNode`）只把
 `FoldPlan` 翻译成 `SystemMessage` / `RemoveMessage` / `notes` 更新。
 
 Stage 3（2026-11-04）：折叠单位从“整段一条扁平摘要”改为 `FoldGroup`——同一 plan

@@ -178,7 +178,9 @@ def test_review_node_logs_denied(ws, monkeypatch):
         def known_names(self, state):
             return {"write_file"}
 
-    monkeypatch.setattr(nodes_module, "interrupt", lambda payload: {"approved": False})
+    monkeypatch.setattr(
+        "app.agent.nodes.review.interrupt", lambda payload: {"approved": False}
+    )
     node = ReviewNode(toolset=_Toolset(), log=False)
     state = {
         "session_id": "s1",

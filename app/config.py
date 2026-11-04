@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     # 完全交给服务端默认（当前智谱 GLM-4.7 系列默认就开思考）。
     # 与 GITHUB_TOKEN 同理带空默认：它是**可选的厂商参数**，不是"必须配的东西"——不填时行为与
     # 没有这个键完全一样。取值 → `extra_body` 的映射单点在
-    # app/agent/nodes.py::LLMNode.thinking_extra_body。
+    # app/agent/nodes/llm.py::LLMNode.thinking_extra_body。
     CHAT_THINKING: str = ""
 
     #Tavily搜索api

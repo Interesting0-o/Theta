@@ -10,7 +10,7 @@
 
 **位置**：`app/resource/skills.py`——资源层里"能力资源"那一支（与同包的 memory.py 并列：一个读
 记忆文件、一个读技能目录，都是"读 agent 之外的东西 → 转成内部表示"）。**独立成模块**（而非并进
-`LLMNode`）是因为消费者跨三个文件：`tools.py` 的 `get_skill`/`drop_skill`、`nodes.py::LLMNode`
+`LLMNode`）是因为消费者跨三个文件：`tools.py` 的 `get_skill`/`drop_skill`、`app/agent/nodes/llm.py::LLMNode`
 的注入块、`graph.py` 构图期把目录烤进 docstring。
 
 **一个技能 = 一个目录**：`<name>/SKILL.md`（+ 可选 `server.py`、可选 `skill.json`）。

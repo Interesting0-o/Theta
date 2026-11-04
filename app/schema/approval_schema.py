@@ -106,7 +106,7 @@ class ApprovalRequest(TypedDict):
     current_step: NotRequired[str]
     tool_call_id: NotRequired[str | None]
     # 仅 type=ask_user（且只可能来自本地主 agent）携带：问题正文、选项清单、"为什么问"。
-    # options 可空 = 纯开放式提问；选项上限由 ReviewNode 在弹面板前把关（见 app/agent/nodes.py）。
+    # options 可空 = 纯开放式提问；选项上限由 ReviewNode 在弹面板前把关（见 app/agent/nodes/review.py）。
     question: NotRequired[str]
     options: NotRequired[list[str]]
     why: NotRequired[str]

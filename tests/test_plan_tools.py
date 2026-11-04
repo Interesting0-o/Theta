@@ -80,7 +80,7 @@ def test_clear_plan_returns_empty():
 def test_orchestrate_tools_only_return_declared_slice_keys():
     """**契约用例**：编排工具返回的切片键必须都被 OrchestrateNode 认。
 
-    背景（`nodes.py::_EXTRA_SLICE_KEYS` 上方那段）：执行器只合并 `messages` / `current_plan` /
+    背景（`app/agent/nodes/orchestrate.py::_EXTRA_SLICE_KEYS` 上方那段）：执行器只合并 `messages` / `current_plan` /
     `_EXTRA_SLICE_KEYS` 里列的键，**白名单之外的键一律静默丢弃**。而生产者（本模块的各编排工具）
     并不 import 那张白名单——所以"工具开始返回一个新切片、或白名单被删掉一项"的症状是**静默失效**
     （回执正常、state 没生效）。这条用例把两侧钉在一起：扫 `app/agent/tools.py` 里所有

@@ -9,7 +9,7 @@
 import asyncio
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph.message import add_messages
 
 from app.agent.nodes import CompressNode
@@ -652,6 +652,139 @@ def test_write_args_cleanup_is_idempotent():
         mask_min_chars=100,
         max_batch_chars=30000,
         min_batch_chars=100,
+    )
+    merged = _merged(messages, _run(messages, **kwargs))
+    assert _run(merged, **kwargs) == {}
+
+
+#------------------ Phase 2：整块墓碑 ------------------
+
+
+def test_old_blocks_are_tombstoned():
+    """旧的可重取块整块移除；原位留一条墓碑摘要，最终答复保留。"""
+    messages = [HumanMessage(content="读文件", id="h1")]
+    messages += _batch("a1", [("c1", "read_file", {"path": "a.py"}, "A" * 20000)])
+    messages += _batch("a2", [("c2", "read_file", {"path": "b.py"}, "B" * 20000)])
+    messages.append(AIMessage(content="完成", id="ans"))
+
+    out = _run(
+        messages,
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=0,
+        mask_min_chars=100,
+        max_batch_chars=8000,
+        min_batch_chars=100,
+        tombstone_blocks=True,
+    )
+    merged = _merged(messages, out)
+
+    ids = {m.id for m in merged}
+    assert "tc1" not in ids and "tc2" not in ids       # 整块移除，无孤儿回执
+    assert "a1" in ids and "a2" in ids                 # 原位是墓碑摘要
+    sys_msgs = [m for m in merged if isinstance(m, SystemMessage)]
+    assert len(sys_msgs) == 2
+    assert all("整块已移除" in m.content for m in sys_msgs)
+    assert any("path=a.py" in m.content for m in sys_msgs)
+    assert any("path=b.py" in m.content for m in sys_msgs)
+    assert merged[-1].content == "完成"
+
+
+def test_recent_block_is_not_tombstoned():
+    """保留窗口内的块不整块移除。"""
+    messages = [HumanMessage(content="读文件", id="h1")]
+    messages += _batch("a1", [("c1", "read_file", {"path": "a.py"}, "A" * 20000)])
+    messages += _batch("a2", [("c2", "read_file", {"path": "b.py"}, "B" * 20000)])
+    messages.append(AIMessage(content="完成", id="ans"))
+
+    out = _run(
+        messages,
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=1,
+        mask_min_chars=100,
+        max_batch_chars=8000,
+        min_batch_chars=100,
+        tombstone_blocks=True,
+    )
+    merged = _merged(messages, out)
+
+    assert "tc1" not in {m.id for m in merged}
+    assert _by_id(merged, "tc2").content == "B" * 20000
+
+
+def test_web_block_is_not_tombstoned():
+    """含 web 的混合块不整块移除：web 正文保留，成功兄弟走内容 mask。"""
+    messages = [HumanMessage(content="调研", id="h1")]
+    messages += _batch(
+        "a1",
+        [
+            ("c1", "web_search", {"query": "q"}, "W" * 20000),
+            ("c2", "read_file", {"path": "a.py"}, "R" * 20000),
+        ],
+    )
+    messages += _batch("a2", [("c3", "read_file", {"path": "b.py"}, "B" * 100)])
+    messages.append(AIMessage(content="完成", id="ans"))
+
+    out = _run(
+        messages,
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=0,
+        mask_min_chars=100,
+        max_batch_chars=30000,
+        min_batch_chars=100,
+        tombstone_blocks=True,
+    )
+    merged = _merged(messages, out)
+
+    assert _by_id(merged, "tc1").content == "W" * 20000  # web 不压
+    assert "已压缩" in _by_id(merged, "tc2").content      # 成功兄弟走内容 mask
+    assert isinstance(_by_id(merged, "a1"), AIMessage)
+
+
+def test_failed_block_is_not_tombstoned():
+    """失败块不整块移除，错误正文原样保留。"""
+    messages = [HumanMessage(content="跑命令", id="h1")]
+    messages += _batch(
+        "a1", [("c1", "run_command", {"command": "bad"}, "E" * 20000)]
+    )
+    messages += _batch("a2", [("c2", "read_file", {"path": "b.py"}, "B" * 20000)])
+    messages.append(AIMessage(content="完成", id="ans"))
+    for message in messages:
+        if isinstance(message, ToolMessage) and message.tool_call_id == "c1":
+            message.additional_kwargs = {"error_type": "tool_error"}
+
+    out = _run(
+        messages,
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=0,
+        mask_min_chars=100,
+        max_batch_chars=30000,
+        min_batch_chars=100,
+        tombstone_blocks=True,
+    )
+    merged = _merged(messages, out)
+
+    assert _by_id(merged, "tc1").content.startswith("E")
+    assert isinstance(_by_id(merged, "a1"), AIMessage)
+    assert "tc2" not in {m.id for m in merged}           # 成功兄弟块墓碑
+
+
+def test_tombstone_is_idempotent():
+    messages = [HumanMessage(content="读文件", id="h1")]
+    messages += _batch("a1", [("c1", "read_file", {"path": "a.py"}, "A" * 20000)])
+    messages += _batch("a2", [("c2", "read_file", {"path": "b.py"}, "B" * 20000)])
+    messages.append(AIMessage(content="完成", id="ans"))
+    kwargs = dict(
+        high_watermark_chars=10000,
+        low_watermark_chars=5000,
+        keep_blocks=0,
+        mask_min_chars=100,
+        max_batch_chars=8000,
+        min_batch_chars=100,
+        tombstone_blocks=True,
     )
     merged = _merged(messages, _run(messages, **kwargs))
     assert _run(merged, **kwargs) == {}

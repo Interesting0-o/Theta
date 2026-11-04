@@ -6,14 +6,21 @@
 
 轮内**不删消息**：图路由中间删掉结果会破坏 tool_call / ToolMessage 配对与调用方状态，
 因此只改 `ToolMessage.content` 与旧写操作的 `tool_call.args`（Phase 2；id / 配对不动）。
-本模块只产出替换后的消息，state 合并由 `nodes.py::CompressNode` 适配器负责。
+本模块只产出替换后的消息，state 合并由 `app/agent/nodes/compress_node.py::CompressNode`
+适配器负责。
 """
 from __future__ import annotations
 
 import posixpath
 import re
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from . import parser, planner, policy
 from .models import ToolBlock, ToolCallInfo
@@ -44,6 +51,8 @@ class TurnCompressor:
     DEDUP_MARKER_PREFIX = "…[重复读取]"
     # 移动窗口的指针标记；幂等判定同时认这两个前缀。
     MASK_MARKER_PREFIX = "…[已压缩]"
+    # Phase 2 整块墓碑：整个旧块被移除，原位留一条摘要 SystemMessage。
+    TOMBSTONE_MARKER_PREFIX = "…[整块已移除]"
 
     def __init__(
         self,
@@ -54,6 +63,7 @@ class TurnCompressor:
         mask_min_chars: int = MASK_MIN_CHARS,
         max_batch_chars: int = MAX_BATCH_CHARS,
         min_batch_chars: int = MIN_BATCH_CHARS,
+        tombstone_blocks: bool = False,
     ) -> None:
         """`read_dedup_min_chars`：被替换的旧 read_file 正文不短于它才指针化。
 
@@ -80,6 +90,9 @@ class TurnCompressor:
         self.mask_min_chars = mask_min_chars
         self.max_batch_chars = max_batch_chars
         self.min_batch_chars = min_batch_chars
+        # Phase 2 整块墓碑**默认关闭**：删除语义比指针化激进，先等真实会话的
+        # prefix cache / 行为回归基线，再决定是否默认开启。
+        self.tombstone_blocks = tombstone_blocks
         self._planner = CycleBatchPlanner(max_batch_chars, min_batch_chars)
         # 编排/state 工具与轮末共享同一份策略源：read_note / read_event_log 等回执
         # 在轮内也不能被批级 mask（§2.2 的两套策略漂移，2026-11-04 统一）。
@@ -124,22 +137,38 @@ class TurnCompressor:
         self._mark_eligibility(region_blocks, protected_ids)
 
         compressible = sum(block.eligible_chars for block in region_blocks)
+        tombstone_updates: list = []
+        tombstoned_ids: set[str] = set()
         if compressible > self.high_watermark_chars:
             plan_blocks = region_blocks[: max(0, len(region_blocks) - self.keep_blocks)]
             remaining = compressible
             for batch in self._planner.plan_batches(plan_blocks, boundaries):
-                for message in self._mask_batch(batch):
-                    by_id[message.id] = message
+                if self.tombstone_blocks:
+                    updates, removed_ids = self._mask_or_tombstone(batch, messages)
+                else:
+                    updates, removed_ids = self._mask_batch(batch), set()
+                for message in updates:
+                    if isinstance(message, (SystemMessage, RemoveMessage)):
+                        tombstone_updates.append(message)
+                    else:
+                        by_id[message.id] = message
+                tombstoned_ids.update(removed_ids)
                 # 滞回：逐批压，一旦回到低水位就停手；后面的批保持原文。
                 remaining -= planner.CycleBatchPlanner.batch_chars(batch)
                 if remaining <= self.low_watermark_chars:
                     break
 
-        return [
+        # 被墓碑移除的消息不再写出替换（可能是去重/回执的旧替换）。
+        for message_id in tombstoned_ids:
+            by_id.pop(message_id, None)
+
+        ordered = [
             by_id[message.id]
             for message in messages[region_start:]
             if getattr(message, "id", None) in by_id
+            and message.id not in tombstoned_ids
         ]
+        return ordered + tombstone_updates
 
     # ---------- 区域 / 预算 ----------
 
@@ -524,7 +553,73 @@ class TurnCompressor:
             replacements.append(self._clear_args(ai_message, calls))
         return replacements
 
-    def _batch_pointer(self, calls: list[ToolCallInfo]) -> str:
+    def _tombstone_eligible(self, block: ToolBlock) -> bool:
+        """整块可移除：完整、已消费、所有调用成功且属于可重取工具集。"""
+        if not (block.complete and block.ids_ok and block.consumed):
+            return False
+        if not block.calls:
+            return False
+        return all(
+            call.status == "ok"
+            and call.name in policy.TOMBSTONE_TOOLS
+            and getattr(call.tool_message, "id", None)
+            for call in block.calls
+        )
+
+    def _mask_or_tombstone(
+        self, batch: list[ToolBlock], messages: list
+    ) -> tuple[list, set[str]]:
+        """一批里：可整块移除的块做墓碑，其余（混合/受保护块）走内容/args mask。"""
+        tombstone_blocks = [block for block in batch if self._tombstone_eligible(block)]
+        if not tombstone_blocks:
+            return self._mask_batch(batch), set()
+
+        tombstone_object_ids = {id(block) for block in tombstone_blocks}
+        mask_blocks = [
+            block for block in batch if id(block) not in tombstone_object_ids
+        ]
+
+        removed: list = []
+        calls: list[ToolCallInfo] = []
+        for block in tombstone_blocks:
+            removed.extend(messages[block.start:block.end + 1])
+            calls.extend(block.calls)
+
+        updates: list = [
+            SystemMessage(
+                content=self._tombstone_pointer(tombstone_blocks, calls),
+                id=removed[0].id,
+            )
+        ]
+        updates.extend(
+            RemoveMessage(id=message.id)
+            for message in removed[1:]
+            if getattr(message, "id", None)
+        )
+        removed_ids = {
+            message.id for message in removed if getattr(message, "id", None)
+        }
+        if mask_blocks:
+            updates.extend(self._mask_batch(mask_blocks))
+        return updates, removed_ids
+
+    def _tombstone_pointer(
+        self, blocks: list[ToolBlock], calls: list[ToolCallInfo]
+    ) -> str:
+        """墓碑摘要：批级目标 + 块内工作日志（最多 3 条）。"""
+        text = self._batch_pointer(calls, prefix=self.TOMBSTONE_MARKER_PREFIX)
+        reasons: list[str] = []
+        for block in blocks:
+            content = str(getattr(block.ai_message, "content", "") or "").strip()
+            if content:
+                reasons.append(parser.first_line(content, 60))
+        if reasons:
+            text += " · 工作日志: " + "；".join(reasons[:3])
+        return text if len(text) <= 600 else text[:597] + "…"
+
+    def _batch_pointer(
+        self, calls: list[ToolCallInfo], prefix: str | None = None
+    ) -> str:
         """批级时间线：工具×次数 + 目标/关键行；不复制正文。"""
         counts: dict[str, int] = {}
         groups: dict[str, list[str]] = {}
@@ -557,7 +652,7 @@ class TurnCompressor:
                 part += f"（{suffix}）"
             parts.append(part)
         text = (
-            f"{self.MASK_MARKER_PREFIX} "
+            f"{prefix or self.MASK_MARKER_PREFIX} "
             + " · ".join(parts)
             + " · 需要时重新读取/执行"
         )

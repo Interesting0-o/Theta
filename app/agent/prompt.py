@@ -19,7 +19,7 @@ get_skill/drop_skill（技能加载）+ file_io/terminal/web_search MCP
 worker 只有**项目画像与长期记忆两样**不注入（`inject_session_context=False` 只包住这两样；
 工作区上下文与计划回显它照样有）。技能块**独立于该开关**，但 worker 没有 get_skill，
 loaded_skills 天然为空，所以一样不会出现。
-见 app/agent/nodes.py::LLMNode.__call__。
+见 app/agent/nodes/llm.py::LLMNode.__call__。
 """
 from app.resource.paths import HANDOFF_MD_FILENAME, handoff_md_path
 

@@ -76,7 +76,7 @@ def test_need_review_tool_interrupts_and_approval_lets_it_pass(monkeypatch):
     """web_search 等需审批工具必须挂起；批准后才进入放行队列。"""
     interrupts = []
     monkeypatch.setattr(
-        "app.agent.nodes.interrupt",
+        "app.agent.nodes.review.interrupt",
         lambda payload: interrupts.append(payload) or {"approved": True},
     )
     out = _run(ReviewNode(), _state([_call("web_search")]))
@@ -88,7 +88,7 @@ def test_need_review_tool_interrupts_and_approval_lets_it_pass(monkeypatch):
 def test_need_review_tool_rejection_injects_denial_message(monkeypatch):
     """被拒的需审批调用不放行，但须回灌一条 ToolMessage 告知模型（兑现悬空 tool_call）。"""
     monkeypatch.setattr(
-        "app.agent.nodes.interrupt",
+        "app.agent.nodes.review.interrupt",
         lambda payload: {"approved": False},
     )
     out = _run(ReviewNode(), _state([_call("web_search", call_id="call_w1")]))
@@ -108,7 +108,7 @@ def test_need_review_tool_rejection_injects_denial_message(monkeypatch):
 def test_need_review_tool_approval_injects_no_message(monkeypatch):
     """批准路径不应注入多余 ToolMessage（只有拒绝才需要反馈）。"""
     monkeypatch.setattr(
-        "app.agent.nodes.interrupt",
+        "app.agent.nodes.review.interrupt",
         lambda payload: {"approved": True},
     )
     out = _run(ReviewNode(), _state([_call("web_search")]))
@@ -118,7 +118,7 @@ def test_need_review_tool_approval_injects_no_message(monkeypatch):
 def test_denied_call_only_gets_denial_message_in_mixed_turn(monkeypatch):
     """同一 AIMessage 的多个调用：被拒的那个收到拒绝消息，免审放行的那个不注入。"""
     monkeypatch.setattr(
-        "app.agent.nodes.interrupt",
+        "app.agent.nodes.review.interrupt",
         lambda payload: {"approved": False},  # web_search 被拒；read_file 免审不会走到这里
     )
     node = ReviewNode()
@@ -219,7 +219,7 @@ def test_free_terminal_command_skips_the_approval_panel(monkeypatch):
     def _unexpected(payload):
         raise AssertionError("只读命令不该弹审批面板")
 
-    monkeypatch.setattr("app.agent.nodes.interrupt", _unexpected)
+    monkeypatch.setattr("app.agent.nodes.review.interrupt", _unexpected)
     out = _run(ReviewNode(), _state([_cmd("git status --porcelain")]))
     assert out["pending_tool_calls"] == []
     assert [c["name"] for c in out["approved_tool_calls"]] == ["run_command"]
@@ -229,7 +229,7 @@ def test_write_terminal_command_still_asks_for_approval(monkeypatch):
     """同一个工具、写形态照常挂起——决策只由命令文本决定。"""
     interrupts = []
     monkeypatch.setattr(
-        "app.agent.nodes.interrupt",
+        "app.agent.nodes.review.interrupt",
         lambda payload: interrupts.append(payload) or {"approved": True},
     )
     out = _run(ReviewNode(), _state([_cmd("git push origin main")]))

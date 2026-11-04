@@ -1,7 +1,7 @@
 """agent 提问机制（闸门 type=ask_user）的机制测试：闸门分流 + 工具体 + 端到端闭环。
 
 分工与本仓库既有约定一致：
-- **闸门/解析**：monkeypatch `app.agent.nodes.interrupt`，不起真图、不花钱；
+- **闸门/解析**：monkeypatch `app.agent.nodes.review.interrupt`，不起真图、不花钱；
 - **工具体**：直接调 `ask_user.func`（编排工具的执行器就是这么调底层函数的）；
 - **端到端**：真图 + 真 MCP 运行体 + 脚本化模型，验"挂起 → 两段回答 → ToolMessage 回模型"闭环。
 
@@ -55,7 +55,8 @@ def captured_interrupts(monkeypatch):
     def install(answer):
         seen: list[dict] = []
         monkeypatch.setattr(
-            nodes_module, "interrupt", lambda payload: seen.append(payload) or answer
+            "app.agent.nodes.review.interrupt",
+            lambda payload: seen.append(payload) or answer,
         )
         return seen
 
@@ -196,7 +197,9 @@ def test_ask_dedupes_repeated_indexes(captured_interrupts):
 def test_invalid_ask_never_reaches_the_human(monkeypatch, args, hint):
     """参数不合法时**不弹面板**：回一条可行动回执让模型自己改（同 unknown 工具的手感）。"""
     seen: list = []
-    monkeypatch.setattr(nodes_module, "interrupt", lambda payload: seen.append(payload))
+    monkeypatch.setattr(
+        "app.agent.nodes.review.interrupt", lambda payload: seen.append(payload)
+    )
 
     out = _run(ReviewNode(), _state([{"name": "ask_user", "args": args, "id": "call_bad"}]))
 
@@ -360,7 +363,9 @@ def test_ask_source_is_registered_for_gate_and_executor():
     import json
     from pathlib import Path
 
-    cfg = json.loads((Path(nodes_module.__file__).with_name("tool.json")).read_text("utf-8"))
+    cfg = json.loads(
+        (Path(nodes_module.__file__).parent.parent / "tool.json").read_text("utf-8")
+    )
 
     assert cfg["ask_user"]["source"] == "ask"
     assert cfg["ask_user"]["need_review"] is False  # 提问没什么可"批准"的
@@ -374,7 +379,9 @@ def test_worker_graph_refuses_a_hallucinated_ask(monkeypatch):
     话主侧会看到一张语义错乱的面板。回执要让模型把"该问什么"写进结论交回。
     """
     seen: list = []
-    monkeypatch.setattr(nodes_module, "interrupt", lambda payload: seen.append(payload))
+    monkeypatch.setattr(
+        "app.agent.nodes.review.interrupt", lambda payload: seen.append(payload)
+    )
 
     out = _run(ReviewNode(allow_ask=False), _state([_ask_call()]))
 

@@ -47,6 +47,16 @@ ARG_CLEAR_FIELDS: dict[str, tuple[str, ...]] = {
 }
 ARG_CLEAR_TOOLS: frozenset[str] = frozenset(ARG_CLEAR_FIELDS)
 
+# Phase 2 整块墓碑：这些工具的旧块可以整块移除（磁盘 / 仓库 / 命令可重取）。
+# 不含 web（需归档）、ask / dispatch（人的决定 / worker 结论）、state 回执、
+# process_* / start_process（进程可能仍在跑，id 仍有用），以及未知的技能工具。
+TOMBSTONE_TOOLS: frozenset[str] = frozenset({
+    "read_file", "list_dir", "get_directory_tree", "search_content", "glob",
+    "run_command",
+    "write_file", "edit_file", "create_file", "create_dir",
+    "delete_file", "delete_dir", "copy_path",
+})
+
 # 不进轮内移动窗口的工具：
 # - web 四件套：正文由轮末归档进 notes，轮内压掉等于丢研究原料；
 # - ask_user：用户决定，必须保留；

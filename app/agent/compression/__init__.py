@@ -1,7 +1,8 @@
 """上下文压缩引擎（2026-11-04 从 `nodes.py` 剥离）。
 
-依赖方向是单向的：`nodes.py → compression`。本包**不** import `nodes.py`、
-`app.agent.tools` 或 `app.platform.mcp`，因此引擎本身不依赖图与审批。注意父包
+依赖方向是单向的：`app.agent.nodes → compression`。本包**不** import
+`app.agent.nodes`、`app.agent.tools` 或 `app.platform.mcp`，因此引擎本身不依赖图与
+审批。注意父包
 `app/agent/__init__.py` 仍会 re-export 图，所以导入路径本身仍受既有 `.env` 约束
 （与仓库其余测试一致，不在本包处理）。
 
@@ -29,6 +30,7 @@ from .policy import (
     KEEP_TOOLS,
     NO_MASK_TOOLS,
     STATE_RECEIPT_TOOLS,
+    TOMBSTONE_TOOLS,
     WRITE_TOOLS,
     orchestrate_tools,
 )
@@ -45,6 +47,7 @@ __all__ = [
     "KEEP_TOOLS",
     "NO_MASK_TOOLS",
     "STATE_RECEIPT_TOOLS",
+    "TOMBSTONE_TOOLS",
     "ToolBlock",
     "ToolCallInfo",
     "TurnCompressor",
