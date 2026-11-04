@@ -16,7 +16,7 @@ import asyncio
 import subprocess
 
 import pytest
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.graph import get_main_agent_graph
@@ -71,16 +71,25 @@ def _run(tmp_path, session: str, command: str) -> dict:
 
 
 def test_readonly_command_runs_without_asking(tmp_path):
-    """免审命令：图不挂起，命令**真的被执行**，回执作为 ToolMessage 回到对话。"""
+    """免审命令：图不挂起，命令**真的被执行**（回执或轮末折叠摘要状态为 ok）。"""
     result = _run(tmp_path, "e2e-free", "git status --porcelain --branch")
 
     assert "__interrupt__" not in result, "只读命令不该挂起等审批"
     receipts = [
         m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "run_command"
     ]
-    assert len(receipts) == 1
-    # exit_code 0 = terminal server 真的 spawn 了 git 且它在 git init 过的仓库里跑成功
-    assert "exit_code: 0" in receipts[0].content
+    summaries = [
+        m for m in result["messages"] if isinstance(m, SystemMessage)
+    ]
+    # 有最终答复时当前轮工具块会被折叠；失败/被拒会保留原文，所以 ok 即证明真执行成功。
+    executed = (
+        (receipts and "exit_code: 0" in receipts[0].content)
+        or any(
+            "工具调用: run_command" in m.content and "状态: ok" in m.content
+            for m in summaries
+        )
+    )
+    assert executed, "terminal server 必须真的 spawn 了 git 并成功返回"
 
 
 def test_write_command_parks_the_run_and_executes_nothing(tmp_path):

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import time
 
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from app.config import TEXT_BUDGET_CHARS
 from app.schema.agent_schema import NoteEntry
@@ -151,23 +151,39 @@ def plan_compact(
     notes: dict,
     orchestrate_tools: frozenset[str] | set[str],
 ) -> FoldPlan:
-    """扫描消息，规划“更早轮次、已消费工具块”的分组折叠。
+    """扫描消息，规划“已消费工具块”的分组折叠。
 
-    折叠区 = 最后一条 HumanMessage 之前；当前轮原样保留。不折叠：无 tool_calls 的
-    AIMessage、Human/System、不完整块、未被消费块、整块都是保护调用、以及折叠区为空。
+    折叠区：
+    - **有最终答复**（末条是无 tool_calls 的 AIMessage）：折到最终答复之前，**当前轮
+      已闭环的工具块也折**（调研结论：逻辑停止点压缩），最终答复原样保留；
+    - **无最终答复**（steering 提前收口等）：只折最后一条 HumanMessage 之前的旧轮，
+      当前轮在途结果保持原样。
+
+    不折叠：无 tool_calls 的 AIMessage、Human/System、不完整块、未被消费块、整块都是
+    保护调用、以及折叠区为空。
     """
-    # 锚点 = 最后一条 HumanMessage；它及其后（当前轮）原样保留，只折更早轮次
-    anchor = -1
-    for i, m in enumerate(messages):
-        if isinstance(m, HumanMessage):
-            anchor = i
-    if anchor <= 0:
-        return FoldPlan()
-    region = messages[:anchor]
+    final_answer_index: int | None = None
+    if messages:
+        last = messages[-1]
+        if isinstance(last, AIMessage) and not getattr(last, "tool_calls", None):
+            final_answer_index = len(messages) - 1
 
-    blocks, boundaries = parser.iter_tool_blocks(region)
+    if final_answer_index is None:
+        anchor = -1
+        for i, m in enumerate(messages):
+            if isinstance(m, HumanMessage):
+                anchor = i
+        if anchor <= 0:
+            return FoldPlan()
+        cutoff = anchor
+    else:
+        cutoff = final_answer_index
+
+    # 解析整段 messages（而不是截到 cutoff）：当前轮块的 `consumed` 要看到最终答复。
+    blocks, boundaries = parser.iter_tool_blocks(messages)
+    blocks = [block for block in blocks if block.end < cutoff]
     decisions = {
-        block.start: _block_folding(block, region, orchestrate_tools)
+        block.start: _block_folding(block, messages, orchestrate_tools)
         for block in blocks
     }
     # 整块保留的块是组边界：把它们的位置并进 boundaries，避免跨块成组。
@@ -186,7 +202,7 @@ def plan_compact(
 
         for block in blocks_in_group:
             folded_ids, kept_ids = decisions[block.start]  # type: ignore[misc]
-            block_messages = region[block.start:block.end + 1]
+            block_messages = messages[block.start:block.end + 1]
             reason = reason_of(block.ai_message)
 
             folded_calls = [

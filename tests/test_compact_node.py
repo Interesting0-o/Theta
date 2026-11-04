@@ -81,8 +81,8 @@ def test_unconsumed_block_is_kept():
     assert _run(messages) == {}
 
 
-def test_folds_older_round_and_replaces_in_place():
-    """跨两轮超预算：只折更早轮的工具块；摘要 SystemMessage 原位替换；尾部仍是最终答复。"""
+def test_folds_older_round_and_current_round_after_final_answer():
+    """有最终答复：旧轮与刚完成的当前轮工具块都折；每组一条摘要，尾部保留答复。"""
     messages = [
         HumanMessage(content="读 src/x.py 并报告", id="h1"),
         AIMessage(content="读取 src/x.py 布局", tool_calls=[_tc("read_file", "c1")], id="a1"),
@@ -96,29 +96,23 @@ def test_folds_older_round_and_replaces_in_place():
     out = _run(messages)
 
     assert "messages" in out
-    # 恰一条 SystemMessage(摘要) + 一条 RemoveMessage(t1)，无 notes 新增
+    # 两组各一条摘要 + 各删一条 ToolMessage；无 notes 新增
     sys_msgs = [m for m in out["messages"] if isinstance(m, SystemMessage)]
     rem_msgs = [m for m in out["messages"] if isinstance(m, RemoveMessage)]
-    assert len(sys_msgs) == 1 and len(rem_msgs) == 1
-    assert rem_msgs[0].id == "t1"
+    assert len(sys_msgs) == 2 and len(rem_msgs) == 2
+    assert {m.id for m in rem_msgs} == {"t1", "t2"}
     assert "notes" not in out
 
-    summary = sys_msgs[0].content
-    assert "工作日志: 读取 src/x.py 布局" in summary
-    assert "工具调用: read_file" in summary
-    assert "状态: ok" in summary
+    by_id = {m.id: m for m in sys_msgs}
+    assert "工具调用: read_file" in by_id["a1"].content
+    assert "工具调用: run_command" in by_id["a2"].content
+    assert "状态: ok" in by_id["a1"].content
 
-    # 原位替换：SystemMessage id == 最早被删消息 id(a1)，reducer 合并在原位置
-    assert sys_msgs[0].id == "a1"
+    # 原位替换：SystemMessage id == 该组最早被删消息 id；尾部仍是最终答复
     merged = _merged(messages, out)
-    # a1 处现在是 SystemMessage（原 AIMessage 已被顶替），且只此一条 id=a1
-    a1_msgs = [m for m in merged if m.id == "a1"]
-    assert len(a1_msgs) == 1 and isinstance(a1_msgs[0], SystemMessage)
     assert isinstance(merged[1], SystemMessage) and merged[1].id == "a1"
-    assert "t1" not in {m.id for m in merged}                     # TM1 已被 RemoveMessage 删除
-    assert merged[-1].content == "已完成并验证通过。"                # 尾部仍是本轮最终答复
-    # 保留区不动：当前轮的 Human/工具/答复、以及旧轮的 Human 与无 tool_calls 答复都在
-    assert {m.id for m in merged} == {"h1", "a1", "ans1", "h2", "a2", "t2", "ans2"}
+    assert merged[-1].content == "已完成并验证通过。"
+    assert {m.id for m in merged} == {"h1", "a1", "ans1", "h2", "a2", "ans2"}
 
 
 def test_skips_plain_aimessage():
@@ -232,8 +226,8 @@ def test_existing_notes_ref_continues_numbering():
     assert out["notes"]["notes#r4"]["source_tool"] == "deep_research"
 
 
-def test_single_round_never_folds():
-    """整个会话只有一条 HumanMessage → 折叠区为空，即使超预算也 no-op。"""
+def test_single_round_folds_after_final_answer():
+    """单轮也会在最终答复后折叠刚完成的工具块；答复本身保留。"""
     messages = [
         HumanMessage(content="一个很长的单轮问题" + _pad(300), id="h1"),
         AIMessage(content="读文件", tool_calls=[_tc("read_file", "c1")], id="a1"),
@@ -241,7 +235,34 @@ def test_single_round_never_folds():
         AIMessage(content="读完了。", id="ans1"),
     ]
     out = _run(messages)
-    assert out == {}
+
+    sys_msgs = [m for m in out["messages"] if isinstance(m, SystemMessage)]
+    rem_msgs = [m for m in out["messages"] if isinstance(m, RemoveMessage)]
+    assert len(sys_msgs) == 1 and sys_msgs[0].id == "a1"
+    assert len(rem_msgs) == 1 and rem_msgs[0].id == "t1"
+
+    merged = _merged(messages, out)
+    assert merged[-1].content == "读完了。"
+    assert "t1" not in {m.id for m in merged}
+
+
+def test_steering_cut_without_final_answer_keeps_current_round():
+    """没有最终答复（steering 提前收口）时只折旧轮，当前轮在途结果原样保留。"""
+    messages = [
+        HumanMessage(content="旧问题", id="h1"),
+        AIMessage(content="读旧文件", tool_calls=[_tc("read_file", "c1")], id="a1"),
+        ToolMessage(content="OLD" * 100, tool_call_id="c1", name="read_file", id="t1"),
+        AIMessage(content="旧答复", id="ans1"),
+        HumanMessage(content="新问题", id="h2"),
+        AIMessage(content="读新文件", tool_calls=[_tc("read_file", "c2")], id="a2"),
+        ToolMessage(content="NEW" * 100, tool_call_id="c2", name="read_file", id="t2"),
+    ]
+    out = _run(messages)
+
+    sys_msgs = [m for m in out["messages"] if isinstance(m, SystemMessage)]
+    assert len(sys_msgs) == 1 and sys_msgs[0].id == "a1"
+    merged = _merged(messages, out)
+    assert _by_id(merged, "t2").content == "NEW" * 100   # 当前轮未闭环，保留原文
 
 
 def test_coerce_tool_result_reconstructs_mcp_payload():
