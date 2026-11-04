@@ -396,52 +396,6 @@ tool.json 的 `source: mcp_service/web_search` 同义）；`_EXTRA_SLICE_KEYS`�
 docs/CONTEXT_ENGINEERING.md（消息流转改动前必读）、docs/ARCHITECTURE.md §4（图内 vs 基座）、
 文末「相关但未立项」的**长回合止损**（取消 = 扔掉整轮，队列 = 带着上下文转向，互补不互替）。
 
-## [~] 运行中 compact：工具循环中间的上下文收口
-
-> **状态（2026-11-04）**：已落地为轮内 `CompressNode`（批级移动窗口 + read 去重 +
-> 状态回执变薄，见 `CONTEXT_ENGINEERING.md` §8.6）。本条目保留动机与实测数据；原计划的
-> “折更早轮次完整块”被替换为“当前轮移动窗口”，因为长单轮没有可折的旧 Human 轮次
-> （见下方 2026-10-18 实测）。
-
-**问题**（2026-09-07 长回合实测）：主 agent 一轮里大量工具调用（如一次 jupyter 审计
-~67 次、20 分钟）时，历史里的**读文件/检索结果作为 ToolMessage 每轮原样重发**，上下文越滚
-越大、单轮越来越慢；`compact_node` 却只在**回合末**（`llm` 不再调工具 → `route_after_llm`
-走 compact/END）才可能折叠，**工具循环中间从不触发** → 长跑无中间收口。
-
-**实测补充（2026-10-18）**：见 [SESSION_CASE_INDEX_TTS2.md](SESSION_CASE_INDEX_TTS2.md)——
-单轮 44 次工具调用、上下文 139,380 字符；累计 prompt **1,469,372 字符（终态的 10.6 倍）**，
-其中三份安装日志占 **71.3%**；`compact_node` 已被路由到，但因"最后一条 HumanMessage 之前
-没有可折块"返回空。可作落地后的回归基线：重放同一 DB/任务，应看到工具循环中途出现折叠，
-终态与累计 prompt 都不再线性增长。
-
-**目标态**：历史 content 超预算（复用 `needs_compact` / `CompactNode._plan` 口径）时，
-在工具循环中途也折叠"更早轮次、已被消费的完整工具块"，只保留当前正在进行的轮次。
-
-**要点（实现前须钉死）**：
-- 只能折**最后一个 HumanMessage 之前的旧轮完整块**（含 AIMessage(tool_calls) + 兑现它的
-  ToolMessages），**正在推进的当前工具链不能折**——判据 `CompactNode._plan` 已有；
-- 折叠落点仍是 `SystemMessage(摘要, id=…)` 原位替换 + `RemoveMessage`，不尾追加；
-- **触发点（2026-10-18 定）**：新增 `compress_node` 放在 `tool_node` / `orchestrate_node`
-  回到 `llm_node` 的边上——工具结果已写入、下一次 LLM 调用之前，是唯一"新结果已在、旧上下文
-  尚未付费"的时点；不要放在 `review_node`/`queue_node`（那里还没执行工具），也不要塞进
-  interrupt 节点。每拍只算大小，用 delta/hysteresis 批量触发，避免每轮破坏 prompt cache；
-  轮末 `compact_node` 保留为跨回合兜底（折叠区不同，见
-  [CONTEXT_COMPRESSION_SURVEY.md](CONTEXT_COMPRESSION_SURVEY.md) §5.10）。
-- 折叠后的摘要系统消息会再注入每轮，注意别把"当前轮"误判成旧轮折掉。
-- **单轮长任务没有"之前的 HumanMessage"可折**（2026-10-18 实测）：现有 `_plan` 只折最后一条
-  HumanMessage 之前的块，而一次 44 次工具的会话只有一条 HumanMessage——即使轮内触发也一块
-  折不了。轮内压缩必须把折叠单元改为"**已完成工具块 + 移动窗口**"（保留在途块、原始请求、
-  `current_plan` 与失败信号），不能直接复用现有判据；详见
-  [CONTEXT_COMPRESSION_SURVEY.md](CONTEXT_COMPRESSION_SURVEY.md) §5.2 与
-  [SESSION_CASE_INDEX_TTS2.md](SESSION_CASE_INDEX_TTS2.md) §7.3。
-- **阈值口径（2026-10-18 用户拍板）**：**摘要**在**厂商标称窗口的 40%–50%** 触发，不是
-  80%–90%；到这个量级历史已经被压缩过很多次，再压缩收益很小。压缩（截断/遮蔽/落盘）是
-  另一层——在写入侧与轮内移动窗口持续做。当前 `_CONTEXT_BUDGET_DEFAULT = 60000` 只是压缩
-  侧的字符代理，不能当摘要阈值。详见
-  [CONTEXT_COMPRESSION_SURVEY.md](CONTEXT_COMPRESSION_SURVEY.md) §4 第 6 条 / §5.4。
-- 相关背景：[[docs/CONTEXT_ENGINEERING]]（只流结论 / notes / 折叠目标态；**§8.6 批级压缩设计**：
-  周期/chunk、plan step 语义边界、语义切点优先于预算、Phase 1 已落地）、根目录 CLAUDE.md 上下文工程一节。
-
 ## [ ] 缓存友好的提示顺序：稳定前缀 → 历史 → 动态尾部
 
 **动机**（2026-10-18）：glm-5.3-flash 的价格为未命中 0.8 元/M、命中 0.23 元/M。本会话
@@ -645,44 +599,10 @@ OS / conda / GPU / 系统 ffmpeg 属 ①；磁盘余量、`conda env list` 等�
 `app/agent/tools.py`（`write_memory`/`read_memory` 与
 `InjectedWorkspace`）。证据见本文「工具面缺口」与「工作区语义」两条。
 
-## [~] 技能（skill）：按需加载的"领域包"——**三期均已落地**（见 docs/SKILL_DESIGN.md）
+## [ ] 技能控制面命令：`/skills`
 
-> **设计已独立成文** → [[docs/SKILL_DESIGN]]。本条只留指针与当前状态，**别再往这里堆内容**。
-> ⚠️ 下面按日期追加，**读最新一条**（`docs/README.md` 的写作约定）——中间那几段标着"当前状态
-> （2026-09-12）"的是当日快照，其中"`skills/github/` 没有 `server.py`、当前是知识型"**已被三期取代**。
-
-一句话：把某个领域要用的**工具**和这个领域的**纪律**打成一包、按需加载。典型 = **GitHub**（推送 /
-PR / issue / 搜索 / 不克隆就读远端代码，外加"先开分支""master 不能随便提"等约束）。差异化在
-**约束三分法**——软约束走 `SKILL.md` 正文（host 读取、注入系统提示）、硬闸门走 `tool.json`、
-结构性拒绝写死在工具里。
-
-**当前状态（2026-09-12）**：**两型共用的那条通道已落地**——`app/resource/skills.py` +
-`get_skill`/`drop_skill` + state 的 `loaded_skills` + `LLMNode` 注入（落地清单见
-SKILL_DESIGN §11）。`skills/github/` 没有 `server.py`，故**当前自动是知识型**、可加载。
-**未做**：能力型（`server.py` 生命周期、会话级注册表 + 动态 `bind_tools`、idle 回收、
-env 声明与白名单转发）——那是 §3.3/§3.4 那套，也是最重的一块。
-
-**前置里程碑已落地（2026-09-12）**：SKILL_DESIGN **§12「MCP 运行体常驻化」**——MCP server 从
-"每次调用重起的临时脚本"变成"会话期常驻的后台服务"（每 (工作区, 会话, server) 一个 owner task）。
-顺带修好了 `mcp_service/terminal.py` 的跨调用进程管理（`start_process` 起的进程以前下次调用就认不到）。
-承重约束（anyio 的 cancel scope 与 Task 绑定 × langgraph 每节点开新 Task）写在 §12.2，**改那套机制前必读**。
-
-**二期已落地（只读子集，2026-09-12）**：SKILL_DESIGN **§13 能力型**——技能可以带 `server.py`，
-`get_skill` 把它的工具拉进本会话、`drop_skill` 一并关掉（机制 = "技能就是按需加入的 server"，
-复用 §12 的运行体）。首个能力型技能 `skills/github/` 落了 **7 个只读工具**（stdlib HTTP，不引 PyGithub）+ 一次**加载时凭证体检**（`skill.json` 的 `preflight`，替代了原 `github_auth_status` 工具）。
-
-**三期已落地（2026-09-14，见 SKILL_DESIGN §13.10）**：`skills/github/` 从 7 个只读工具长到
-**14 只读 + 3 写**（`github_pr_create` / `github_pr_review` / `github_issue_comment`，都要人批）。
-越权动作在工具内**结构性拒绝**：`github_pr_review` 的 `event` 白名单不含 `APPROVE`；**"合并"连工具
-都没有**（"合并权留给人"最彻底的落点是这个动作压根不存在，与"APPROVE 被拒"同构）。同批修掉了
-`server.py` 的 8 处审计问题与 `skills.py` 两处真 bug（坏编码的 `SKILL.md` 会拖垮整次扫描；目录名是
-Python 关键字时被误标 `[带工具]`）。
-
-**未做**：技能运行体的空闲回收（已定不做，只靠 `drop_skill`）；`/skills` 控制面命令。口径见 §13.9。
-
-**与本文其它条目的关系**：SKILL_DESIGN §6 与上面的「反思节点」打通——skill fork 到隔离子 agent 执行，
-本身即一次结构性反思，且 `mcp_service/sub_agent.py` 那套骨架已经在了；但它卡在
-`docs/MULTI_AGENT.md` §6「子 agent 写权限下放」这个里程碑上。
+技能三期已落地（见 `DONE.md` 2026-11-04 归档 / `SKILL_DESIGN.md` §13.10）。剩余：
+`/skills` 控制面命令（列出 / 加载 / 卸载技能）；运行体空闲回收已定不做（只靠 `drop_skill`）。
 
 ## [ ] 图像输入：@路径 附图通道已落地；工具返回图仍无通路（2026-09-14）
 
