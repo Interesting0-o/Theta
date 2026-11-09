@@ -107,12 +107,31 @@ python -m pytest
 运行 LangGraph 本地开发服务器：
 
 ```bash
-langgraph dev
+python -m evaluation                          # 层 A 回放（默认，零成本）
+python -m evaluation --task write_and_verify  # 只跑单个任务
+python -m evaluation --live                   # 层 B 真跑（花 token）
+python -m evaluation --record                 # 真跑并把模型输出录成 fixture（改动任务后重录）
+python -m evaluation --keep-workspace         # 保留临时工作区，人工复查失败现场
 ```
 
-测试前需要准备 `.env` 和工作区环境变量；Windows/WSL 等环境的具体要求见[技术路线与实现说明](docs/TECHNICAL_ROADMAP.md#5-验证策略)。
+任务的 prompt / setup 变了，旧 fixture 会被判定为陈旧并**跳过**（不计入通过率），跑 `--record` 重录即可。
 
-更多项目设计：
+**退出码**（层 A 零成本，所以它能当回归闸门直接进 CI）：`0` 通过 / `1` 不通过 / `2` 用法错误
+（`--task` 名不存在）。「通过」= 检查全过 **且** 没有任务报错 **且** 至少有一个任务真跑了——
+全部 SKIP 也算不通过：一行都没验证过报绿，等于把 fixture 陈旧藏起来。
+
+### 本地部署 LangGraph
+
+```bash
+langgraph dev          # 启动本地开发服务器（非 Windows）
+langgraph build        # 构建可部署镜像
+```
+
+Windows 下请使用 `.\scripts\langgraph-dev.cmd` 启动开发服务器。该脚本会启用 UTF-8、允许 LangGraph Studio 的本地网络预检，并使用 LangGraph dev 的 `--allow-blocking` 选项，避免 Windows 的 MCP 可执行文件探测被同步 I/O 检查拦截。
+
+### 已知限制（上下文工程 / 消息压缩）
+
+消息压缩与笔记区是**进行中的工程**，以下缺口当前已知、未闭环（`docs/CONTEXT_ENGINEERING.md` 是目标态设计，实现是它的简化收敛，改动时以代码现状为准）：
 
 - [架构原则](docs/ARCHITECTURE.md)
 - [技术路线与当前实现](docs/TECHNICAL_ROADMAP.md)
