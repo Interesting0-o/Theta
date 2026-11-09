@@ -150,7 +150,7 @@ Git 没有独立 MCP server；Git 操作经 `run_command` 执行。只读 Git �
 - **轮末 `CompactNode`**（无条件运行）：折叠最终答复之前、已被消费的工具块（含刚完成的当前轮；无最终答复时退回最后一条 Human 之前）；按 plan epoch/step 分组，每组一条摘要。块内逐调用处置：编排 / 失败 / 被拒调用保留，联网正文归档到会话 `notes`，其余折叠；通过 `RemoveMessage` 原位替换，不拆开 AI tool call 与其对应 ToolMessage。保留回执必须排在折叠回执之前，否则整块保留。
 - **轮内 `CompressNode`**：在当前轮工具循环中做 read_file 去重、批级移动窗口（高水位触发、低水位停止）、状态回执变薄，以及旧写操作的大 args 清理（`content` / `old_string` / `new_string` → 带长度指针）；不改 `tool_call_id`。整块墓碑（`tombstone_blocks=True`）可把可重取的旧块整块移除并留摘要，**默认关闭**，等真实会话基线后再决定是否开启。
 
-两者共享 `ToolBlock` 解析与策略表；当前计划单独存在 `current_plan` 并按轮注入，不依赖计划工具回执一直留在历史里。当前机制**不等于完整的长上下文解决方案**：预算仍是字符代理，尚未按 provider 的 token 用量校准；轮末也尚未折叠刚完成的周期。
+两者共享 `ToolBlock` 解析与策略表；当前计划单独存在 `current_plan` 并按轮注入，不依赖计划工具回执一直留在历史里。当前机制**不等于完整的长上下文解决方案**：预算仍是字符代理，尚未按 provider 的 token 用量校准；整块墓碑默认关闭（需真实会话的 prefix cache / 行为基线）；prefix cache 与 evaluation 仍未接线。
 
 ### 4.6 技能与动态工具
 
