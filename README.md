@@ -317,9 +317,11 @@ python -m evaluation --keep-workspace         # 保留临时工作区，人工�
 ### 本地部署 LangGraph
 
 ```bash
-langgraph dev          # 启动本地开发服务器
+langgraph dev          # 启动本地开发服务器（非 Windows）
 langgraph build        # 构建可部署镜像
 ```
+
+Windows 下请使用 `.\scripts\langgraph-dev.cmd` 启动开发服务器。该脚本会启用 UTF-8、允许 LangGraph Studio 的本地网络预检，并使用 LangGraph dev 的 `--allow-blocking` 选项，避免 Windows 的 MCP 可执行文件探测被同步 I/O 检查拦截。
 
 ### 已知限制（上下文工程 / 消息压缩）
 
